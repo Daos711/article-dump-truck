@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+results/pump/*.png
+results/pump/*.npz
+results/diesel/*.png
+results/diesel/*.npz
