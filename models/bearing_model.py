@@ -88,15 +88,18 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     """
     omega = 2 * np.pi * n / 60.0  # угловая скорость (рад/с)
 
-    P, residual, n_iter = solve_reynolds(
-        H, d_phi, d_Z, R, L,
+    # Солвер ожидает H в формате (N_Z, N_phi) — транспонируем
+    P_init_T = P_init.T if P_init is not None else None
+    P_T, residual, n_iter = solve_reynolds(
+        H.T, d_phi, d_Z, R, L,
         closure=closure,
         cavitation=cavitation,
         omega=1.5,
         tol=1e-5,
         max_iter=50000,
-        P_init=P_init,
+        P_init=P_init_T,
     )
+    P = P_T.T  # обратно в (N_phi, N_Z)
 
     # Масштаб давления: p* = 6·η·ω·(R/c)² (стандартная безразмерная форма)
     p_scale = 6.0 * eta * omega * (R / c) ** 2
