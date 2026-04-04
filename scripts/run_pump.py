@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Запуск стационарного расчёта подшипника центробежного насоса.
 
-Генерирует графики W(ε), f(ε), h_min(ε), Q(ε) для 4 конфигураций
-и сохраняет данные в results/pump/.
+Генерирует графики W(ε), f(ε), h_min(ε), Q(ε), F_tr(ε), N_loss(ε)
+для 4 конфигураций и сохраняет данные в results/pump/.
 """
 import sys
 import os
@@ -58,6 +58,10 @@ def main():
                 "hmin_vs_eps.png", "Минимальный зазор h_min(ε) — насос")
     plot_curves(eps, results["Q"] * 1e6, "Расход смазки Q (см³/с)",
                 "Q_vs_eps.png", "Расход смазки Q(ε) — насос")
+    plot_curves(eps, results["F_tr"], "Сила трения F_tr (Н)",
+                "Ftr_vs_eps.png", "Сила трения F_tr(ε) — насос")
+    plot_curves(eps, results["N_loss"], "Потери мощности N_loss (Вт)",
+                "Nloss_vs_eps.png", "Потери мощности N_loss(ε) — насос")
 
     # Сохранить данные
     np.savez(
@@ -65,6 +69,7 @@ def main():
         epsilon=eps,
         W=results["W"], f=results["f"],
         hmin=results["hmin"], Q=results["Q"],
+        F_tr=results["F_tr"], N_loss=results["N_loss"],
         labels=[c["label"] for c in CONFIGS],
     )
     print(f"\nДанные сохранены в results/pump/data.npz")

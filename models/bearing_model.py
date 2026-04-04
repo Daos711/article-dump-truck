@@ -87,6 +87,7 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     Q     : float — расход смазки (м³/с)
     h_min : float — минимальный зазор (м)
     p_max : float — максимальное давление (Па)
+    F_tr  : float — сила трения (Н)
     """
     omega = 2 * np.pi * n / 60.0  # угловая скорость (рад/с)
 
@@ -140,4 +141,4 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     h_min = np.min(h_dim)
     p_max = np.max(P_dim)
 
-    return P, F, mu_val, Q, h_min, p_max
+    return P, F, mu_val, Q, h_min, p_max, F_friction

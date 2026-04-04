@@ -13,8 +13,8 @@ from models.bearing_model import (
 from config import diesel_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
-N_GRID = 100                           # 100 для отладки, 300 для финала
-PHI_CRANK = np.linspace(0, 720, 36)   # шаг 20° для отладки, 360 для финала
+N_GRID = 300
+PHI_CRANK = np.linspace(0, 720, 360)  # шаг 2°
 
 CONFIGS = [
     {"label": "Гладкий + минеральное", "textured": False,
@@ -53,8 +53,8 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     """
     eta = oil["eta_diesel"]
     eps_table = np.concatenate([
-        np.linspace(0.001, 0.05, 5),
-        np.linspace(0.06, 0.98, 20),
+        np.linspace(0.001, 0.05, 15),
+        np.linspace(0.06, 0.98, 40),
     ])
     W_table = np.zeros(len(eps_table))
     P_prev = None
@@ -62,7 +62,7 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     for i, eps in enumerate(eps_table):
         H = make_H(eps, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        P, F, *_ = solve_and_compute(
+        P, F, _, _, _, _, _ = solve_and_compute(
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
             closure=closure, cavitation=cavitation,
@@ -101,11 +101,11 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
     eps_mid = 0.5 * (eps_lo + eps_hi)
     F_hyd = mu = Qv = h_min = p_max = 0.0
 
-    for _ in range(8):
+    for _ in range(12):
         eps_mid = 0.5 * (eps_lo + eps_hi)
         H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        _, F_hyd, mu, Qv, h_min, p_max = solve_and_compute(
+        _, F_hyd, mu, Qv, h_min, p_max, _ = solve_and_compute(
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh,
             closure=closure, cavitation=cavitation,
