@@ -11,7 +11,7 @@ from models.bearing_model import (
 from config import pump_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
-N_GRID = 300
+N_GRID = 150                           # 150 для отладки, 300 для финала
 EPSILON_VALUES = np.linspace(0.1, 0.8, 15)
 
 CONFIGS = [
