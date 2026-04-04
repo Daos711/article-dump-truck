@@ -13,8 +13,8 @@ from models.bearing_model import (
 from config import diesel_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
-N_GRID = 150                           # 150 для отладки, 300 для финала
-PHI_CRANK = np.linspace(0, 720, 72)   # шаг 10° для отладки, 360 для финала
+N_GRID = 100                           # 100 для отладки, 300 для финала
+PHI_CRANK = np.linspace(0, 720, 36)   # шаг 20° для отладки, 360 для финала
 
 CONFIGS = [
     {"label": "Гладкий + минеральное", "textured": False,
@@ -53,8 +53,8 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     """
     eta = oil["eta_diesel"]
     eps_table = np.concatenate([
-        np.linspace(0.001, 0.05, 10),
-        np.linspace(0.06, 0.98, 30),
+        np.linspace(0.001, 0.05, 5),
+        np.linspace(0.06, 0.98, 20),
     ])
     W_table = np.zeros(len(eps_table))
     P_prev = None
@@ -101,7 +101,7 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
     eps_mid = 0.5 * (eps_lo + eps_hi)
     F_hyd = mu = Qv = h_min = p_max = 0.0
 
-    for _ in range(12):
+    for _ in range(8):
         eps_mid = 0.5 * (eps_lo + eps_hi)
         H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
