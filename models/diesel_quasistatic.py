@@ -38,7 +38,7 @@ def load_diesel(phi_deg, F_max=None):
     F_gas = F_max * np.exp(-((phi_deg - 370) ** 2) / (2 * 30 ** 2))
     F_inertia = 0.1 * F_max * np.cos(2 * np.deg2rad(phi_deg))
     F_total = F_gas + F_inertia + 0.05 * F_max
-    return np.maximum(F_total, 1000.0)
+    return np.maximum(F_total, 20000.0)
 
 
 def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
@@ -52,7 +52,10 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     W_table   : (M,)
     """
     eta = oil["eta_diesel"]
-    eps_table = np.linspace(0.05, 0.95, 50)
+    eps_table = np.concatenate([
+        np.linspace(0.001, 0.05, 25),
+        np.linspace(0.06, 0.98, 60),
+    ])
     W_table = np.zeros(len(eps_table))
     P_prev = None
 
@@ -67,6 +70,7 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
         W_table[i] = F
         P_prev = P
 
+    print(f"    W_table: min={W_table.min()/1000:.1f} кН, max={W_table.max()/1000:.1f} кН")
     return eps_table, W_table
 
 
@@ -74,28 +78,31 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
                           Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
                           oil, textured=False, phi_c=None, Z_c=None,
                           closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
-    """Найти ε для заданной нагрузки: интерполяция + 5 шагов бисекции.
+    """Найти ε для заданной нагрузки: локализация по таблице + 12 шагов бисекции.
 
     Returns
     -------
-    eps_mid, F_hyd, mu, Q, h_min, p_max
+    eps_mid, F_hyd, mu, Q, h_min, p_max, status
     """
     eta = oil["eta_diesel"]
 
-    # Начальное приближение из таблицы
-    eps_guess = np.interp(F_target, W_table, eps_table)
-    eps_lo = max(eps_guess - 0.05, 0.01)
-    eps_hi = min(eps_guess + 0.05, 0.95)
+    # Локализация корня по таблице
+    status = "ok"
+    if F_target <= W_table[0]:
+        eps_lo, eps_hi = 0.001, eps_table[1]
+        status = "below_range"
+    elif F_target >= W_table[-1]:
+        eps_lo, eps_hi = eps_table[-2], 0.98
+        status = "above_range"
+    else:
+        j = np.searchsorted(W_table, F_target)
+        eps_lo, eps_hi = eps_table[j - 1], eps_table[j]
 
-    eps_mid = eps_guess
-    F_hyd = F_target
-    mu = 0.0
-    Qv = 0.0
-    h_min = 0.0
-    p_max = 0.0
+    eps_mid = 0.5 * (eps_lo + eps_hi)
+    F_hyd = mu = Qv = h_min = p_max = 0.0
 
-    for _ in range(5):
-        eps_mid = (eps_lo + eps_hi) / 2.0
+    for _ in range(12):
+        eps_mid = 0.5 * (eps_lo + eps_hi)
         H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
         _, F_hyd, mu, Qv, h_min, p_max = solve_and_compute(
@@ -108,7 +115,7 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
         else:
             eps_lo = eps_mid
 
-    return eps_mid, F_hyd, mu, Qv, h_min, p_max
+    return eps_mid, F_hyd, mu, Qv, h_min, p_max, status
 
 
 def run_diesel_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
@@ -144,22 +151,30 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
             closure=closure, cavitation=cavitation,
         )
 
+        print(f"    F_ext:   min={F_ext.min()/1000:.1f} кН, max={F_ext.max()/1000:.1f} кН")
+
         # Шаг 2: по каждому углу — бисекция
         print("    Расчёт по углам коленвала...")
+        n_below = n_above = 0
         for ip, phi_k in enumerate(PHI_CRANK):
             F_target = F_ext[ip]
-            eps_mid, F_hyd, mu, Qv, h_min, p_max = find_epsilon_for_load(
+            eps_mid, F_hyd, mu, Qv, h_min, p_max, st = find_epsilon_for_load(
                 F_target, eps_table, W_table,
                 Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
                 oil=cfg["oil"], textured=cfg["textured"],
                 phi_c=phi_c, Z_c=Z_c,
                 closure=closure, cavitation=cavitation,
             )
+            if st == "below_range":
+                n_below += 1
+            elif st == "above_range":
+                n_above += 1
             eps_arr[ic, ip] = eps_mid
             hmin_arr[ic, ip] = h_min
             f_arr[ic, ip] = mu
             pmax_arr[ic, ip] = p_max
             F_hyd_arr[ic, ip] = F_hyd
+        print(f"    Вне диапазона: {n_below} ниже, {n_above} выше (из {n_phi})")
 
     return {
         "phi_crank": PHI_CRANK,
