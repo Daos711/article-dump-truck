@@ -16,6 +16,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.ndimage import uniform_filter1d
 
 from models.diesel_transient import run_transient, load_diesel, CONFIGS
 from config import diesel_params as params
@@ -24,12 +25,25 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "diesel")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
+SMOOTH_WINDOW = 15  # окно сглаживания ≈ 7.5° при шаге 0.5°
+
+
 def plot_curves(phi, data, ylabel, filename, title):
-    """Построить график с 4 кривыми по углу коленвала (последний цикл)."""
+    """Построить график с 4 кривыми по углу коленвала (последний цикл).
+
+    Тонкая полупрозрачная линия — сырые данные, жирная — скользящее среднее.
+    """
     fig, ax = plt.subplots(figsize=(10, 5))
-    for ic, cfg in enumerate(CONFIGS):
+    n_cfg = data.shape[0]
+    for ic in range(n_cfg):
+        cfg = CONFIGS[ic]
+        # Сырые данные — фон
         ax.plot(phi, data[ic], color=cfg["color"], linestyle=cfg["ls"],
-                linewidth=1.5, label=cfg["label"])
+                linewidth=0.5, alpha=0.2)
+        # Сглаженные — основная линия
+        smooth = uniform_filter1d(data[ic], size=SMOOTH_WINDOW)
+        ax.plot(phi, smooth, color=cfg["color"], linestyle=cfg["ls"],
+                linewidth=1.8, label=cfg["label"])
     ax.set_xlabel("Угол коленвала φ (°)", fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
     ax.set_title(title, fontsize=13)
