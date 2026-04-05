@@ -6,6 +6,7 @@
 import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
+from reynolds_solver.squeeze import squeeze_to_api_params
 from models.bearing_model import setup_grid, setup_texture, DEFAULT_CLOSURE, DEFAULT_CAVITATION
 from config import diesel_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
@@ -62,21 +63,6 @@ def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
         H0, H_p, Phi_mesh, Z_mesh, phi_c_flat, Z_c_flat, A, B
     )
 
-
-def squeeze_to_api_params(vx, vy, c, omega_shaft, d_phi_mesh):
-    """Пересчёт скоростей вала (vx, vy) в параметры squeeze для солвера.
-
-    Солвер ожидает безразмерные xprime, yprime (= d(ε)/d(θ_shaft)),
-    и beta = (L/D)² (отношение длины к диаметру, в квадрате).
-
-    xprime = (1/c) · vx / omega_shaft  =  dεx / dθ
-    yprime = (1/c) · vy / omega_shaft  =  dεy / dθ
-    beta используется солвером для масштабирования squeeze-члена.
-    """
-    xprime = vx / (c * omega_shaft)
-    yprime = vy / (c * omega_shaft)
-    beta = 1.0  # стандартный масштаб, squeeze уже в безразмерной форме
-    return xprime, yprime, beta
 
 
 def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
