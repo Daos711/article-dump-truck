@@ -112,7 +112,8 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     if alpha_pv is not None:
         solver_kw["alpha_pv"] = alpha_pv
         solver_kw["p_scale"] = p_scale
-        solver_kw["pv_method"] = "transformed"
+        solver_kw["relax_pv"] = 0.4
+        solver_kw["max_outer_pv"] = 50
 
     result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
 
