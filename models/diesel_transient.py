@@ -148,81 +148,95 @@ def run_transient(F_max=None, debug=False,
         ex = params.eps_x0 * params.c
         ey = params.eps_y0 * params.c
         vx, vy = 0.0, 0.0
+        ax_prev, ay_prev = 0.0, 0.0  # ускорение на предыдущем шаге
         P_prev = None
         contact_count = 0
 
-        for step in range(n_steps):
-            phi_deg = phi_crank_deg[step] % 720.0
-            eps_x = ex / params.c
-            eps_y = ey / params.c
-
-            # 1. Зазор
-            H = build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, params,
-                           textured=cfg["textured"],
-                           phi_c_flat=phi_c, Z_c_flat=Z_c)
-
-            # 2. Squeeze
-            xprime, yprime, beta = squeeze_to_api_params(
-                -vx, -vy, params.c, omega, d_phi)
-
-            # 3. Решить Reynolds
-            solver_kw = dict(
-                closure=closure,
-                cavitation=cavitation,
-                omega=1.5,
-                tol=1e-5,
-                max_iter=50000,
-                P_init=P_prev,
-                xprime=xprime,
-                yprime=yprime,
-                beta=beta,
+        def _solve_at(ex_, ey_, vx_, vy_, P_init_):
+            """Решить Reynolds в точке (ex_, ey_) и вернуть силы."""
+            eps_x_ = ex_ / params.c
+            eps_y_ = ey_ / params.c
+            H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
+                            textured=cfg["textured"],
+                            phi_c_flat=phi_c, Z_c_flat=Z_c)
+            xp_, yp_, bt_ = squeeze_to_api_params(
+                -vx_, -vy_, params.c, omega, d_phi)
+            kw = dict(
+                closure=closure, cavitation=cavitation,
+                omega=1.5, tol=1e-5, max_iter=50000,
+                P_init=P_init_,
+                xprime=xp_, yprime=yp_, beta=bt_,
             )
             if alpha_pv is not None:
-                solver_kw["alpha_pv"] = alpha_pv
-                solver_kw["p_scale"] = p_scale
-                solver_kw["relax_pv"] = 0.4
-                solver_kw["max_outer_pv"] = 50
+                kw["alpha_pv"] = alpha_pv
+                kw["p_scale"] = p_scale
+                kw["relax_pv"] = 0.4
+                kw["max_outer_pv"] = 50
+            res = solve_reynolds(H_, d_phi, d_Z, params.R, params.L, **kw)
+            P_ = res[0]
+            Fx_, Fy_ = compute_hydro_forces(
+                P_, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
+            return P_, H_, Fx_, Fy_
 
-            result = solve_reynolds(H, d_phi, d_Z, params.R, params.L,
-                                    **solver_kw)
-            if len(result) == 4:
-                P, residual, n_iter, n_outer = result
-            else:
-                P, residual, n_iter = result
+        def _clamp(ex_, ey_, vx_, vy_):
+            """Clamp |ε| < eps_max, обнулить радиальную скорость к стенке."""
+            clamped = False
+            eps_mag_ = np.hypot(ex_, ey_) / params.c
+            if eps_mag_ > params.eps_max:
+                scale_ = params.eps_max / eps_mag_
+                ex_ *= scale_
+                ey_ *= scale_
+                e_hat_x_ = ex_ / (eps_mag_ * params.c)
+                e_hat_y_ = ey_ / (eps_mag_ * params.c)
+                v_rad_ = vx_ * e_hat_x_ + vy_ * e_hat_y_
+                if v_rad_ > 0:
+                    vx_ -= v_rad_ * e_hat_x_
+                    vy_ -= v_rad_ * e_hat_y_
+                clamped = True
+            return ex_, ey_, vx_, vy_, clamped
+
+        for step in range(n_steps):
+            phi_deg = phi_crank_deg[step] % 720.0
+
+            # --- Velocity Verlet ---
+            # 1. Predict position
+            ex_pred = ex + vx * dt + 0.5 * ax_prev * dt**2
+            ey_pred = ey + vy * dt + 0.5 * ay_prev * dt**2
+
+            # Clamp predicted position
+            ex_pred, ey_pred, vx, vy, clamped_pred = _clamp(
+                ex_pred, ey_pred, vx, vy)
+            if clamped_pred:
+                contact_count += 1
+                P_prev = None
+
+            # 2. Solve Reynolds at predicted position
+            P, H, Fx_hyd, Fy_hyd = _solve_at(
+                ex_pred, ey_pred, vx, vy, P_prev)
             P_prev = P
 
-            # 4. Гидродинамические силы
-            Fx_hyd, Fy_hyd = compute_hydro_forces(
-                P, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
-
-            # 5. Внешняя нагрузка
+            # 3. External load at current angle
             Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
             Fx_ext = float(Fx_ext)
             Fy_ext = float(Fy_ext)
 
-            # 6. Semi-implicit Euler
-            ax = (Fx_ext + Fx_hyd) / params.m_shaft
-            ay = (Fy_ext + Fy_hyd) / params.m_shaft
-            vx += ax * dt
-            vy += ay * dt
-            ex += vx * dt
-            ey += vy * dt
+            # 4. New acceleration
+            ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
+            ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
 
-            # 7. Clamp — защита от контакта
-            eps_mag = np.hypot(ex, ey) / params.c
-            if eps_mag > params.eps_max:
-                scale = params.eps_max / eps_mag
-                ex *= scale
-                ey *= scale
-                # Обнулить радиальную компоненту скорости (к стенке)
-                e_hat_x = ex / (eps_mag * params.c)
-                e_hat_y = ey / (eps_mag * params.c)
-                v_radial = vx * e_hat_x + vy * e_hat_y
-                if v_radial > 0:  # движется к стенке
-                    vx -= v_radial * e_hat_x
-                    vy -= v_radial * e_hat_y
+            # 5. Correct velocity
+            vx += 0.5 * (ax_prev + ax_new) * dt
+            vy += 0.5 * (ay_prev + ay_new) * dt
+
+            # 6. Accept position
+            ex, ey = ex_pred, ey_pred
+            ax_prev, ay_prev = ax_new, ay_new
+
+            # 7. Final clamp (safety)
+            ex, ey, vx, vy, clamped_final = _clamp(ex, ey, vx, vy)
+            if clamped_final:
                 contact_count += 1
-                P_prev = None  # сброс warm-start после скачка ε
+                P_prev = None
 
             # 8. Характеристики
             h_dim = H * params.c

@@ -8,6 +8,7 @@ summary.txt и data.npz для 4 конфигураций.
 import sys
 import os
 import time
+import argparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -42,19 +43,32 @@ def plot_curves(phi, data, ylabel, filename, title):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить data.npz и перестроить графики без расчёта")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("НЕСТАЦИОНАРНЫЙ РАСЧЁТ ПОДШИПНИКА ДВС")
     print("(Reynolds со squeeze + уравнение движения вала)")
     print("=" * 60)
 
-    t0 = time.time()
-    results = run_transient(debug=True)
-    dt_calc = time.time() - t0
-    print(f"\nВремя расчёта: {dt_calc:.1f} с")
+    data_path = os.path.join(RESULTS_DIR, "data.npz")
+
+    if args.plot_only:
+        print("Режим --plot-only: загрузка data.npz...")
+        d = np.load(data_path, allow_pickle=True)
+        results = {k: d[k] for k in d.files}
+        dt_calc = 0.0
+    else:
+        t0 = time.time()
+        results = run_transient(debug=True)
+        dt_calc = time.time() - t0
+        print(f"\nВремя расчёта: {dt_calc:.1f} с")
 
     # Индексы последнего цикла
-    s = results["last_start"]
-    nc = results["n_steps_per_cycle"]
+    s = results["last_start"] if "last_start" in results else int(results["last_start"])
+    nc = results["n_steps_per_cycle"] if "n_steps_per_cycle" in results else int(results["n_steps_per_cycle"])
     phi = results["phi_last"]
 
     eps_x = results["eps_x"][:, s:s+nc]
@@ -93,9 +107,22 @@ def main():
 
     # 6. Орбита вала (последний цикл)
     fig, ax = plt.subplots(figsize=(7, 7))
-    for ic, cfg in enumerate(CONFIGS):
+    n_cfg_actual = eps_x.shape[0]
+    kern = max(1, nc // 144)  # ядро сглаживания ~5 шагов при 720/цикл
+    for ic in range(n_cfg_actual):
+        cfg = CONFIGS[ic]
+        # Тонкая линия — сырая орбита
         ax.plot(eps_x[ic], eps_y[ic], color=cfg["color"], linestyle=cfg["ls"],
-                linewidth=1.2, label=cfg["label"])
+                linewidth=0.4, alpha=0.3)
+        # Жирная линия — скользящее среднее
+        if kern > 1:
+            kernel = np.ones(kern) / kern
+            sx = np.convolve(eps_x[ic], kernel, mode="same")
+            sy = np.convolve(eps_y[ic], kernel, mode="same")
+        else:
+            sx, sy = eps_x[ic], eps_y[ic]
+        ax.plot(sx, sy, color=cfg["color"], linestyle=cfg["ls"],
+                linewidth=1.8, label=cfg["label"])
         ax.plot(eps_x[ic, 0], eps_y[ic, 0], "o", color=cfg["color"], markersize=5)
     # Окружность зазора
     theta = np.linspace(0, 2 * np.pi, 200)
@@ -105,6 +132,18 @@ def main():
     ax.set_ylabel("εy", fontsize=12)
     ax.set_title("Орбита вала — последний цикл", fontsize=13)
     ax.set_aspect("equal")
+    # Автозум: ±10% от диапазона данных
+    all_ex = eps_x[:n_cfg_actual].ravel()
+    all_ey = eps_y[:n_cfg_actual].ravel()
+    valid = np.isfinite(all_ex) & np.isfinite(all_ey)
+    if np.any(valid):
+        margin = 0.1
+        xmin, xmax = all_ex[valid].min(), all_ex[valid].max()
+        ymin, ymax = all_ey[valid].min(), all_ey[valid].max()
+        dx = max(xmax - xmin, 0.1)
+        dy = max(ymax - ymin, 0.1)
+        ax.set_xlim(xmin - margin * dx, xmax + margin * dx)
+        ax.set_ylim(ymin - margin * dy, ymax + margin * dy)
     ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
