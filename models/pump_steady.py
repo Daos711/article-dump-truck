@@ -14,6 +14,7 @@ from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
 N_GRID = 300
 EPSILON_VALUES = np.linspace(0.1, 0.8, 15)
+MAX_OUTER_PV = 20  # порог расходимости пьезовязкого солвера
 
 CONFIGS = [
     {"label": "Гладкий + минеральное", "textured": False,
@@ -93,18 +94,31 @@ def run_pump_analysis(h_p_override=None,
                 n_outer_sum += n_out
                 n_outer_count += 1
 
-            W[ic, ie] = F
-            f[ic, ie] = mu
-            hmin[ic, ie] = h_m
-            Q[ic, ie] = Qv
-            F_tr[ic, ie] = F_friction
-            N_loss[ic, ie] = F_friction * U
-            pmax[ic, ie] = p_m
+            # Детекция расходимости пьезовязкого цикла
+            diverged = (n_out >= MAX_OUTER_PV)
+            if diverged:
+                W[ic, ie] = np.nan
+                f[ic, ie] = np.nan
+                hmin[ic, ie] = h_m  # геометрический, всегда валиден
+                Q[ic, ie] = np.nan
+                F_tr[ic, ie] = np.nan
+                N_loss[ic, ie] = np.nan
+                pmax[ic, ie] = np.nan
+                P_prev = None  # сбросить начальное приближение
+                print(f"    eps={eps:.2f}: РАСХОДИМОСТЬ (n_outer={n_out})")
+            else:
+                W[ic, ie] = F
+                f[ic, ie] = mu
+                hmin[ic, ie] = h_m
+                Q[ic, ie] = Qv
+                F_tr[ic, ie] = F_friction
+                N_loss[ic, ie] = F_friction * U
+                pmax[ic, ie] = p_m
 
-            pv_tag = f", n_outer={n_out}" if n_out > 0 else ""
-            print(f"    eps={eps:.2f}: W={F:.0f} Н, f={mu:.4f}, "
-                  f"F_tr={F_friction:.1f} Н, N_loss={F_friction*U:.0f} Вт, "
-                  f"h_min={h_m*1e6:.1f} мкм, p_max={p_m/1e6:.1f} МПа{pv_tag}")
+                pv_tag = f", n_outer={n_out}" if n_out > 0 else ""
+                print(f"    eps={eps:.2f}: W={F:.0f} Н, f={mu:.4f}, "
+                      f"F_tr={F_friction:.1f} Н, N_loss={F_friction*U:.0f} Вт, "
+                      f"h_min={h_m*1e6:.1f} мкм, p_max={p_m/1e6:.1f} МПа{pv_tag}")
 
     n_outer_avg = n_outer_sum / n_outer_count if n_outer_count > 0 else 0
     if n_outer_count > 0:
