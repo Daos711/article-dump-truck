@@ -74,10 +74,16 @@ def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
 def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
                       phi_1D, Z_1D, Phi_mesh, P_init=None,
                       closure=DEFAULT_CLOSURE,
-                      cavitation=DEFAULT_CAVITATION):
+                      cavitation=DEFAULT_CAVITATION,
+                      alpha_pv=None):
     """Решить уравнение Рейнольдса и вычислить интегральные характеристики.
 
     H, Phi_mesh, Z_mesh имеют shape (N_Z, N_phi) — формат солвера.
+
+    Parameters
+    ----------
+    alpha_pv : float or None
+        Коэффициент пьезовязкости Баруса (Па⁻¹). При None — изовязкий режим.
 
     Returns
     -------
@@ -88,11 +94,14 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     h_min : float — минимальный зазор (м)
     p_max : float — максимальное давление (Па)
     F_tr  : float — сила трения (Н)
+    n_outer : int — число внешних итераций пьезовязкости (0 для изовязкого)
     """
     omega = 2 * np.pi * n / 60.0  # угловая скорость (рад/с)
 
-    P, residual, n_iter = solve_reynolds(
-        H, d_phi, d_Z, R, L,
+    # Масштаб давления: p* = 6·η·ω·(R/c)² (стандартная безразмерная форма)
+    p_scale = 6.0 * eta * omega * (R / c) ** 2
+
+    solver_kw = dict(
         closure=closure,
         cavitation=cavitation,
         omega=1.5,
@@ -100,9 +109,19 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
         max_iter=50000,
         P_init=P_init,
     )
+    if alpha_pv is not None:
+        solver_kw["alpha_pv"] = alpha_pv
+        solver_kw["p_scale"] = p_scale
 
-    # Масштаб давления: p* = 6·η·ω·(R/c)² (стандартная безразмерная форма)
-    p_scale = 6.0 * eta * omega * (R / c) ** 2
+    result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
+
+    # Пьезовязкий солвер возвращает 4 элемента (P, delta, n_iter, n_outer),
+    # изовязкий — 3 (P, delta, n_iter).
+    if len(result) == 4:
+        P, residual, n_iter, n_outer = result
+    else:
+        P, residual, n_iter = result
+        n_outer = 0
 
     # Размерное давление
     P_dim = P * p_scale  # Па
@@ -141,4 +160,4 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     h_min = np.min(h_dim)
     p_max = np.max(P_dim)
 
-    return P, F, mu_val, Q, h_min, p_max, F_friction
+    return P, F, mu_val, Q, h_min, p_max, F_friction, n_outer

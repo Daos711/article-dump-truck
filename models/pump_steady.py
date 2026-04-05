@@ -65,8 +65,13 @@ def run_pump_analysis(h_p_override=None,
     N_loss = np.zeros((n_cfg, n_eps))
     pmax = np.zeros((n_cfg, n_eps))
 
+    n_outer_max = 0
+    n_outer_sum = 0
+    n_outer_count = 0
+
     for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_pump"]
+        alpha_pv = cfg["oil"].get("alpha_pv")
         P_prev = None
         print(f"  [{ic+1}/{n_cfg}] {cfg['label']}...")
 
@@ -75,12 +80,18 @@ def run_pump_analysis(h_p_override=None,
                        textured=cfg["textured"],
                        phi_c_flat=phi_c, Z_c_flat=Z_c)
 
-            P, F, mu, Qv, h_m, p_m, F_friction = solve_and_compute(
+            P, F, mu, Qv, h_m, p_m, F_friction, n_out = solve_and_compute(
                 H, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
                 phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
                 closure=closure, cavitation=cavitation,
+                alpha_pv=alpha_pv,
             )
             P_prev = P
+
+            if n_out > 0:
+                n_outer_max = max(n_outer_max, n_out)
+                n_outer_sum += n_out
+                n_outer_count += 1
 
             W[ic, ie] = F
             f[ic, ie] = mu
@@ -90,13 +101,20 @@ def run_pump_analysis(h_p_override=None,
             N_loss[ic, ie] = F_friction * U
             pmax[ic, ie] = p_m
 
+            pv_tag = f", n_outer={n_out}" if n_out > 0 else ""
             print(f"    eps={eps:.2f}: W={F:.0f} Н, f={mu:.4f}, "
                   f"F_tr={F_friction:.1f} Н, N_loss={F_friction*U:.0f} Вт, "
-                  f"h_min={h_m*1e6:.1f} мкм, p_max={p_m/1e6:.1f} МПа")
+                  f"h_min={h_m*1e6:.1f} мкм, p_max={p_m/1e6:.1f} МПа{pv_tag}")
+
+    n_outer_avg = n_outer_sum / n_outer_count if n_outer_count > 0 else 0
+    if n_outer_count > 0:
+        print(f"  Пьезовязкость: n_outer avg={n_outer_avg:.1f}, max={n_outer_max}")
 
     return {
         "epsilon": EPSILON_VALUES,
         "W": W, "f": f, "hmin": hmin, "Q": Q,
         "F_tr": F_tr, "N_loss": N_loss, "pmax": pmax,
         "configs": CONFIGS,
+        "n_outer_avg": n_outer_avg,
+        "n_outer_max": n_outer_max,
     }
