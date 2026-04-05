@@ -81,9 +81,18 @@ def main():
         print(f"\nВремя расчёта: {dt_calc:.1f} с")
 
     # Индексы последнего цикла
-    s = results["last_start"] if "last_start" in results else int(results["last_start"])
-    nc = results["n_steps_per_cycle"] if "n_steps_per_cycle" in results else int(results["n_steps_per_cycle"])
-    phi = results["phi_last"]
+    if "last_start" in results:
+        s = int(results["last_start"])
+        nc = int(results["n_steps_per_cycle"])
+        phi = results["phi_last"]
+    else:
+        # Восстановить из phi_crank_deg
+        phi_all = results["phi_crank_deg"]
+        nc = int(round(720.0 / params.d_phi_crank_deg))
+        n_total = len(phi_all)
+        n_cyc = max(1, n_total // nc)
+        s = nc * (n_cyc - 1)
+        phi = phi_all[s:s+nc]
 
     eps_x = results["eps_x"][:, s:s+nc]
     eps_y = results["eps_y"][:, s:s+nc]
