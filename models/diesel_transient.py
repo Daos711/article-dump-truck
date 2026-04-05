@@ -213,6 +213,33 @@ def run_transient(F_max=None, debug=False,
             Fx_ext = float(Fx_ext)
             Fy_ext = float(Fy_ext)
 
+            # DEBUG: первые 10 шагов — печать ключевых величин
+            if step < 10 and ic == 0:
+                print(f"    step={step}: εx={eps_x:.4f} εy={eps_y:.4f} "
+                      f"|ε|={np.sqrt(eps_x**2+eps_y**2):.4f}")
+                print(f"      vx={vx:.4f} vy={vy:.4f} "
+                      f"xprime={xprime:.4e} yprime={yprime:.4e}")
+                print(f"      P: min={np.min(P):.4e} max={np.max(P):.4e} "
+                      f"p_scale={p_scale:.2e}")
+                print(f"      Fx_hyd={Fx_hyd:.1f} Fy_hyd={Fy_hyd:.1f} "
+                      f"Fx_ext={Fx_ext:.1f} Fy_ext={Fy_ext:.1f}")
+                print(f"      H: min={np.min(H):.4f} max={np.max(H):.4f}")
+
+            # Проверка overflow
+            if not (np.isfinite(Fx_hyd) and np.isfinite(Fy_hyd)):
+                print(f"    OVERFLOW на шаге {step}! Остановка конфигурации.")
+                # Заполнить остаток NaN
+                eps_x_all[ic, step:] = np.nan
+                eps_y_all[ic, step:] = np.nan
+                hmin_all[ic, step:] = np.nan
+                pmax_all[ic, step:] = np.nan
+                f_all[ic, step:] = np.nan
+                Ftr_all[ic, step:] = np.nan
+                Nloss_all[ic, step:] = np.nan
+                Fx_hyd_all[ic, step:] = np.nan
+                Fy_hyd_all[ic, step:] = np.nan
+                break
+
             # 6. Semi-implicit Euler
             ax = (Fx_ext + Fx_hyd) / params.m_shaft
             ay = (Fy_ext + Fy_hyd) / params.m_shaft
