@@ -48,7 +48,7 @@ def main():
     print("=" * 60)
 
     t0 = time.time()
-    results = run_transient(debug=False)
+    results = run_transient(debug=True)
     dt_calc = time.time() - t0
     print(f"\nВремя расчёта: {dt_calc:.1f} с")
 
