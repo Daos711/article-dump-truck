@@ -231,7 +231,8 @@ def main():
                      f"N_loss(h_p) при ε = {eps_ref_actual:.2f} — текстура")
 
     # --- Выбор рекомендуемого h_p ---
-    # Критерий: максимальный W_gain при pmax_gain < 3 и Nloss_gain < 1.2
+    # Критерий: максимальный W_gain при умеренных pmax и Nloss.
+    # Штрафы: pmax_gain > 5 (перебор давления), Nloss_gain > 1.15.
     best_hp = H_P_VALUES_UM[0]
     best_score = 0
     best_reason = ""
@@ -245,10 +246,10 @@ def main():
         nloss_gain_avg = (g_min["Nloss_gain"] + g_rap["Nloss_gain"]) / 2
 
         score = w_gain_avg
-        if pmax_gain_avg > 3.0:
-            score *= 0.5  # штраф за высокое давление
-        if nloss_gain_avg > 1.2:
-            score *= 0.8  # штраф за потери
+        if pmax_gain_avg > 5.0:
+            score *= 0.3  # жёсткий штраф за высокое давление
+        if nloss_gain_avg > 1.15:
+            score *= 0.5  # штраф за потери
 
         if score > best_score:
             best_score = score
