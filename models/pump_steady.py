@@ -1,9 +1,10 @@
 """Стационарный анализ подшипника центробежного насоса.
 
 Для диапазона эксцентриситетов ε вычисляются характеристики W, f, h_min, Q,
-F_tr, N_loss для 4 конфигураций (гладкий/текстурированный × минеральное/рапсовое).
+F_tr, N_loss, p_max для 4 конфигураций (гладкий/текстурированный × минеральное/рапсовое).
 """
 import numpy as np
+import types
 from models.bearing_model import (
     setup_grid, setup_texture, make_H, solve_and_compute,
     DEFAULT_CLOSURE, DEFAULT_CAVITATION,
@@ -26,18 +27,32 @@ CONFIGS = [
 ]
 
 
-def run_pump_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
+def run_pump_analysis(h_p_override=None,
+                      closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
     """Выполнить стационарный расчёт для всех конфигураций.
+
+    Parameters
+    ----------
+    h_p_override : float or None
+        Если задано, использовать эту глубину текстуры вместо params.h_p.
 
     Returns
     -------
     results : dict
     """
-    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_GRID)
-    phi_c, Z_c = setup_texture(params)
+    # Если нужно переопределить h_p — создаём копию params
+    if h_p_override is not None:
+        p = types.SimpleNamespace(**{k: getattr(params, k)
+                                     for k in dir(params) if not k.startswith('_')})
+        p.h_p = h_p_override
+    else:
+        p = params
 
-    omega = 2 * np.pi * params.n / 60.0
-    U = omega * params.R  # линейная скорость вала
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_GRID)
+    phi_c, Z_c = setup_texture(p)
+
+    omega = 2 * np.pi * p.n / 60.0
+    U = omega * p.R
 
     n_eps = len(EPSILON_VALUES)
     n_cfg = len(CONFIGS)
@@ -48,6 +63,7 @@ def run_pump_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
     Q = np.zeros((n_cfg, n_eps))
     F_tr = np.zeros((n_cfg, n_eps))
     N_loss = np.zeros((n_cfg, n_eps))
+    pmax = np.zeros((n_cfg, n_eps))
 
     for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_pump"]
@@ -55,12 +71,12 @@ def run_pump_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
         print(f"  [{ic+1}/{n_cfg}] {cfg['label']}...")
 
         for ie, eps in enumerate(EPSILON_VALUES):
-            H = make_H(eps, Phi_mesh, Z_mesh, params,
+            H = make_H(eps, Phi_mesh, Z_mesh, p,
                        textured=cfg["textured"],
                        phi_c_flat=phi_c, Z_c_flat=Z_c)
 
             P, F, mu, Qv, h_m, p_m, F_friction = solve_and_compute(
-                H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
+                H, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
                 phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
                 closure=closure, cavitation=cavitation,
             )
@@ -72,6 +88,7 @@ def run_pump_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
             Q[ic, ie] = Qv
             F_tr[ic, ie] = F_friction
             N_loss[ic, ie] = F_friction * U
+            pmax[ic, ie] = p_m
 
             print(f"    eps={eps:.2f}: W={F:.0f} Н, f={mu:.4f}, "
                   f"F_tr={F_friction:.1f} Н, N_loss={F_friction*U:.0f} Вт, "
@@ -80,6 +97,6 @@ def run_pump_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
     return {
         "epsilon": EPSILON_VALUES,
         "W": W, "f": f, "hmin": hmin, "Q": Q,
-        "F_tr": F_tr, "N_loss": N_loss,
+        "F_tr": F_tr, "N_loss": N_loss, "pmax": pmax,
         "configs": CONFIGS,
     }
