@@ -54,6 +54,7 @@ def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
                textured=False, phi_c_flat=None, Z_c_flat=None):
     """Зазор для 2D-эксцентриситета: H = 1 − εx·cos(θ) − εy·sin(θ) [+ текстура]."""
     H0 = 1.0 - eps_x * np.cos(Phi_mesh) - eps_y * np.sin(Phi_mesh)
+    H0 = np.sqrt(H0**2 + (2e-6 / p.c)**2)  # регуляризация σ = 2 мкм
     if not textured:
         return H0
     A = 2 * p.a_dim / p.L
@@ -136,7 +137,7 @@ def run_transient(F_max=None, debug=False,
 
     phi_crank_deg = np.arange(n_steps) * params.d_phi_crank_deg
 
-    for ic, cfg in enumerate(CONFIGS[:1]):  # TEST: только 1 конфиг, вернуть CONFIGS
+    for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_diesel"]
         alpha_pv = None  # пьезовязкость отключена до стабилизации transient
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
