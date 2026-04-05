@@ -52,8 +52,8 @@ def load_diesel(phi_deg, F_max=None, sigma=None):
 
 def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
                textured=False, phi_c_flat=None, Z_c_flat=None):
-    """Зазор для 2D-эксцентриситета: H = 1 + εx·cos(θ) + εy·sin(θ) [+ текстура]."""
-    H0 = 1.0 + eps_x * np.cos(Phi_mesh) + eps_y * np.sin(Phi_mesh)
+    """Зазор для 2D-эксцентриситета: H = 1 − εx·cos(θ) − εy·sin(θ) [+ текстура]."""
+    H0 = 1.0 - eps_x * np.cos(Phi_mesh) - eps_y * np.sin(Phi_mesh)
     if not textured:
         return H0
     A = 2 * p.a_dim / p.L
@@ -162,7 +162,7 @@ def run_transient(F_max=None, debug=False,
 
             # 2. Squeeze
             xprime, yprime, beta = squeeze_to_api_params(
-                vx, vy, params.c, omega, d_phi)
+                -vx, -vy, params.c, omega, d_phi)
 
             # 3. Решить Reynolds
             solver_kw = dict(
