@@ -138,7 +138,7 @@ def run_transient(F_max=None, debug=False,
 
     for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_diesel"]
-        alpha_pv = cfg["oil"].get("alpha_pv")
+        alpha_pv = None  # пьезовязкость отключена до стабилизации transient
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
 
         print(f"\n  [{ic+1}/{n_cfg}] {cfg['label']}...")
@@ -208,7 +208,7 @@ def run_transient(F_max=None, debug=False,
             ey += vy * dt
 
             # 7. Clamp — защита от контакта
-            eps_mag = np.sqrt(ex**2 + ey**2) / params.c
+            eps_mag = np.hypot(ex, ey) / params.c
             if eps_mag > params.eps_max:
                 scale = params.eps_max / eps_mag
                 ex *= scale
@@ -221,6 +221,7 @@ def run_transient(F_max=None, debug=False,
                     vx -= v_radial * e_hat_x
                     vy -= v_radial * e_hat_y
                 contact_count += 1
+                P_prev = None  # сброс warm-start после скачка ε
 
             # 8. Характеристики
             h_dim = H * params.c
@@ -229,7 +230,7 @@ def run_transient(F_max=None, debug=False,
             F_friction = compute_friction(
                 P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
                 eta, omega, params.R, params.L, params.c)
-            F_hyd_mag = np.sqrt(Fx_hyd**2 + Fy_hyd**2)
+            F_hyd_mag = np.hypot(Fx_hyd, Fy_hyd)
             mu_val = F_friction / max(F_hyd_mag, 1.0)
 
             eps_x_all[ic, step] = ex / params.c
