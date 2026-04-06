@@ -81,41 +81,68 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--grid", type=int, default=300,
                         help="Размер сетки NxN (default: 300)")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить data.npz и перестроить графики без расчёта")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Путь к папке с data.npz для --plot-only")
     args = parser.parse_args()
 
     pump_steady.N_GRID = args.grid
-    RESULTS_DIR = make_results_dir()
 
-    print("=" * 60)
-    print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
-    print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
-    print(f"Сетка: {args.grid}×{args.grid}, σ = {params.sigma*1e6:.1f} мкм")
-    print(f"Результаты → {RESULTS_DIR}")
-    print("=" * 60)
+    if args.plot_only:
+        RESULTS_DIR = args.data_dir or os.path.join(
+            os.path.dirname(__file__), "..", "results", "pump")
+        print("=" * 60)
+        print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА — PLOT ONLY")
+        print(f"Загрузка из {RESULTS_DIR}")
+        print("=" * 60)
+
+        d = np.load(os.path.join(RESULTS_DIR, "data.npz"), allow_pickle=True)
+        eps = d["epsilon"]
+        best_hp = int(d["recommended_hp_um"])
+
+        # Восстановить all_results из data.npz
+        all_results = {}
+        for h_p_um in H_P_VALUES_UM:
+            prefix = f"hp{h_p_um}_"
+            r = {"epsilon": eps}
+            for key in ["W", "f", "hmin", "Q", "F_tr", "N_loss", "pmax"]:
+                r[key] = d[prefix + key]
+            all_results[h_p_um] = r
+    else:
+        RESULTS_DIR = make_results_dir()
+
+        print("=" * 60)
+        print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
+        print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
+        print(f"Сетка: {args.grid}×{args.grid}, σ = {params.sigma*1e6:.1f} мкм")
+        print(f"Результаты → {RESULTS_DIR}")
+        print("=" * 60)
 
     # Индекс ε ближайший к EPS_REF
     ie_ref = np.argmin(np.abs(EPSILON_VALUES - EPS_REF))
     eps_ref_actual = EPSILON_VALUES[ie_ref]
     print(f"Опорный эксцентриситет: ε = {eps_ref_actual:.2f}")
 
-    # --- Sweep по h_p ---
-    all_results = {}
-    t0_total = time.time()
+    if not args.plot_only:
+        # --- Sweep по h_p ---
+        all_results = {}
+        t0_total = time.time()
 
-    for h_p_um in H_P_VALUES_UM:
-        h_p_m = h_p_um * 1e-6
-        print(f"\n{'='*40}")
-        print(f"h_p = {h_p_um} мкм")
-        print(f"{'='*40}")
+        for h_p_um in H_P_VALUES_UM:
+            h_p_m = h_p_um * 1e-6
+            print(f"\n{'='*40}")
+            print(f"h_p = {h_p_um} мкм")
+            print(f"{'='*40}")
 
-        t0 = time.time()
-        results = run_pump_analysis(h_p_override=h_p_m)
-        dt = time.time() - t0
-        print(f"Время: {dt:.1f} с")
-        all_results[h_p_um] = results
+            t0 = time.time()
+            results = run_pump_analysis(h_p_override=h_p_m)
+            dt = time.time() - t0
+            print(f"Время: {dt:.1f} с")
+            all_results[h_p_um] = results
 
-    dt_total = time.time() - t0_total
-    print(f"\nОбщее время sweep: {dt_total:.1f} с")
+        dt_total = time.time() - t0_total
+        print(f"\nОбщее время sweep: {dt_total:.1f} с")
 
     # --- Сводная таблица при ε = EPS_REF ---
     # Индексы конфигураций: 0=smooth+mineral, 1=smooth+rapeseed,
