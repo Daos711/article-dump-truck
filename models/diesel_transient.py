@@ -104,7 +104,7 @@ def run_transient(F_max=None, debug=False,
         F_max = params.F_max_debug if debug else params.F_max
 
     N = params.N_grid_transient
-    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N)
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N, N)
     phi_c, Z_c = setup_texture(params)
 
     omega = 2 * np.pi * params.n / 60.0

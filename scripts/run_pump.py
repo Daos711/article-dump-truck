@@ -26,9 +26,9 @@ from config import pump_params as params
 
 def make_results_dir():
     hp_um = int(params.h_p * 1e6)
-    N = pump_steady.N_GRID
     tag = datetime.now().strftime("%y%m%d_%H%M")
-    name = f"{tag}_grid{N}_hp{hp_um}_sigma{params.sigma*1e6:.1f}um"
+    name = (f"{tag}_{pump_steady.N_PHI}x{pump_steady.N_Z}"
+            f"_hp{hp_um}_sigma{params.sigma*1e6:.1f}um")
     d = os.path.join(os.path.dirname(__file__), "..", "results", "pump", name)
     os.makedirs(d, exist_ok=True)
     return d
@@ -79,15 +79,23 @@ def main():
     global RESULTS_DIR
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--grid", type=int, default=300,
-                        help="Размер сетки NxN (default: 300)")
+    parser.add_argument("--nphi", type=int, default=800,
+                        help="Узлов по φ (default: 800)")
+    parser.add_argument("--nz", type=int, default=200,
+                        help="Узлов по Z (default: 200)")
+    parser.add_argument("--hp", type=float, default=None,
+                        help="Одна глубина для теста (мкм). Без — sweep [15,30,45,60]")
     parser.add_argument("--plot-only", action="store_true",
                         help="Загрузить data.npz и перестроить графики без расчёта")
     parser.add_argument("--data-dir", type=str, default=None,
                         help="Путь к папке с data.npz для --plot-only")
     args = parser.parse_args()
 
-    pump_steady.N_GRID = args.grid
+    pump_steady.N_PHI = args.nphi
+    pump_steady.N_Z = args.nz
+
+    if args.hp is not None:
+        H_P_VALUES_UM = [int(args.hp)]
 
     if args.plot_only:
         RESULTS_DIR = args.data_dir or os.path.join(
@@ -115,7 +123,7 @@ def main():
         print("=" * 60)
         print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
         print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
-        print(f"Сетка: {args.grid}×{args.grid}, σ = {params.sigma*1e6:.1f} мкм")
+        print(f"Сетка: {args.nphi}×{args.nz}, σ = {params.sigma*1e6:.1f} мкм")
         print(f"Результаты → {RESULTS_DIR}")
         print("=" * 60)
 

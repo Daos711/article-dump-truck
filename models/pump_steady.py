@@ -12,7 +12,8 @@ from models.bearing_model import (
 from config import pump_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
-N_GRID = 300
+N_PHI = 800
+N_Z = 200
 EPSILON_VALUES = np.linspace(0.1, 0.8, 15)
 MAX_OUTER_PV = 50  # порог расходимости пьезовязкого солвера
 
@@ -49,7 +50,7 @@ def run_pump_analysis(h_p_override=None,
     else:
         p = params
 
-    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_GRID)
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_PHI, N_Z)
     phi_c, Z_c = setup_texture(p)
 
     omega = 2 * np.pi * p.n / 60.0
@@ -79,7 +80,8 @@ def run_pump_analysis(h_p_override=None,
         for ie, eps in enumerate(EPSILON_VALUES):
             H = make_H(eps, Phi_mesh, Z_mesh, p,
                        textured=cfg["textured"],
-                       phi_c_flat=phi_c, Z_c_flat=Z_c)
+                       phi_c_flat=phi_c, Z_c_flat=Z_c,
+                       profile="smoothcap")
 
             P, F, mu, Qv, h_m, p_m, F_friction, n_out = solve_and_compute(
                 H, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,

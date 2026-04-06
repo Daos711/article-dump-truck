@@ -125,7 +125,7 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
     -------
     results : dict
     """
-    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_GRID)
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N_GRID, N_GRID)
     phi_c, Z_c = setup_texture(params)
 
     F_ext = load_diesel(PHI_CRANK)
