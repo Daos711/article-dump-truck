@@ -23,8 +23,6 @@ CONFIGS = [
 ]
 
 
-LAMBDA_CRANK = 0.27  # R_crank / L_rod для БелАЗ
-
 
 def load_diesel(phi_deg, F_max=None):
     """Нагрузка ДВС: Вибе-функция + КШМ-разложение на Fx, Fy.
@@ -56,7 +54,8 @@ def load_diesel(phi_deg, F_max=None):
     F_total = F_vibe + params.F_base
 
     # КШМ-разложение: проекции одной и той же F_total
-    beta = np.arcsin(LAMBDA_CRANK * np.sin(np.deg2rad(phi)))
+    phi_rad = np.deg2rad(phi)
+    beta = np.arcsin(params.lambda_crank * np.sin(phi_rad))
     Fx = F_total * np.sin(beta)
     Fy = -F_total * np.cos(beta)
 
