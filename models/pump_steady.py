@@ -88,6 +88,7 @@ def run_pump_analysis(h_p_override=None,
                 phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
                 closure=closure, cavitation=cavitation,
                 alpha_pv=alpha_pv,
+                subcell_quad=True,
             )
             P_prev = P
 
