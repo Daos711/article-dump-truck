@@ -149,7 +149,7 @@ def run_transient(F_max=None, debug=False,
 
     phi_crank_deg = np.arange(n_steps) * params.d_phi_crank_deg
 
-    for ic, cfg in enumerate(CONFIGS[:1]):  # TEST: 1 конфиг, вернуть CONFIGS
+    for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_diesel"]
         alpha_pv = None  # пьезовязкость отключена до стабилизации transient
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
