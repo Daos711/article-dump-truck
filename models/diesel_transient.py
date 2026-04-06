@@ -144,7 +144,7 @@ def run_transient(F_max=None, debug=False,
 
     for ic, cfg in enumerate(CONFIGS[:1]):  # ТЕСТ: 1 конфиг для оценки времени
         eta = cfg["oil"]["eta_diesel"]
-        alpha_pv = cfg["oil"].get("alpha_pv")
+        alpha_pv = None  # PV отключена — overflow при 850 кН
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
 
         print(f"\n  [{ic+1}/{n_cfg}] {cfg['label']}...")
