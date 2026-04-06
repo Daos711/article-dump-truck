@@ -1,8 +1,9 @@
 """Нестационарная модель подшипника ДВС (time-stepping).
 
 Совместное решение уравнения Рейнольдса со squeeze и уравнения движения вала.
-Интегратор: semi-implicit Euler.
+Интегратор: Velocity Verlet с sub-iterations.
 """
+import time as _time
 import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
@@ -23,27 +24,15 @@ CONFIGS = [
 ]
 
 
-
 def load_diesel(phi_deg, F_max=None):
-    """Нагрузка ДВС: Вибе-функция + КШМ-разложение на Fx, Fy.
-
-    Parameters
-    ----------
-    phi_deg : float or array — угол ПКВ (0..720°)
-    F_max : float — пиковая нагрузка (Н)
-
-    Returns
-    -------
-    Fx, Fy : float or array — компоненты нагрузки (Н).
-    """
+    """Нагрузка ДВС: Вибе-функция + КШМ-разложение на Fx, Fy."""
     if F_max is None:
         F_max = params.F_max
 
     phi = np.atleast_1d(np.asarray(phi_deg, dtype=float)) % 720.0
 
-    # Вибе-функция: асимметричный пик
-    phi_s = 345.0   # начало нарастания (°)
-    phi_p = 370.0   # пик (°)
+    phi_s = 345.0
+    phi_p = 370.0
     m_vibe = 2.0
     k_vibe = 1.2
 
@@ -53,7 +42,6 @@ def load_diesel(phi_deg, F_max=None):
         0.0)
     F_total = F_vibe + params.F_base
 
-    # КШМ-разложение: проекции одной и той же F_total
     phi_rad = np.deg2rad(phi)
     beta = np.arcsin(params.lambda_crank * np.sin(phi_rad))
     Fx = F_total * np.sin(beta)
@@ -77,12 +65,8 @@ def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
     )
 
 
-
 def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
-    """Вычислить компоненты гидродинамической силы на вал.
-
-    Знаки соответствуют bearing_model.py: при ey < 0 → Fy_hyd > 0.
-    """
+    """Вычислить компоненты гидродинамической силы на вал."""
     P_dim = P * p_scale
     Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
                    Z_1D, axis=0) * R * L / 2
@@ -93,7 +77,7 @@ def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
 
 def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
                      eta, omega, R, L, c):
-    """Сила трения и коэффициент трения (как в bearing_model.py)."""
+    """Сила трения."""
     P_dim = P * p_scale
     h_dim = H * c
     tau_couette = eta * omega * R / h_dim
@@ -105,19 +89,17 @@ def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
     return F_friction
 
 
+def get_step_deg(phi_deg):
+    """Адаптивный шаг: 0.25° у пика Вибе, базовый вне."""
+    phi_mod = phi_deg % 720.0
+    if 330.0 <= phi_mod <= 420.0:
+        return 0.25
+    return params.d_phi_crank_deg
+
+
 def run_transient(F_max=None, debug=False,
                   closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
-    """Нестационарный расчёт для всех 4 конфигураций.
-
-    Parameters
-    ----------
-    F_max : float or None — пиковая нагрузка. При None берётся из params.
-    debug : bool — если True, использует F_max_debug.
-
-    Returns
-    -------
-    results : dict
-    """
+    """Нестационарный расчёт для всех 4 конфигураций."""
     if F_max is None:
         F_max = params.F_max_debug if debug else params.F_max
 
@@ -125,18 +107,30 @@ def run_transient(F_max=None, debug=False,
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N)
     phi_c, Z_c = setup_texture(params)
 
-    omega = 2 * np.pi * params.n / 60.0  # рад/с вала
+    omega = 2 * np.pi * params.n / 60.0
     U = omega * params.R
-    d_phi_crank_rad = np.deg2rad(params.d_phi_crank_deg)
-    dt = d_phi_crank_rad / omega
-    n_steps_per_cycle = int(round(720.0 / params.d_phi_crank_deg))
-    n_steps = n_steps_per_cycle * params.n_cycles
+    N_SUB = params.n_sub_iterations
 
-    print(f"  Параметры: F_max={F_max/1e3:.0f} кН, dt={dt*1e6:.1f} мкс, "
-          f"{n_steps} шагов ({params.n_cycles} цикла × {n_steps_per_cycle})")
+    # Предвычислить адаптивную сетку углов
+    phi_list = []
+    phi_cur = 0.0
+    phi_total = 720.0 * params.n_cycles
+    while phi_cur < phi_total - 1e-9:
+        phi_list.append(phi_cur)
+        phi_cur += get_step_deg(phi_cur)
+    phi_crank_deg = np.array(phi_list)
+    n_steps = len(phi_crank_deg)
+
+    # Индексы последнего цикла: найти первый шаг >= 720*(n_cycles-1)
+    last_cycle_start_deg = 720.0 * (params.n_cycles - 1)
+    last_start = int(np.searchsorted(phi_crank_deg, last_cycle_start_deg))
+    n_last = n_steps - last_start
+
+    print(f"  Параметры: F_max={F_max/1e3:.0f} кН, "
+          f"{n_steps} шагов (адаптивный: 0.25° пик / {params.d_phi_crank_deg}° вне), "
+          f"N_SUB={N_SUB}, {params.n_cycles} цикла")
 
     n_cfg = len(CONFIGS)
-    # Массивы для всех шагов
     eps_x_all = np.zeros((n_cfg, n_steps))
     eps_y_all = np.zeros((n_cfg, n_steps))
     hmin_all = np.zeros((n_cfg, n_steps))
@@ -146,26 +140,27 @@ def run_transient(F_max=None, debug=False,
     Nloss_all = np.zeros((n_cfg, n_steps))
     Fx_hyd_all = np.zeros((n_cfg, n_steps))
     Fy_hyd_all = np.zeros((n_cfg, n_steps))
-
-    phi_crank_deg = np.arange(n_steps) * params.d_phi_crank_deg
+    cfg_times = []  # время каждого конфига
 
     for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_diesel"]
-        alpha_pv = None  # пьезовязкость отключена до стабилизации transient
+        alpha_pv = cfg["oil"].get("alpha_pv")
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
 
         print(f"\n  [{ic+1}/{n_cfg}] {cfg['label']}...")
+        t_cfg_start = _time.time()
 
         # Начальные условия
         ex = params.eps_x0 * params.c
         ey = params.eps_y0 * params.c
         vx, vy = 0.0, 0.0
-        ax_prev, ay_prev = 0.0, 0.0  # ускорение на предыдущем шаге
+        ax_prev, ay_prev = 0.0, 0.0
         P_prev = None
         contact_count = 0
+        pv_fallback_count = 0
 
-        def _solve_at(ex_, ey_, vx_, vy_, P_init_):
-            """Решить Reynolds в точке (ex_, ey_) и вернуть силы."""
+        def _solve_at(ex_, ey_, vx_, vy_, P_init_, phi_deg_):
+            """Решить Reynolds в точке (ex_, ey_) и вернуть P, H, Fx, Fy."""
             eps_x_ = ex_ / params.c
             eps_y_ = ey_ / params.c
             H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
@@ -180,18 +175,21 @@ def run_transient(F_max=None, debug=False,
                 xprime=xp_, yprime=yp_, beta=bt_,
             )
             if alpha_pv is not None:
+                phi_mod = phi_deg_ % 720.0
+                near_peak = 330.0 <= phi_mod <= 420.0
                 kw["alpha_pv"] = alpha_pv
                 kw["p_scale"] = p_scale
-                kw["relax_pv"] = 0.4
-                kw["max_outer_pv"] = 50
+                kw["relax_pv"] = 0.2 if near_peak else 0.4
+                kw["max_outer_pv"] = 80 if near_peak else 50
             res = solve_reynolds(H_, d_phi, d_Z, params.R, params.L, **kw)
             P_ = res[0]
+            n_outer_ = res[3] if len(res) == 4 else 0
+            max_outer_ = kw.get("max_outer_pv", 0)
             Fx_, Fy_ = compute_hydro_forces(
                 P_, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
-            return P_, H_, Fx_, Fy_
+            return P_, H_, Fx_, Fy_, n_outer_, max_outer_
 
         def _clamp(ex_, ey_, vx_, vy_):
-            """Clamp |ε| < eps_max, обнулить радиальную скорость к стенке."""
             clamped = False
             eps_mag_ = np.hypot(ex_, ey_) / params.c
             if eps_mag_ > params.eps_max:
@@ -207,50 +205,97 @@ def run_transient(F_max=None, debug=False,
                 clamped = True
             return ex_, ey_, vx_, vy_, clamped
 
+        progress_interval = max(1, n_steps // 10)
+
         for step in range(n_steps):
             phi_deg = phi_crank_deg[step] % 720.0
+            dt_step = np.deg2rad(get_step_deg(phi_crank_deg[step])) / omega
 
-            # --- Velocity Verlet ---
-            # 1. Predict position
-            ex_pred = ex + vx * dt + 0.5 * ax_prev * dt**2
-            ey_pred = ey + vy * dt + 0.5 * ay_prev * dt**2
+            # Сохранить состояние на начало шага
+            ex_n, ey_n = ex, ey
+            vx_n, vy_n = vx, vy
 
-            # Clamp predicted position
-            ex_pred, ey_pred, vx, vy, clamped_pred = _clamp(
-                ex_pred, ey_pred, vx, vy)
-            if clamped_pred:
+            # --- Velocity Verlet с sub-iterations ---
+            # Начальный predict
+            ex_pred = ex_n + vx_n * dt_step + 0.5 * ax_prev * dt_step**2
+            ey_pred = ey_n + vy_n * dt_step + 0.5 * ay_prev * dt_step**2
+            ex_pred, ey_pred, vx_corr, vy_corr, clamped_p = _clamp(
+                ex_pred, ey_pred, vx_n, vy_n)
+            if clamped_p:
                 contact_count += 1
                 P_prev = None
 
-            # 2. Solve Reynolds at predicted position
-            P, H, Fx_hyd, Fy_hyd = _solve_at(
-                ex_pred, ey_pred, vx, vy, P_prev)
-            P_prev = P
+            vx_corr, vy_corr = vx_n, vy_n  # reset for sub-iteration
+            ax_new, ay_new = ax_prev, ay_prev
 
-            # 3. External load at current angle
-            Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
-            Fx_ext = float(Fx_ext)
-            Fy_ext = float(Fy_ext)
+            for k in range(N_SUB):
+                # Solve Reynolds at current predicted position
+                P, H, Fx_hyd, Fy_hyd, n_outer, max_outer = _solve_at(
+                    ex_pred, ey_pred, vx_corr, vy_corr, P_prev, phi_deg)
 
-            # 4. New acceleration
-            ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
-            ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
+                # Пьезовязкость: откат к изовязкому при расходимости
+                if alpha_pv is not None and max_outer > 0 and n_outer >= max_outer:
+                    pv_fallback_count += 1
+                    kw_iso = dict(
+                        closure=closure, cavitation=cavitation,
+                        omega=1.5, tol=1e-5, max_iter=50000,
+                        P_init=None,
+                        xprime=0.0, yprime=0.0, beta=2.0,
+                    )
+                    xp_, yp_, bt_ = squeeze_to_api_params(
+                        -vx_corr, -vy_corr, params.c, omega, d_phi)
+                    kw_iso["xprime"] = xp_
+                    kw_iso["yprime"] = yp_
+                    kw_iso["beta"] = bt_
+                    eps_x_ = ex_pred / params.c
+                    eps_y_ = ey_pred / params.c
+                    H_fb = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
+                                      textured=cfg["textured"],
+                                      phi_c_flat=phi_c, Z_c_flat=Z_c)
+                    res_fb = solve_reynolds(H_fb, d_phi, d_Z, params.R, params.L,
+                                           **kw_iso)
+                    P = res_fb[0]
+                    H = H_fb
+                    Fx_hyd, Fy_hyd = compute_hydro_forces(
+                        P, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
 
-            # 5. Correct velocity
-            vx += 0.5 * (ax_prev + ax_new) * dt
-            vy += 0.5 * (ay_prev + ay_new) * dt
+                P_prev = P
 
-            # 6. Accept position
+                # External load
+                Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
+                Fx_ext = float(Fx_ext)
+                Fy_ext = float(Fy_ext)
+
+                # New acceleration
+                ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
+                ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
+
+                # Correct velocity
+                vx_corr = vx_n + 0.5 * (ax_prev + ax_new) * dt_step
+                vy_corr = vy_n + 0.5 * (ay_prev + ay_new) * dt_step
+
+                # Re-predict for next sub-iteration (except last)
+                if k < N_SUB - 1:
+                    ex_pred = ex_n + vx_corr * dt_step + 0.5 * ax_new * dt_step**2
+                    ey_pred = ey_n + vy_corr * dt_step + 0.5 * ay_new * dt_step**2
+                    ex_pred, ey_pred, vx_corr, vy_corr, cl = _clamp(
+                        ex_pred, ey_pred, vx_corr, vy_corr)
+                    if cl:
+                        contact_count += 1
+                        P_prev = None
+
+            # Accept
             ex, ey = ex_pred, ey_pred
+            vx, vy = vx_corr, vy_corr
             ax_prev, ay_prev = ax_new, ay_new
 
-            # 7. Final clamp (safety)
+            # Final clamp
             ex, ey, vx, vy, clamped_final = _clamp(ex, ey, vx, vy)
             if clamped_final:
                 contact_count += 1
                 P_prev = None
 
-            # 8. Характеристики
+            # Характеристики
             h_dim = H * params.c
             h_min = np.min(h_dim)
             p_max = np.max(P * p_scale)
@@ -270,28 +315,29 @@ def run_transient(F_max=None, debug=False,
             Fx_hyd_all[ic, step] = Fx_hyd
             Fy_hyd_all[ic, step] = Fy_hyd
 
-            # Прогресс (каждые 10%)
-            if (step + 1) % (n_steps // 10) == 0:
+            if (step + 1) % progress_interval == 0:
                 pct = 100 * (step + 1) / n_steps
-                eps_now = np.sqrt(ex**2 + ey**2) / params.c
+                eps_now = np.hypot(ex, ey) / params.c
                 print(f"    {pct:3.0f}%: φ={phi_deg:6.1f}°, "
                       f"|ε|={eps_now:.3f}, h_min={h_min*1e6:.1f} мкм, "
                       f"p_max={p_max/1e6:.1f} МПа")
 
+        t_cfg = _time.time() - t_cfg_start
+        cfg_times.append(t_cfg)
         print(f"    Контакт (clamp): {contact_count} из {n_steps} шагов")
+        if pv_fallback_count > 0:
+            print(f"    Пьезовязкость: {pv_fallback_count} откатов к изовязкому")
+        print(f"    Время: {t_cfg:.1f} с")
 
-    # Углы ПКВ для последнего цикла
-    last_start = n_steps_per_cycle * (params.n_cycles - 1)
-    phi_last = phi_crank_deg[last_start:last_start + n_steps_per_cycle]
-
-    # Внешняя нагрузка для последнего цикла
+    # Углы для последнего цикла
+    phi_last = phi_crank_deg[last_start:]
     Fx_ext_last, Fy_ext_last = load_diesel(phi_last % 720.0, F_max=F_max)
 
     return {
         "phi_crank_deg": phi_crank_deg,
         "phi_last": phi_last,
         "last_start": last_start,
-        "n_steps_per_cycle": n_steps_per_cycle,
+        "n_steps_per_cycle": n_last,
         "eps_x": eps_x_all,
         "eps_y": eps_y_all,
         "hmin": hmin_all,
@@ -304,5 +350,5 @@ def run_transient(F_max=None, debug=False,
         "Fy_ext_last": Fy_ext_last,
         "F_max": F_max,
         "configs": CONFIGS,
-        "dt": dt,
+        "cfg_times": cfg_times,
     }
