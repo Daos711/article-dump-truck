@@ -16,3 +16,5 @@ N_phi_tex = 8
 N_Z_tex = 11
 phi_start_deg = 90
 phi_end_deg = 270
+
+sigma = 0.8e-6          # RMS шероховатости (м) = 0.8 мкм (полированный баббит)

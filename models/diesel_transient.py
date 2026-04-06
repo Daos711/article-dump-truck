@@ -54,7 +54,7 @@ def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
                textured=False, phi_c_flat=None, Z_c_flat=None):
     """Зазор для 2D-эксцентриситета: H = 1 − εx·cos(θ) − εy·sin(θ) [+ текстура]."""
     H0 = 1.0 - eps_x * np.cos(Phi_mesh) - eps_y * np.sin(Phi_mesh)
-    H0 = np.sqrt(H0**2 + (2e-6 / p.c)**2)  # регуляризация σ = 2 мкм
+    H0 = np.sqrt(H0**2 + (p.sigma / p.c)**2)  # регуляризация шероховатости
     if not textured:
         return H0
     A = 2 * p.a_dim / p.L

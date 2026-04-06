@@ -58,7 +58,7 @@ def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
     При textured=True добавляются эллипсоидальные углубления.
     """
     H0 = 1.0 + epsilon * np.cos(Phi_mesh)
-    H0 = np.sqrt(H0**2 + (2e-6 / params.c)**2)  # регуляризация σ = 2 мкм
+    H0 = np.sqrt(H0**2 + (params.sigma / params.c)**2)  # регуляризация шероховатости
     if not textured:
         return H0
 

@@ -9,6 +9,8 @@ import sys
 import os
 import time
 import csv
+import argparse
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -17,10 +19,21 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import models.pump_steady as pump_steady
 from models.pump_steady import run_pump_analysis, CONFIGS, EPSILON_VALUES
+from config import pump_params as params
 
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "pump")
-os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def make_results_dir():
+    hp_um = int(params.h_p * 1e6)
+    N = pump_steady.N_GRID
+    tag = datetime.now().strftime("%y%m%d_%H%M")
+    name = f"{tag}_grid{N}_hp{hp_um}_sigma{params.sigma*1e6:.1f}um"
+    d = os.path.join(os.path.dirname(__file__), "..", "results", "pump", name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+RESULTS_DIR = None  # устанавливается в main() после --grid
 
 H_P_VALUES_UM = [15, 30, 45, 60]  # мкм
 EPS_REF = 0.6  # ε для сводной таблицы и sensitivity
@@ -63,9 +76,21 @@ def plot_sensitivity(h_p_vals, data_mineral, data_rapeseed, ylabel, filename, ti
 
 
 def main():
+    global RESULTS_DIR
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--grid", type=int, default=300,
+                        help="Размер сетки NxN (default: 300)")
+    args = parser.parse_args()
+
+    pump_steady.N_GRID = args.grid
+    RESULTS_DIR = make_results_dir()
+
     print("=" * 60)
     print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
     print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
+    print(f"Сетка: {args.grid}×{args.grid}, σ = {params.sigma*1e6:.1f} мкм")
+    print(f"Результаты → {RESULTS_DIR}")
     print("=" * 60)
 
     # Индекс ε ближайший к EPS_REF
