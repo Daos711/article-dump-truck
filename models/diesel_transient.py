@@ -23,30 +23,43 @@ CONFIGS = [
 ]
 
 
-def load_diesel(phi_deg, F_max=None, sigma=None):
-    """Surrogate индикаторной диаграммы 4-тактного ДВС.
+LAMBDA_CRANK = 0.27  # R_crank / L_rod для БелАЗ
 
-    Не полная КШМ-модель, а гауссов пик при ~370° ПКВ + базовый уровень.
+
+def load_diesel(phi_deg, F_max=None):
+    """Нагрузка ДВС: Вибе-функция + КШМ-разложение на Fx, Fy.
 
     Parameters
     ----------
     phi_deg : float or array — угол ПКВ (0..720°)
     F_max : float — пиковая нагрузка (Н)
-    sigma : float — ширина пика (°)
 
     Returns
     -------
-    Fx, Fy : float — компоненты внешней нагрузки (Н).
-             Fx = 0, Fy = -F_total (вал прижимается вниз).
+    Fx, Fy : float or array — компоненты нагрузки (Н).
     """
     if F_max is None:
         F_max = params.F_max
-    if sigma is None:
-        sigma = params.sigma_deg
-    F_gas = F_max * np.exp(-((phi_deg - 370) ** 2) / (2 * sigma ** 2))
-    F_total = F_gas + params.F_base
-    Fx = np.zeros_like(np.atleast_1d(F_total), dtype=float)
-    Fy = -np.asarray(F_total, dtype=float)
+
+    phi = np.atleast_1d(np.asarray(phi_deg, dtype=float)) % 720.0
+
+    # Вибе-функция: асимметричный пик
+    phi_s = 345.0   # начало нарастания (°)
+    phi_p = 370.0   # пик (°)
+    m_vibe = 2.0
+    k_vibe = 1.2
+
+    x = np.clip((phi - phi_s) / (phi_p - phi_s), 0, None)
+    F_vibe = np.where(x > 0,
+        (F_max - params.F_base) * x**m_vibe * np.exp(m_vibe / k_vibe * (1 - x**k_vibe)),
+        0.0)
+    F_total = F_vibe + params.F_base
+
+    # КШМ-разложение: проекции одной и той же F_total
+    beta = np.arcsin(LAMBDA_CRANK * np.sin(np.deg2rad(phi)))
+    Fx = F_total * np.sin(beta)
+    Fy = -F_total * np.cos(beta)
+
     return Fx, Fy
 
 
@@ -137,7 +150,7 @@ def run_transient(F_max=None, debug=False,
 
     phi_crank_deg = np.arange(n_steps) * params.d_phi_crank_deg
 
-    for ic, cfg in enumerate(CONFIGS):
+    for ic, cfg in enumerate(CONFIGS[:1]):  # TEST: 1 конфиг, вернуть CONFIGS
         eta = cfg["oil"]["eta_diesel"]
         alpha_pv = None  # пьезовязкость отключена до стабилизации transient
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
