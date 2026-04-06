@@ -142,7 +142,7 @@ def run_transient(F_max=None, debug=False,
     Fy_hyd_all = np.zeros((n_cfg, n_steps))
     cfg_times = []  # время каждого конфига
 
-    for ic, cfg in enumerate(CONFIGS[:1]):  # ТЕСТ: 1 конфиг для оценки времени
+    for ic, cfg in enumerate(CONFIGS):
         eta = cfg["oil"]["eta_diesel"]
         alpha_pv = None  # PV отключена — overflow при 850 кН
         p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
