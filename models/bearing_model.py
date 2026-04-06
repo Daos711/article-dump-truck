@@ -11,18 +11,22 @@ DEFAULT_CLOSURE = "laminar"
 DEFAULT_CAVITATION = "half_sommerfeld"
 
 
-def setup_grid(N):
-    """Создать сетку φ ∈ [0, 2π], Z ∈ [-1, 1] размером (N_Z, N_phi).
+def setup_grid(N_phi, N_Z=None):
+    """Создать сетку φ ∈ [0, 2π), Z ∈ [-1, 1] размером (N_Z, N_phi).
+
+    Parameters
+    ----------
+    N_phi : int — узлов по φ (endpoint=False, периодическое)
+    N_Z   : int or None — узлов по Z (если None, = N_phi)
 
     Returns
     -------
-    phi_1D : (N,) — узлы по φ
-    Z_1D   : (N,) — узлы по Z (безразмерные, -1..1)
-    Phi_mesh, Z_mesh : (N_Z, N_phi) — меш-гриды (стандартный meshgrid)
-    d_phi, d_Z : шаги сетки
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z
     """
-    phi_1D = np.linspace(0, 2 * np.pi, N)
-    Z_1D = np.linspace(-1, 1, N)
+    if N_Z is None:
+        N_Z = N_phi
+    phi_1D = np.linspace(0, 2 * np.pi, N_phi, endpoint=False)
+    Z_1D = np.linspace(-1, 1, N_Z)
     d_phi = phi_1D[1] - phi_1D[0]
     d_Z = Z_1D[1] - Z_1D[0]
     Phi_mesh, Z_mesh = np.meshgrid(phi_1D, Z_1D)  # (N_Z, N_phi)
@@ -50,12 +54,27 @@ def setup_texture(params):
     return phi_grid.ravel(), Z_grid.ravel()
 
 
+def create_H_smoothcap(H0, H_p, Phi_mesh, Z_mesh,
+                       phi_c_flat, Z_c_flat, A, B):
+    """Лунки с гладким профилем (1 - r²)² вместо sqrt(1 - r²)."""
+    H = H0.copy()
+    for k in range(len(phi_c_flat)):
+        phi_c = phi_c_flat[k]
+        Z_c = Z_c_flat[k]
+        delta_phi = np.arctan2(np.sin(Phi_mesh - phi_c),
+                               np.cos(Phi_mesh - phi_c))
+        expr = (delta_phi / B) ** 2 + ((Z_mesh - Z_c) / A) ** 2
+        inside = expr <= 1
+        H[inside] += H_p * (1 - expr[inside])**2
+    return H
+
+
 def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
-           phi_c_flat=None, Z_c_flat=None):
+           phi_c_flat=None, Z_c_flat=None, profile="sqrt"):
     """Построить безразмерный зазор H (гладкий или текстурированный).
 
     H0 = 1 + ε·cos(φ)  — гладкий профиль
-    При textured=True добавляются эллипсоидальные углубления.
+    profile : "sqrt" (эллипсоид) или "smoothcap" ((1-r²)²)
     """
     H0 = 1.0 + epsilon * np.cos(Phi_mesh)
     H0 = np.sqrt(H0**2 + (params.sigma / params.c)**2)  # регуляризация шероховатости
@@ -66,9 +85,12 @@ def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
     B = params.b_dim / params.R           # полуось по φ (в радианах)
     H_p = params.h_p / params.c           # безразмерная глубина
 
-    H = create_H_with_ellipsoidal_depressions(
-        H0, H_p, Phi_mesh, Z_mesh, phi_c_flat, Z_c_flat, A, B
-    )
+    if profile == "smoothcap":
+        H = create_H_smoothcap(
+            H0, H_p, Phi_mesh, Z_mesh, phi_c_flat, Z_c_flat, A, B)
+    else:
+        H = create_H_with_ellipsoidal_depressions(
+            H0, H_p, Phi_mesh, Z_mesh, phi_c_flat, Z_c_flat, A, B)
     return H
 
 
