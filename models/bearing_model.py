@@ -81,7 +81,9 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
                       closure=DEFAULT_CLOSURE,
                       cavitation=DEFAULT_CAVITATION,
                       alpha_pv=None,
-                      subcell_quad=False):
+                      subcell_quad=False,
+                      H_smooth=None,
+                      texture_params=None):
     """Решить уравнение Рейнольдса и вычислить интегральные характеристики.
 
     H, Phi_mesh, Z_mesh имеют shape (N_Z, N_phi) — формат солвера.
@@ -115,6 +117,10 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
         max_iter=50000,
         P_init=P_init,
         subcell_quad=subcell_quad,
+        H_smooth=H_smooth,
+        texture_params=texture_params,
+        phi_1D=phi_1D,
+        Z_1D=Z_1D,
     )
     if alpha_pv is not None:
         solver_kw["alpha_pv"] = alpha_pv

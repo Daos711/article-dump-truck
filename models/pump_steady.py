@@ -77,18 +77,38 @@ def run_pump_analysis(h_p_override=None,
         P_prev = None
         print(f"  [{ic+1}/{n_cfg}] {cfg['label']}...")
 
+        # Параметры текстуры для аналитической квадратуры
+        tex_params = None
+        if cfg["textured"]:
+            tex_params = {
+                "phi_c": phi_c,
+                "Z_c": Z_c,
+                "A": 2 * p.a_dim / p.L,
+                "B": p.b_dim / p.R,
+                "H_p": p.h_p / p.c,
+                "profile": "smoothcap",
+            }
+
         for ie, eps in enumerate(EPSILON_VALUES):
             H = make_H(eps, Phi_mesh, Z_mesh, p,
                        textured=cfg["textured"],
                        phi_c_flat=phi_c, Z_c_flat=Z_c,
                        profile="smoothcap")
 
+            # H_smooth для аналитической квадратуры (только текстура)
+            H_smooth = None
+            if cfg["textured"]:
+                H_smooth = make_H(eps, Phi_mesh, Z_mesh, p,
+                                  textured=False)
+
             P, F, mu, Qv, h_m, p_m, F_friction, n_out = solve_and_compute(
                 H, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
                 phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
                 closure=closure, cavitation=cavitation,
                 alpha_pv=alpha_pv,
-                subcell_quad=True,
+                subcell_quad=cfg["textured"],
+                H_smooth=H_smooth,
+                texture_params=tex_params,
             )
             P_prev = P
 
