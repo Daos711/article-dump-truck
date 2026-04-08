@@ -9,6 +9,8 @@ import sys
 import os
 import time
 import csv
+import argparse
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -17,13 +19,27 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import models.pump_steady as pump_steady
 from models.pump_steady import run_pump_analysis, CONFIGS, EPSILON_VALUES
+from config import pump_params as params
 
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "pump")
-os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def make_results_dir():
+    hp_um = int(params.h_p * 1e6)
+    tag = datetime.now().strftime("%y%m%d_%H%M")
+    ps = int(pump_steady.PHI_START_DEG)
+    pe = int(pump_steady.PHI_END_DEG)
+    name = (f"{tag}_{pump_steady.N_PHI}x{pump_steady.N_Z}"
+            f"_hp{hp_um}_zone{ps}-{pe}_{pump_steady.PROFILE}")
+    d = os.path.join(os.path.dirname(__file__), "..", "results", "pump", name)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+RESULTS_DIR = None  # устанавливается в main() после --grid
 
 H_P_VALUES_UM = [15, 30, 45, 60]  # мкм
 EPS_REF = 0.6  # ε для сводной таблицы и sensitivity
+EPS_STABLE_MIN = 0.70  # минимальный порог стабильности для рекомендации
 
 
 def plot_curves(eps, data, ylabel, filename, title):
@@ -62,34 +78,104 @@ def plot_sensitivity(h_p_vals, data_mineral, data_rapeseed, ylabel, filename, ti
 
 
 def main():
-    print("=" * 60)
-    print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
-    print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
-    print("=" * 60)
+    global RESULTS_DIR
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--nphi", type=int, default=800,
+                        help="Узлов по φ (default: 800)")
+    parser.add_argument("--nz", type=int, default=200,
+                        help="Узлов по Z (default: 200)")
+    parser.add_argument("--hp", type=float, default=None,
+                        help="Одна глубина для теста (мкм). Без — sweep [15,30,45,60]")
+    parser.add_argument("--profile", type=str, default="smoothcap",
+                        choices=["sqrt", "smoothcap"],
+                        help="Профиль лунки (default: smoothcap)")
+    parser.add_argument("--no-pv", action="store_true",
+                        help="Отключить пьезовязкость (изовязкий расчёт)")
+    parser.add_argument("--phi-start", type=float, default=None,
+                        help="Начало зоны текстуры (градусы)")
+    parser.add_argument("--phi-end", type=float, default=None,
+                        help="Конец зоны текстуры (градусы)")
+    parser.add_argument("--nz-tex", type=int, default=None,
+                        help="Число рядов лунок по Z")
+    parser.add_argument("--nphi-tex", type=int, default=None,
+                        help="Число лунок по φ")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить data.npz и перестроить графики без расчёта")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Путь к папке с data.npz для --plot-only")
+    args = parser.parse_args()
+
+    pump_steady.N_PHI = args.nphi
+    pump_steady.N_Z = args.nz
+    pump_steady.PROFILE = args.profile
+    pump_steady.NO_PV = args.no_pv
+    if args.phi_start is not None:
+        pump_steady.PHI_START_DEG = args.phi_start
+    if args.phi_end is not None:
+        pump_steady.PHI_END_DEG = args.phi_end
+    if args.nphi_tex is not None:
+        pump_steady.N_PHI_TEX = args.nphi_tex
+    if args.nz_tex is not None:
+        pump_steady.N_Z_TEX = args.nz_tex
+
+    if args.hp is not None:
+        H_P_VALUES_UM = [int(args.hp)]
+
+    if args.plot_only:
+        RESULTS_DIR = args.data_dir or os.path.join(
+            os.path.dirname(__file__), "..", "results", "pump")
+        print("=" * 60)
+        print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА — PLOT ONLY")
+        print(f"Загрузка из {RESULTS_DIR}")
+        print("=" * 60)
+
+        d = np.load(os.path.join(RESULTS_DIR, "data.npz"), allow_pickle=True)
+        eps = d["epsilon"]
+        best_hp = int(d["recommended_hp_um"])
+
+        # Восстановить all_results из data.npz
+        all_results = {}
+        for h_p_um in H_P_VALUES_UM:
+            prefix = f"hp{h_p_um}_"
+            r = {"epsilon": eps}
+            for key in ["W", "f", "hmin", "Q", "F_tr", "N_loss", "pmax"]:
+                r[key] = d[prefix + key]
+            all_results[h_p_um] = r
+    else:
+        RESULTS_DIR = make_results_dir()
+
+        print("=" * 60)
+        print("РАСЧЁТ ПОДШИПНИКА ЦЕНТРОБЕЖНОГО НАСОСА")
+        print(f"Sensitivity sweep: h_p = {H_P_VALUES_UM} мкм")
+        print(f"Сетка: {args.nphi}×{args.nz}, σ = {params.sigma*1e6:.1f} мкм")
+        print(f"Результаты → {RESULTS_DIR}")
+        print("=" * 60)
 
     # Индекс ε ближайший к EPS_REF
     ie_ref = np.argmin(np.abs(EPSILON_VALUES - EPS_REF))
     eps_ref_actual = EPSILON_VALUES[ie_ref]
     print(f"Опорный эксцентриситет: ε = {eps_ref_actual:.2f}")
 
-    # --- Sweep по h_p ---
-    all_results = {}
-    t0_total = time.time()
+    if not args.plot_only:
+        # --- Sweep по h_p ---
+        all_results = {}
+        t0_total = time.time()
 
-    for h_p_um in H_P_VALUES_UM:
-        h_p_m = h_p_um * 1e-6
-        print(f"\n{'='*40}")
-        print(f"h_p = {h_p_um} мкм")
-        print(f"{'='*40}")
+        for h_p_um in H_P_VALUES_UM:
+            h_p_m = h_p_um * 1e-6
+            print(f"\n{'='*40}")
+            print(f"h_p = {h_p_um} мкм")
+            print(f"{'='*40}")
 
-        t0 = time.time()
-        results = run_pump_analysis(h_p_override=h_p_m)
-        dt = time.time() - t0
-        print(f"Время: {dt:.1f} с")
-        all_results[h_p_um] = results
+            t0 = time.time()
+            results = run_pump_analysis(h_p_override=h_p_m)
+            dt = time.time() - t0
+            print(f"Время: {dt:.1f} с")
+            all_results[h_p_um] = results
 
-    dt_total = time.time() - t0_total
-    print(f"\nОбщее время sweep: {dt_total:.1f} с")
+        dt_total = time.time() - t0_total
+        print(f"\nОбщее время sweep: {dt_total:.1f} с")
 
     # --- Сводная таблица при ε = EPS_REF ---
     # Индексы конфигураций: 0=smooth+mineral, 1=smooth+rapeseed,
@@ -98,11 +184,31 @@ def main():
     print(f"СВОДНАЯ ТАБЛИЦА при ε = {eps_ref_actual:.2f}")
     print(f"{'='*60}")
 
+    def gain(a, b):
+        if np.isnan(a) or np.isnan(b) or b <= 0:
+            return np.nan
+        return a / b
+
+    def max_valid_eps(r, cfg_idx):
+        """Максимальный ε, при котором конфигурация сошлась (не NaN)."""
+        W_row = r["W"][cfg_idx]
+        valid = ~np.isnan(W_row)
+        if not np.any(valid):
+            return 0.0
+        return EPSILON_VALUES[np.where(valid)[0][-1]]
+
     table_rows = []
     gain_rows = []
+    stability = {}  # h_p -> max ε среди текстурированных
 
     for h_p_um in H_P_VALUES_UM:
         r = all_results[h_p_um]
+        # Стабильность: минимум из двух текстурированных конфигов
+        eps_stable_min = min(max_valid_eps(r, 2), max_valid_eps(r, 3))
+        eps_stable_rap = max_valid_eps(r, 3)
+        stability[h_p_um] = eps_stable_min
+        print(f"  h_p={h_p_um}: стабильно до ε = {eps_stable_min:.2f}")
+
         for oil_name, i_smooth, i_tex in [("Минеральное", 0, 2),
                                            ("Рапсовое", 1, 3)]:
             row = {
@@ -122,9 +228,6 @@ def main():
             }
             table_rows.append(row)
 
-            def gain(a, b):
-                return a / b if b > 0 else 0
-
             gain_rows.append({
                 "h_p_um": h_p_um, "oil": oil_name,
                 "W_gain": gain(row["W_tex"], row["W_smooth"]),
@@ -138,26 +241,41 @@ def main():
     # Печать в терминал
     print(f"\n{'Абсолютные значения (текстура)':}")
     print(f"{'h_p':>6} {'масло':>12} {'W(Н)':>8} {'f':>8} {'F_tr(Н)':>8} "
-          f"{'N_loss(Вт)':>10} {'p_max(МПа)':>10} {'Q(см³/с)':>10}")
+          f"{'N_loss(Вт)':>10} {'p_max(МПа)':>10} {'Q(см³/с)':>10} {'ε_max':>6}")
     for row in table_rows:
-        print(f"{row['h_p_um']:>6} {row['oil']:>12} "
-              f"{row['W_tex']:>8.0f} {row['f_tex']:>8.4f} {row['Ftr_tex']:>8.1f} "
-              f"{row['Nloss_tex']:>10.0f} {row['pmax_tex']/1e6:>10.1f} "
-              f"{row['Q_tex']*1e6:>10.3f}")
+        hp = row['h_p_um']
+        eps_max = stability[hp]
+        if np.isnan(row['W_tex']):
+            print(f"{hp:>6} {row['oil']:>12}    — расходимость при ε={eps_ref_actual:.2f} —")
+        else:
+            print(f"{hp:>6} {row['oil']:>12} "
+                  f"{row['W_tex']:>8.0f} {row['f_tex']:>8.4f} {row['Ftr_tex']:>8.1f} "
+                  f"{row['Nloss_tex']:>10.0f} {row['pmax_tex']/1e6:>10.1f} "
+                  f"{row['Q_tex']*1e6:>10.3f} {eps_max:>6.2f}")
 
     print(f"\n{'Gain (текстура / гладкий)':}")
     print(f"{'h_p':>6} {'масло':>12} {'W':>6} {'f':>6} {'F_tr':>6} "
-          f"{'N_loss':>6} {'p_max':>6} {'Q':>6}")
+          f"{'N_loss':>6} {'p_max':>6} {'Q':>6} {'ε_max':>6}")
     for g in gain_rows:
-        print(f"{g['h_p_um']:>6} {g['oil']:>12} "
-              f"{g['W_gain']:>6.2f} {g['f_gain']:>6.2f} {g['Ftr_gain']:>6.2f} "
-              f"{g['Nloss_gain']:>6.2f} {g['pmax_gain']:>6.2f} {g['Q_gain']:>6.2f}")
+        hp = g['h_p_um']
+        eps_max = stability[hp]
+        if np.isnan(g['W_gain']):
+            print(f"{hp:>6} {g['oil']:>12}    — расходимость —")
+        else:
+            print(f"{hp:>6} {g['oil']:>12} "
+                  f"{g['W_gain']:>6.2f} {g['f_gain']:>6.2f} {g['Ftr_gain']:>6.2f} "
+                  f"{g['Nloss_gain']:>6.2f} {g['pmax_gain']:>6.2f} {g['Q_gain']:>6.2f} "
+                  f"{eps_max:>6.2f}")
 
     # CSV
+    def csv_val(val, fmt):
+        return fmt % val if not np.isnan(val) else "NaN"
+
     csv_path = os.path.join(RESULTS_DIR, "gain_table.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as fcsv:
         writer = csv.writer(fcsv)
-        writer.writerow(["h_p_um", "oil", "W_smooth", "W_tex", "W_gain",
+        writer.writerow(["h_p_um", "oil", "eps_max",
+                         "W_smooth", "W_tex", "W_gain",
                          "f_smooth", "f_tex", "f_gain",
                          "Ftr_smooth", "Ftr_tex", "Ftr_gain",
                          "Nloss_smooth", "Nloss_tex", "Nloss_gain",
@@ -166,12 +284,17 @@ def main():
         for row, g in zip(table_rows, gain_rows):
             writer.writerow([
                 row["h_p_um"], row["oil"],
-                f"{row['W_smooth']:.1f}", f"{row['W_tex']:.1f}", f"{g['W_gain']:.3f}",
-                f"{row['f_smooth']:.5f}", f"{row['f_tex']:.5f}", f"{g['f_gain']:.3f}",
-                f"{row['Ftr_smooth']:.2f}", f"{row['Ftr_tex']:.2f}", f"{g['Ftr_gain']:.3f}",
-                f"{row['Nloss_smooth']:.1f}", f"{row['Nloss_tex']:.1f}", f"{g['Nloss_gain']:.3f}",
-                f"{row['pmax_smooth']/1e6:.2f}", f"{row['pmax_tex']/1e6:.2f}", f"{g['pmax_gain']:.3f}",
-                f"{row['Q_smooth']*1e6:.4f}", f"{row['Q_tex']*1e6:.4f}", f"{g['Q_gain']:.3f}",
+                f"{stability[row['h_p_um']]:.2f}",
+                csv_val(row['W_smooth'], "%.1f"), csv_val(row['W_tex'], "%.1f"), csv_val(g['W_gain'], "%.3f"),
+                csv_val(row['f_smooth'], "%.5f"), csv_val(row['f_tex'], "%.5f"), csv_val(g['f_gain'], "%.3f"),
+                csv_val(row['Ftr_smooth'], "%.2f"), csv_val(row['Ftr_tex'], "%.2f"), csv_val(g['Ftr_gain'], "%.3f"),
+                csv_val(row['Nloss_smooth'], "%.1f"), csv_val(row['Nloss_tex'], "%.1f"), csv_val(g['Nloss_gain'], "%.3f"),
+                csv_val(row['pmax_smooth']/1e6, "%.2f") if not np.isnan(row['pmax_smooth']) else "NaN",
+                csv_val(row['pmax_tex']/1e6, "%.2f") if not np.isnan(row['pmax_tex']) else "NaN",
+                csv_val(g['pmax_gain'], "%.3f"),
+                csv_val(row['Q_smooth']*1e6, "%.4f") if not np.isnan(row['Q_smooth']) else "NaN",
+                csv_val(row['Q_tex']*1e6, "%.4f") if not np.isnan(row['Q_tex']) else "NaN",
+                csv_val(g['Q_gain'], "%.3f"),
             ])
     print(f"\n  Сохранён: gain_table.csv")
 
@@ -183,22 +306,33 @@ def main():
 
         ftxt.write("Часть 1: абсолютные значения (текстурированный подшипник)\n")
         ftxt.write(f"{'h_p(мкм)':>8} {'масло':>12} {'W(Н)':>8} {'f':>8} {'F_tr(Н)':>8} "
-                   f"{'N_loss(Вт)':>10} {'p_max(МПа)':>10} {'Q(см³/с)':>10}\n")
-        ftxt.write("-" * 90 + "\n")
+                   f"{'N_loss(Вт)':>10} {'p_max(МПа)':>10} {'Q(см³/с)':>10} {'ε_max':>6}\n")
+        ftxt.write("-" * 98 + "\n")
         for row in table_rows:
-            ftxt.write(f"{row['h_p_um']:>8} {row['oil']:>12} "
-                       f"{row['W_tex']:>8.0f} {row['f_tex']:>8.4f} {row['Ftr_tex']:>8.1f} "
-                       f"{row['Nloss_tex']:>10.0f} {row['pmax_tex']/1e6:>10.1f} "
-                       f"{row['Q_tex']*1e6:>10.3f}\n")
+            hp = row['h_p_um']
+            eps_max = stability[hp]
+            if np.isnan(row['W_tex']):
+                ftxt.write(f"{hp:>8} {row['oil']:>12}    — расходимость —\n")
+            else:
+                ftxt.write(f"{hp:>8} {row['oil']:>12} "
+                           f"{row['W_tex']:>8.0f} {row['f_tex']:>8.4f} {row['Ftr_tex']:>8.1f} "
+                           f"{row['Nloss_tex']:>10.0f} {row['pmax_tex']/1e6:>10.1f} "
+                           f"{row['Q_tex']*1e6:>10.3f} {eps_max:>6.2f}\n")
 
         ftxt.write("\n\nЧасть 2: gain (текстура / гладкий)\n")
         ftxt.write(f"{'h_p(мкм)':>8} {'масло':>12} {'W':>6} {'f':>6} {'F_tr':>6} "
-                   f"{'N_loss':>6} {'p_max':>6} {'Q':>6}\n")
-        ftxt.write("-" * 60 + "\n")
+                   f"{'N_loss':>6} {'p_max':>6} {'Q':>6} {'ε_max':>6}\n")
+        ftxt.write("-" * 68 + "\n")
         for g in gain_rows:
-            ftxt.write(f"{g['h_p_um']:>8} {g['oil']:>12} "
-                       f"{g['W_gain']:>6.2f} {g['f_gain']:>6.2f} {g['Ftr_gain']:>6.2f} "
-                       f"{g['Nloss_gain']:>6.2f} {g['pmax_gain']:>6.2f} {g['Q_gain']:>6.2f}\n")
+            hp = g['h_p_um']
+            eps_max = stability[hp]
+            if np.isnan(g['W_gain']):
+                ftxt.write(f"{hp:>8} {g['oil']:>12}    — расходимость —\n")
+            else:
+                ftxt.write(f"{hp:>8} {g['oil']:>12} "
+                           f"{g['W_gain']:>6.2f} {g['f_gain']:>6.2f} {g['Ftr_gain']:>6.2f} "
+                           f"{g['Nloss_gain']:>6.2f} {g['pmax_gain']:>6.2f} {g['Q_gain']:>6.2f} "
+                           f"{eps_max:>6.2f}\n")
     print(f"  Сохранён: gain_table.txt")
 
     # --- Sensitivity plots (при ε = EPS_REF) ---
@@ -231,31 +365,42 @@ def main():
                      f"N_loss(h_p) при ε = {eps_ref_actual:.2f} — текстура")
 
     # --- Выбор рекомендуемого h_p ---
-    # Критерий: максимальный W_gain при pmax_gain < 3 и Nloss_gain < 1.2
+    # Критерий: W_gain × стабильность. Решение должно сходиться хотя бы
+    # до ε = EPS_STABLE_MIN. Иначе — дисквалификация.
     best_hp = H_P_VALUES_UM[0]
     best_score = 0
     best_reason = ""
 
     for i, h_p_um in enumerate(H_P_VALUES_UM):
-        # Среднее gain по двум маслам
-        g_min = gain_rows[2 * i]      # минеральное
-        g_rap = gain_rows[2 * i + 1]  # рапсовое
+        g_min = gain_rows[2 * i]
+        g_rap = gain_rows[2 * i + 1]
+
+        # Пропускаем NaN gains (расходимость при ε_ref)
+        if np.isnan(g_min["W_gain"]) or np.isnan(g_rap["W_gain"]):
+            continue
+
         w_gain_avg = (g_min["W_gain"] + g_rap["W_gain"]) / 2
         pmax_gain_avg = (g_min["pmax_gain"] + g_rap["pmax_gain"]) / 2
         nloss_gain_avg = (g_min["Nloss_gain"] + g_rap["Nloss_gain"]) / 2
+        eps_max = stability[h_p_um]
+
+        # Дисквалификация: не сходится до EPS_STABLE_MIN
+        if eps_max < EPS_STABLE_MIN:
+            continue
 
         score = w_gain_avg
-        if pmax_gain_avg > 3.0:
-            score *= 0.5  # штраф за высокое давление
-        if nloss_gain_avg > 1.2:
-            score *= 0.8  # штраф за потери
+        if pmax_gain_avg > 6.0:
+            score *= 0.3
+        if nloss_gain_avg > 1.25:
+            score *= 0.5
 
         if score > best_score:
             best_score = score
             best_hp = h_p_um
             best_reason = (f"W_gain={w_gain_avg:.2f}, "
                            f"pmax_gain={pmax_gain_avg:.2f}, "
-                           f"Nloss_gain={nloss_gain_avg:.2f}")
+                           f"Nloss_gain={nloss_gain_avg:.2f}, "
+                           f"ε_max={eps_max:.2f}")
 
     print(f"\nРекомендуемый h_p = {best_hp} мкм ({best_reason})")
 
@@ -269,12 +414,18 @@ def main():
         for i, h_p_um in enumerate(H_P_VALUES_UM):
             g_min = gain_rows[2 * i]
             g_rap = gain_rows[2 * i + 1]
+            eps_max = stability[h_p_um]
+            if np.isnan(g_min["W_gain"]) or np.isnan(g_rap["W_gain"]):
+                f.write(f"  h_p={h_p_um:>2} мкм: расходимость при ε={eps_ref_actual:.2f}, "
+                        f"ε_max={eps_max:.2f}\n")
+                continue
             w_avg = (g_min["W_gain"] + g_rap["W_gain"]) / 2
             p_avg = (g_min["pmax_gain"] + g_rap["pmax_gain"]) / 2
             n_avg = (g_min["Nloss_gain"] + g_rap["Nloss_gain"]) / 2
             marker = " ← рекомендуемый" if h_p_um == best_hp else ""
             f.write(f"  h_p={h_p_um:>2} мкм: W_gain={w_avg:.2f}, "
-                    f"pmax_gain={p_avg:.2f}, Nloss_gain={n_avg:.2f}{marker}\n")
+                    f"pmax_gain={p_avg:.2f}, Nloss_gain={n_avg:.2f}, "
+                    f"ε_max={eps_max:.2f}{marker}\n")
     print(f"  Сохранён: recommended_hp.txt")
 
     # --- Основные графики для рекомендуемого h_p ---
