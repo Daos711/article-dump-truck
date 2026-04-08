@@ -120,7 +120,6 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     solver_kw = dict(
         closure=closure,
         cavitation=cavitation,
-        omega=1.5,
         tol=1e-5,
         max_iter=50000,
         P_init=P_init,
@@ -129,6 +128,7 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
         texture_params=texture_params,
         phi_1D=phi_1D,
         Z_1D=Z_1D,
+        return_converged=True,
     )
     if alpha_pv is not None:
         solver_kw["alpha_pv"] = alpha_pv
@@ -138,13 +138,18 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
 
     result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
 
-    # Пьезовязкий солвер возвращает 4 элемента (P, delta, n_iter, n_outer),
-    # изовязкий — 3 (P, delta, n_iter).
-    if len(result) == 4:
+    if alpha_pv is not None:
+        # PV-путь: (P, delta, n_iter, n_outer)
         P, residual, n_iter, n_outer = result
+        converged = True  # PV-path пока не возвращает converged
     else:
-        P, residual, n_iter = result
+        # Стандартный: (P, delta, n_iter, converged)
+        P, residual, n_iter, converged = result
         n_outer = 0
+
+    if not converged:
+        import warnings
+        warnings.warn(f"SOR не сошёлся: delta={residual:.2e}, n_iter={n_iter}")
 
     # Размерное давление
     P_dim = P * p_scale  # Па

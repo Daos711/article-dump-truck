@@ -170,7 +170,7 @@ def run_transient(F_max=None, debug=False,
                 -vx_, -vy_, params.c, omega, d_phi)
             kw = dict(
                 closure=closure, cavitation=cavitation,
-                omega=1.5, tol=1e-5, max_iter=50000,
+                tol=1e-5, max_iter=50000,
                 P_init=P_init_,
                 xprime=xp_, yprime=yp_, beta=bt_,
             )
@@ -238,7 +238,7 @@ def run_transient(F_max=None, debug=False,
                     pv_fallback_count += 1
                     kw_iso = dict(
                         closure=closure, cavitation=cavitation,
-                        omega=1.5, tol=1e-5, max_iter=50000,
+                        tol=1e-5, max_iter=50000,
                         P_init=None,
                         xprime=0.0, yprime=0.0, beta=2.0,
                     )
