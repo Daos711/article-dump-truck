@@ -88,6 +88,8 @@ def main():
     parser.add_argument("--profile", type=str, default="smoothcap",
                         choices=["sqrt", "smoothcap"],
                         help="Профиль лунки (default: smoothcap)")
+    parser.add_argument("--no-pv", action="store_true",
+                        help="Отключить пьезовязкость (изовязкий расчёт)")
     parser.add_argument("--plot-only", action="store_true",
                         help="Загрузить data.npz и перестроить графики без расчёта")
     parser.add_argument("--data-dir", type=str, default=None,
@@ -97,6 +99,7 @@ def main():
     pump_steady.N_PHI = args.nphi
     pump_steady.N_Z = args.nz
     pump_steady.PROFILE = args.profile
+    pump_steady.NO_PV = args.no_pv
 
     if args.hp is not None:
         H_P_VALUES_UM = [int(args.hp)]
