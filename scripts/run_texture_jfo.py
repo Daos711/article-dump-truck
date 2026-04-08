@@ -22,13 +22,10 @@ CAVITATION = "jfo"
 # Варианты B, C, D с h_p = 3–5 мкм
 VARIANTS = [
     # (имя, a_mm, b_mm, h_p_um, phi_start, phi_end, nphi_tex, nz_tex, N_phi, N_Z)
-    ("B1 сред h3",   1.0, 1.0,  3, 90, 180, 18, 18, 2000, 200),
-    ("B2 сред h5",   1.0, 1.0,  5, 90, 180, 18, 18, 2000, 200),
-    ("C1 микро h3",  0.5, 0.5,  3, 90, 180, 36, 37, 5000, 400),
     ("C2 микро h5",  0.5, 0.5,  5, 90, 180, 36, 37, 5000, 400),
-    ("D1 микро h3 wide", 0.5, 0.5, 3, 0, 180, 36, 37, 5000, 400),
-    ("D2 микро h5 wide", 0.5, 0.5, 5, 0, 180, 36, 37, 5000, 400),
 ]
+
+JFO_MAX_OUTER = 5000
 
 
 def setup_texture_custom(p):
@@ -93,7 +90,7 @@ def run_variant(name, a_mm, b_mm, h_p_um, phi_s, phi_e, npt, nzt, N_phi, N_Z):
         result = solve_reynolds(
             H_field, d_phi, d_Z, params.R, params.L,
             closure="laminar", cavitation=CAVITATION,
-            jfo_max_outer=2000)
+            jfo_max_outer=JFO_MAX_OUTER)
 
         # JFO возвращает (P, theta, residual, n_outer, n_inner)
         P, theta, residual, n_outer, n_inner = result
