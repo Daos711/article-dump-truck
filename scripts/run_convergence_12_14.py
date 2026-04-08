@@ -14,8 +14,8 @@ from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 # Импортируем setup_texture_custom из sweep_micro
 from scripts.run_sweep_micro import setup_texture_custom
 
-N_PHI = 8000
-N_Z = 600
+N_PHI = 5000
+N_Z = 400
 EPS_TARGET = 0.60
 PROFILE = "sqrt"
 
@@ -69,7 +69,7 @@ def run_single(phi_start_deg, phi_end_deg, a_mm, b_mm, h_p_um, nphi_tex, nz_tex)
 
 def main():
     print("=" * 80)
-    print("GRID CONVERGENCE: варианты 12, 14 на 8000×200")
+    print(f"GRID CONVERGENCE: варианты 12, 14 на {N_PHI}×{N_Z}")
     print(f"ε = {EPS_TARGET}, профиль = {PROFILE}, без PV")
     print("=" * 80)
 
