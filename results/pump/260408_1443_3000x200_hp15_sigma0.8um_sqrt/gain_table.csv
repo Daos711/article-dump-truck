@@ -1,0 +1,3 @@
+h_p_um,oil,eps_max,W_smooth,W_tex,W_gain,f_smooth,f_tex,f_gain,Ftr_smooth,Ftr_tex,Ftr_gain,Nloss_smooth,Nloss_tex,Nloss_gain,pmax_smooth_MPa,pmax_tex_MPa,pmax_gain,Q_smooth_cm3s,Q_tex_cm3s,Q_gain
+30,Минеральное,0.80,9802.8,8804.0,0.898,0.00791,0.00846,1.070,77.55,74.52,0.961,852.7,819.4,0.961,6.69,5.36,0.801,0.3447,0.3488,1.012
+30,Рапсовое,0.80,11055.1,10042.3,0.908,0.00797,0.00843,1.058,88.10,84.68,0.961,968.7,931.1,0.961,7.48,6.11,0.816,0.3458,0.3497,1.011
