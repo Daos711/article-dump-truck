@@ -92,16 +92,17 @@ def run_variant(name, a_mm, b_mm, h_p_um, phi_s, phi_e, npt, nzt, N_phi, N_Z):
     def solve_W(H_field):
         result = solve_reynolds(
             H_field, d_phi, d_Z, params.R, params.L,
-            closure="laminar", cavitation=CAVITATION)
+            closure="laminar", cavitation=CAVITATION,
+            jfo_max_outer=2000)
 
         # JFO возвращает (P, theta, residual, n_outer, n_inner)
         P, theta, residual, n_outer, n_inner = result
 
         P_dim = P * P_SCALE
-        Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi), phi_1D, axis=1),
-                       Z_1D) * params.R * params.L / 2
-        Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi), phi_1D, axis=1),
-                       Z_1D) * params.R * params.L / 2
+        Fx = -np.trapezoid(np.trapezoid(P_dim * np.cos(Phi), phi_1D, axis=1),
+                           Z_1D) * params.R * params.L / 2
+        Fy = -np.trapezoid(np.trapezoid(P_dim * np.sin(Phi), phi_1D, axis=1),
+                           Z_1D) * params.R * params.L / 2
         W = np.sqrt(Fx**2 + Fy**2)
 
         h_dim = H_field * params.c
@@ -111,8 +112,8 @@ def run_variant(name, a_mm, b_mm, h_p_um, phi_s, phi_e, npt, nzt, N_phi, N_Z):
         tau_c = ETA * OMEGA * params.R / h_dim
         dP = np.gradient(P_dim, phi_1D[1] - phi_1D[0], axis=1)
         tau_p = h_dim / 2.0 * dP / params.R
-        F_fr = np.trapz(np.trapz(np.abs(tau_c + tau_p), phi_1D, axis=1),
-                        Z_1D) * params.R * params.L / 2
+        F_fr = np.trapezoid(np.trapezoid(np.abs(tau_c + tau_p), phi_1D, axis=1),
+                            Z_1D) * params.R * params.L / 2
         f = F_fr / max(W, 1.0)
         return W, f, h_min, p_max, n_outer, n_inner
 

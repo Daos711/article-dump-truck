@@ -37,10 +37,10 @@ def compute_W(N_phi, N_Z, omega_sor=None):
         H, d_phi, d_Z, params.R, params.L, **kw)
 
     P_dim = P * p_scale
-    Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi), phi_1D, axis=1),
-                   Z_1D) * params.R * params.L / 2
-    Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi), phi_1D, axis=1),
-                   Z_1D) * params.R * params.L / 2
+    Fx = -np.trapezoid(np.trapezoid(P_dim * np.cos(Phi), phi_1D, axis=1),
+                       Z_1D) * params.R * params.L / 2
+    Fy = -np.trapezoid(np.trapezoid(P_dim * np.sin(Phi), phi_1D, axis=1),
+                       Z_1D) * params.R * params.L / 2
     W = np.sqrt(Fx**2 + Fy**2)
     return W, n_iter, converged, delta
 
