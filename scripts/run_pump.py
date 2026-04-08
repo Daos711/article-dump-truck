@@ -27,8 +27,10 @@ from config import pump_params as params
 def make_results_dir():
     hp_um = int(params.h_p * 1e6)
     tag = datetime.now().strftime("%y%m%d_%H%M")
+    ps = int(pump_steady.PHI_START_DEG)
+    pe = int(pump_steady.PHI_END_DEG)
     name = (f"{tag}_{pump_steady.N_PHI}x{pump_steady.N_Z}"
-            f"_hp{hp_um}_sigma{params.sigma*1e6:.1f}um_{pump_steady.PROFILE}")
+            f"_hp{hp_um}_zone{ps}-{pe}_{pump_steady.PROFILE}")
     d = os.path.join(os.path.dirname(__file__), "..", "results", "pump", name)
     os.makedirs(d, exist_ok=True)
     return d
@@ -90,6 +92,14 @@ def main():
                         help="Профиль лунки (default: smoothcap)")
     parser.add_argument("--no-pv", action="store_true",
                         help="Отключить пьезовязкость (изовязкий расчёт)")
+    parser.add_argument("--phi-start", type=float, default=None,
+                        help="Начало зоны текстуры (градусы)")
+    parser.add_argument("--phi-end", type=float, default=None,
+                        help="Конец зоны текстуры (градусы)")
+    parser.add_argument("--nz-tex", type=int, default=None,
+                        help="Число рядов лунок по Z")
+    parser.add_argument("--nphi-tex", type=int, default=None,
+                        help="Число лунок по φ")
     parser.add_argument("--plot-only", action="store_true",
                         help="Загрузить data.npz и перестроить графики без расчёта")
     parser.add_argument("--data-dir", type=str, default=None,
@@ -100,6 +110,14 @@ def main():
     pump_steady.N_Z = args.nz
     pump_steady.PROFILE = args.profile
     pump_steady.NO_PV = args.no_pv
+    if args.phi_start is not None:
+        pump_steady.PHI_START_DEG = args.phi_start
+    if args.phi_end is not None:
+        pump_steady.PHI_END_DEG = args.phi_end
+    if args.nphi_tex is not None:
+        pump_steady.N_PHI_TEX = args.nphi_tex
+    if args.nz_tex is not None:
+        pump_steady.N_Z_TEX = args.nz_tex
 
     if args.hp is not None:
         H_P_VALUES_UM = [int(args.hp)]

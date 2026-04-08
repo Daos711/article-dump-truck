@@ -36,19 +36,27 @@ def setup_grid(N_phi, N_Z=None):
 def setup_texture(params):
     """Создать массивы центров углублений из параметров подшипника.
 
-    Parameters
-    ----------
-    params : module с атрибутами R, L, phi_start_deg, phi_end_deg,
-             N_phi_tex, N_Z_tex
+    Поддерживает зону через 0°: если phi_start_deg > phi_end_deg,
+    лунки размещаются от phi_start до 360° и от 0° до phi_end.
 
     Returns
     -------
     phi_c_flat : (M,) — φ-координаты центров (рад)
     Z_c_flat   : (M,) — Z-координаты центров (безразмерные, -1..1)
     """
-    phi_start = np.deg2rad(params.phi_start_deg)
-    phi_end = np.deg2rad(params.phi_end_deg)
-    phi_centers = np.linspace(phi_start, phi_end, params.N_phi_tex)
+    phi_s = params.phi_start_deg
+    phi_e = params.phi_end_deg
+    if phi_s <= phi_e:
+        # Обычная зона (например 90°→270°)
+        phi_centers = np.linspace(np.deg2rad(phi_s), np.deg2rad(phi_e),
+                                  params.N_phi_tex)
+    else:
+        # Зона через 0° (например 270°→90° = 270°→360° + 0°→90°)
+        span = (360 - phi_s) + phi_e  # полная ширина в градусах
+        angles_deg = np.linspace(0, span, params.N_phi_tex) + phi_s
+        angles_deg = angles_deg % 360.0
+        phi_centers = np.deg2rad(angles_deg)
+
     Z_centers = np.linspace(-0.8, 0.8, params.N_Z_tex)
     phi_grid, Z_grid = np.meshgrid(phi_centers, Z_centers)
     return phi_grid.ravel(), Z_grid.ravel()

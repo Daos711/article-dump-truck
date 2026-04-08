@@ -16,6 +16,10 @@ N_PHI = 800
 N_Z = 200
 PROFILE = "smoothcap"
 NO_PV = False
+PHI_START_DEG = None   # None → из params
+PHI_END_DEG = None
+N_PHI_TEX = None
+N_Z_TEX = None
 EPSILON_VALUES = np.linspace(0.1, 0.8, 15)
 MAX_OUTER_PV = 50  # порог расходимости пьезовязкого солвера
 
@@ -44,11 +48,23 @@ def run_pump_analysis(h_p_override=None,
     -------
     results : dict
     """
-    # Если нужно переопределить h_p — создаём копию params
+    # Создаём копию params с возможными переопределениями
+    overrides = {}
     if h_p_override is not None:
+        overrides["h_p"] = h_p_override
+    if PHI_START_DEG is not None:
+        overrides["phi_start_deg"] = PHI_START_DEG
+    if PHI_END_DEG is not None:
+        overrides["phi_end_deg"] = PHI_END_DEG
+    if N_PHI_TEX is not None:
+        overrides["N_phi_tex"] = N_PHI_TEX
+    if N_Z_TEX is not None:
+        overrides["N_Z_tex"] = N_Z_TEX
+    if overrides:
         p = types.SimpleNamespace(**{k: getattr(params, k)
                                      for k in dir(params) if not k.startswith('_')})
-        p.h_p = h_p_override
+        for k, v in overrides.items():
+            setattr(p, k, v)
     else:
         p = params
 
