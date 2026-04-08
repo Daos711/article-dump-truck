@@ -14,6 +14,7 @@ from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
 N_PHI = 800
 N_Z = 200
+PROFILE = "smoothcap"
 EPSILON_VALUES = np.linspace(0.1, 0.8, 15)
 MAX_OUTER_PV = 50  # порог расходимости пьезовязкого солвера
 
@@ -86,14 +87,14 @@ def run_pump_analysis(h_p_override=None,
                 "A": 2 * p.a_dim / p.L,
                 "B": p.b_dim / p.R,
                 "H_p": p.h_p / p.c,
-                "profile": "smoothcap",
+                "profile": PROFILE,
             }
 
         for ie, eps in enumerate(EPSILON_VALUES):
             H = make_H(eps, Phi_mesh, Z_mesh, p,
                        textured=cfg["textured"],
                        phi_c_flat=phi_c, Z_c_flat=Z_c,
-                       profile="smoothcap")
+                       profile=PROFILE)
 
             # H_smooth для аналитической квадратуры (только текстура)
             H_smooth = None

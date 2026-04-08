@@ -28,7 +28,7 @@ def make_results_dir():
     hp_um = int(params.h_p * 1e6)
     tag = datetime.now().strftime("%y%m%d_%H%M")
     name = (f"{tag}_{pump_steady.N_PHI}x{pump_steady.N_Z}"
-            f"_hp{hp_um}_sigma{params.sigma*1e6:.1f}um")
+            f"_hp{hp_um}_sigma{params.sigma*1e6:.1f}um_{pump_steady.PROFILE}")
     d = os.path.join(os.path.dirname(__file__), "..", "results", "pump", name)
     os.makedirs(d, exist_ok=True)
     return d
@@ -85,6 +85,9 @@ def main():
                         help="Узлов по Z (default: 200)")
     parser.add_argument("--hp", type=float, default=None,
                         help="Одна глубина для теста (мкм). Без — sweep [15,30,45,60]")
+    parser.add_argument("--profile", type=str, default="smoothcap",
+                        choices=["sqrt", "smoothcap"],
+                        help="Профиль лунки (default: smoothcap)")
     parser.add_argument("--plot-only", action="store_true",
                         help="Загрузить data.npz и перестроить графики без расчёта")
     parser.add_argument("--data-dir", type=str, default=None,
@@ -93,6 +96,7 @@ def main():
 
     pump_steady.N_PHI = args.nphi
     pump_steady.N_Z = args.nz
+    pump_steady.PROFILE = args.profile
 
     if args.hp is not None:
         H_P_VALUES_UM = [int(args.hp)]
