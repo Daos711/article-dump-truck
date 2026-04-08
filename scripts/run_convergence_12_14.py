@@ -15,7 +15,7 @@ from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 from scripts.run_sweep_micro import setup_texture_custom
 
 N_PHI = 8000
-N_Z = 200
+N_Z = 600
 EPS_TARGET = 0.60
 PROFILE = "sqrt"
 
