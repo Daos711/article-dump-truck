@@ -66,7 +66,7 @@ def run_smooth_sweep(N_phi, N_Z, epsilon_values, oils):
 
             print(f"    eps={eps:.2f}: W={F:8.0f} Н, f={mu:.4f}, "
                   f"h_min={h_m*1e6:5.1f} мкм, p_max={p_m/1e6:6.1f} МПа, "
-                  f"cav={cf:.1%}")
+                  f"cav={cf:.1%}, n_iter={n_out}")
 
         results[oil_name] = {
             "eps": epsilon_values, "W": W, "f": f, "hmin": hmin,
@@ -100,15 +100,22 @@ def run_timing(N_phi, N_Z, eps=0.6):
 def main():
     parser = argparse.ArgumentParser(
         description="Гладкий подшипник насоса с Payvar-Salant кавитацией")
-    parser.add_argument("--nphi", type=int, default=2000,
-                        help="Узлов по phi (default: 2000)")
-    parser.add_argument("--nz", type=int, default=500,
-                        help="Узлов по Z (default: 500)")
+    parser.add_argument("--nphi", type=int, default=400,
+                        help="Узлов по phi (default: 400)")
+    parser.add_argument("--nz", type=int, default=100,
+                        help="Узлов по Z (default: 100)")
     parser.add_argument("--neps", type=int, default=15,
                         help="Число точек по eps (default: 15)")
     parser.add_argument("--timing-only", action="store_true",
                         help="Только timing одной точки (eps=0.6)")
+    parser.add_argument("--test", action="store_true",
+                        help="Быстрый тест: 200x50, 5 точек по eps")
     args = parser.parse_args()
+
+    if args.test:
+        args.nphi = 200
+        args.nz = 50
+        args.neps = 5
 
     epsilon_values = np.linspace(0.1, 0.8, args.neps)
     oils = [("Минеральное", MINERAL_OIL), ("Рапсовое", RAPESEED_OIL)]
