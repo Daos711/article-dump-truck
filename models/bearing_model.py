@@ -166,10 +166,22 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     cav_frac = 0.0
 
     if is_ps:
-        # Payvar-Salant: (P, theta, (residual, n_iter))
-        # Формат подтвердить при установке reynolds_solver!
-        P, theta, info = result
-        residual, n_iter = info
+        # Payvar-Salant: формат определяется по длине result
+        # Возможные варианты:
+        #   3: (P, theta, (residual, n_iter))  — вложенный tuple
+        #   5: (P, theta, residual, n_outer, n_inner) — как JFO
+        #   4: (P, theta, residual, n_iter)
+        if len(result) == 3:
+            P, theta, info = result
+            residual, n_iter = info
+        elif len(result) == 5:
+            P, theta, residual, _n_outer, n_iter = result
+        elif len(result) == 4:
+            P, theta, residual, n_iter = result
+        else:
+            raise ValueError(
+                f"Payvar-Salant: неожиданный формат result, "
+                f"len={len(result)}, types={[type(r).__name__ for r in result]}")
         n_outer = n_iter
         converged = True
         cav_frac = float(np.mean(theta < 1.0))
