@@ -62,7 +62,7 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     for i, eps in enumerate(eps_table):
         H = make_H(eps, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        P, F, _, _, _, _, _, _ = solve_and_compute(
+        P, F, _, _, _, _, _, _, _, _ = solve_and_compute(
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
             closure=closure, cavitation=cavitation,
@@ -105,7 +105,7 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
         eps_mid = 0.5 * (eps_lo + eps_hi)
         H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        _, F_hyd, mu, Qv, h_min, p_max, _, _ = solve_and_compute(
+        _, F_hyd, mu, Qv, h_min, p_max, _, _, _, _ = solve_and_compute(
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh,
             closure=closure, cavitation=cavitation,

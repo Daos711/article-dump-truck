@@ -119,7 +119,7 @@ def run_pump_analysis(h_p_override=None,
                 H_smooth = make_H(eps, Phi_mesh, Z_mesh, p,
                                   textured=False)
 
-            P, F, mu, Qv, h_m, p_m, F_friction, n_out = solve_and_compute(
+            P, F, mu, Qv, h_m, p_m, F_friction, n_out, _, _ = solve_and_compute(
                 H, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
                 phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
                 closure=closure, cavitation=cavitation,
