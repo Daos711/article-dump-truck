@@ -29,7 +29,7 @@ from reynolds_solver import solve_reynolds
 
 B_AUSAS = 0.1
 R_AUSAS = 1.0
-L_AUSAS = 2 * np.pi * R_AUSAS * B_AUSAS
+L_AUSAS = R_AUSAS * B_AUSAS  # = 0.1
 
 N1_TEX = 50
 N2_TEX = 5
