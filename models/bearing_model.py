@@ -134,7 +134,7 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
         solver_kw = dict(
             closure=closure,
             cavitation=cavitation,
-            tol=1e-5,
+            tol=1e-6,
             max_iter=50000,
             P_init=P_init,
             phi_1D=phi_1D,
