@@ -100,10 +100,10 @@ def run_timing(N_phi, N_Z, eps=0.6):
 def main():
     parser = argparse.ArgumentParser(
         description="Гладкий подшипник насоса с Payvar-Salant кавитацией")
-    parser.add_argument("--nphi", type=int, default=400,
-                        help="Узлов по phi (default: 400)")
-    parser.add_argument("--nz", type=int, default=100,
-                        help="Узлов по Z (default: 100)")
+    parser.add_argument("--nphi", type=int, default=1000,
+                        help="Узлов по phi (default: 1000)")
+    parser.add_argument("--nz", type=int, default=250,
+                        help="Узлов по Z (default: 250)")
     parser.add_argument("--neps", type=int, default=15,
                         help="Число точек по eps (default: 15)")
     parser.add_argument("--timing-only", action="store_true",
