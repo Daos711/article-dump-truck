@@ -38,13 +38,15 @@ S0_DIMPLES = [
 ]
 S0_HP = [1e-6, 2e-6, 3e-6, 5e-6, 7e-6]
 S0_ZONES = [(0, 90)]
-S0_SF = [1.5, 2.0]
+S0_SF = [2.0, 3.0, 5.0]
 S0_EPS = [0.3, 0.6]
+
+MAX_DIMPLES = 2000
 
 # Stage 1: расширенный
 S1_ZONES = [(0, 90), (0, 180), (90, 270)]
 S1_EPS = [0.3, 0.5, 0.6, 0.7]
-S1_SF = [1.3, 1.5, 2.0]
+S1_SF = [2.0, 3.0, 5.0]
 S1_HP = [1e-6, 2e-6, 3e-6, 5e-6, 7e-6, 10e-6]
 
 MIN_NODES = 6
@@ -147,6 +149,10 @@ def run_stage(dimples, hp_list, zones, sfs, eps_list, tag, out_dir):
                     if Nt_phi < 1 or Nt_Z < 1:
                         skipped += len(eps_list)
                         continue
+                    n_total = Nt_phi * Nt_Z
+                    if n_total > MAX_DIMPLES:
+                        skipped += len(eps_list)
+                        continue
                     variants.append((a, b, hp, zone, sf, Nt_phi, Nt_Z,
                                      npd_phi, npd_Z))
 
@@ -172,6 +178,11 @@ def run_stage(dimples, hp_list, zones, sfs, eps_list, tag, out_dir):
         H_p = hp / p.c
 
         for eps in eps_list:
+            print(f"  [{done+1}/{total_calcs}] "
+                  f"hp={hp*1e6:.0f} a/b={a*1e6:.0f}/{b*1e6:.0f} "
+                  f"zone={zone[0]}-{zone[1]} sf={sf:.1f} ε={eps:.1f} "
+                  f"N={n_dimples} ...", end="", flush=True)
+
             H0 = make_H(eps, Phi_mesh, Z_mesh, p, textured=False)
             H_tex = create_H_with_ellipsoidal_depressions(
                 H0, H_p, Phi_mesh, Z_mesh, phi_c, Z_c, A_nd, B_nd,
@@ -197,10 +208,7 @@ def run_stage(dimples, hp_list, zones, sfs, eps_list, tag, out_dir):
 
             marker = " <<<" if gw > 1.0 else (" ~" if gw > 0.995 else "")
             wup_s = "" if wup else " [!]"
-            print(f"  [{done}/{total_calcs}] "
-                  f"hp={hp*1e6:.0f} a/b={a*1e6:.0f}/{b*1e6:.0f} "
-                  f"zone={zone[0]}-{zone[1]} sf={sf:.1f} ε={eps:.1f} "
-                  f"N={n_dimples} gW={gw:.4f} ({dt:.1f}с){marker}{wup_s}")
+            print(f" gW={gw:.4f} ({dt:.1f}с){marker}{wup_s}")
 
     dt_all = time.time() - t0_all
     print(f"\n  Время: {dt_all:.0f}с ({dt_all/60:.1f} мин)")
