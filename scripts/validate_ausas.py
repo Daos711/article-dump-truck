@@ -105,7 +105,8 @@ def compute_forces_ausas(P, H, Phi, phi_1D, Z_1D, theta=None):
 
 def solve_ps(H, dp, dz):
     P, theta, res, nit = _ps_solver(
-        H, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
+        H, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000,
+        hs_warmup_iter=500_000)
     return P, theta
 
 
