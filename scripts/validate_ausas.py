@@ -89,28 +89,26 @@ def add_square_dimples(H, Phi, Zm, N1, N2, s_frac, ht0):
 def compute_forces_ausas(P, H, Phi, phi_1D, Z_1D, theta=None):
     """Нагрузка и трение в координатах Ausas.
 
-    Load: WX = ∫p·cos(2πx₁) dx₁dx₂, WY = ∫p·sin(2πx₁) dx₁dx₂
-    Friction: T = ∫_Ω⁺ (1/h + 3h·∂p/∂x₁) dx₁dx₂
+    x₁ = φ ∈ [0, 2π] (прямое соответствие, без конвертации).
+    x₂ ∈ [0, B] → Z ∈ [-1, 1]: dx₂ = B·dZ/2.
 
-    Пересчёт из наших координат (φ, Z):
-      dx₁ = dφ/(2π), dx₂ = B·dZ/2
-      ∂p/∂x₁ = 2π · ∂P/∂φ
+    Load: WX = ∫p·cos(x₁) dx₁dx₂, WY = ∫p·sin(x₁) dx₁dx₂
+    Friction: T = ∫_Ω⁺ (1/h + 3h·∂p/∂x₁) dx₁dx₂
     """
     d_phi = phi_1D[1] - phi_1D[0]
 
-    # Масштаб: dx₁·dx₂ = dφ·dZ · B/(4π)
-    scale = B_AUSAS / (4 * np.pi)
+    # dx₁·dx₂ = dφ · B·dZ/2
+    scale = B_AUSAS / 2.0
 
-    # Load (Ausas eq. 9): cos(2πx₁) = cos(φ)
+    # Load
     WX = np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
                        Z_1D, axis=0) * scale
     WY = np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
                        Z_1D, axis=0) * scale
     W = np.sqrt(WX**2 + WY**2)
 
-    # Friction (Ausas eq. 10)
-    dP_dphi = np.gradient(P, d_phi, axis=1)
-    dP_dx1 = 2 * np.pi * dP_dphi  # ∂p/∂x₁
+    # Friction (Ausas eq. 10): ∂p/∂x₁ = ∂P/∂φ (x₁ = φ)
+    dP_dx1 = np.gradient(P, d_phi, axis=1)
 
     if theta is not None:
         full_film = theta > (1.0 - 1e-6)
