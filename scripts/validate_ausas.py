@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Валидация PS-солвера против Ausas et al. (2006).
 
-Безразмерная задача. Домен Ω = (0, 2π) × (-1, 1), B_ausas = 0.1.
-h = 1 + ε·cos(φ) + h_t(φ, z)
-Текстура: квадратные ступенчатые лунки (step profile).
-Без пьезовязкости, без шероховатости, laminar.
+Безразмерная задача в координатах Ausas:
+  x₁ ∈ [0, 1]  (= φ/(2π)), x₂ ∈ [0, B],  B = 0.1
+  h = 1 + X·cos(2πx₁) + Y·sin(2πx₁) + h_t
 
-Stage A: pa=0 (оба торца), качественная проверка формы P(x).
-Stage B: pa=0.0075 на inlet, количественная (Table 1).
+Наш солвер работает в φ ∈ [0, 2π), Z ∈ [-1, 1].
+Связь: x₁ = φ/(2π), x₂ = (Z+1)/2 · B.
+
+Stage A: при фиксированном ε — качественная проверка P(x), θ(x).
+Stage B: поиск равновесия для Wa — количественная (Table 1, Fig. 8).
+
+Friction eq. (10): T = ∫_Ω⁺ (1/h + 3h·∂p/∂x₁) dx₁ dx₂
+Load eq. (9): WX = ∫ p·cos(2πx₁) dx₁dx₂, WY = ∫ p·sin(2πx₁) dx₁dx₂
 """
 import sys
 import os
@@ -20,7 +25,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ─── Прямой импорт солверов ───────────────────────────────────────
+# ─── Солверы ──────────────────────────────────────────────────────
 try:
     from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_gpu
     _ps_solver = solve_payvar_salant_gpu
@@ -28,28 +33,24 @@ except ImportError:
     from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_cpu
     _ps_solver = solve_payvar_salant_cpu
 
-from reynolds_solver import solve_reynolds  # для HS
+from reynolds_solver import solve_reynolds
 
-# ─── Параметры Ausas ──────────────────────────────────────────────
-B_AUSAS = 0.1          # B = L/(2πR) в безразмерном виде
-EPS = 0.6              # эксцентриситет (оценка по Fig. 4)
-PA = 0.0               # Stage A: pa=0
-PA_STAGE_B = 0.0075    # Stage B: feeding pressure
-
-# Геометрия: R=1, L = 2πR·B
+# ─── Параметры Ausas ─────────────────────────────────────────────
+B_AUSAS = 0.1
 R_AUSAS = 1.0
-L_AUSAS = 2 * np.pi * R_AUSAS * B_AUSAS  # ≈ 0.6283
+L_AUSAS = 2 * np.pi * R_AUSAS * B_AUSAS
 
-# Текстура: 50×5 квадратных лунок по всему домену
-N1_TEX = 50            # по φ
-N2_TEX = 5             # по Z
-S_FRAC = 0.20          # area fraction
+N1_TEX = 50
+N2_TEX = 5
+S_FRAC = 0.20
 
 HT0_VALUES = [0.15, 0.30, 0.45, 0.60, 0.75]
 
+# Wa из Ausas Fig. 6 (оценка)
+WA_VALUES = [0.002, 0.0048, 0.0076, 0.0104, 0.0132]
+
 
 def make_grid(N_phi, N_Z):
-    """Сетка φ ∈ [0, 2π), Z ∈ [-1, 1]."""
     phi = np.linspace(0, 2 * np.pi, N_phi, endpoint=False)
     Z = np.linspace(-1, 1, N_Z)
     d_phi = phi[1] - phi[0]
@@ -58,27 +59,16 @@ def make_grid(N_phi, N_Z):
     return phi, Z, Phi, Zm, d_phi, d_Z
 
 
-def make_H_smooth(eps, Phi):
-    """Чистый H без регуляризации шероховатости."""
-    return 1.0 + eps * np.cos(Phi)
+def make_H_XY(X, Y, Phi):
+    """H = 1 + X·cos(φ) + Y·sin(φ)."""
+    return 1.0 + X * np.cos(Phi) + Y * np.sin(Phi)
 
 
-def add_square_dimples(H, Phi, Z, N1, N2, s_frac, ht0):
-    """Добавить квадратные ступенчатые лунки.
-
-    Домен разбит на N1×N2 ячеек. В центре каждой ячейки —
-    квадратная лунка глубиной ht0.
-    """
+def add_square_dimples(H, Phi, Zm, N1, N2, s_frac, ht0):
+    """Квадратные ступенчатые лунки — N1×N2 по всему домену."""
     H_out = H.copy()
-    N_Z, N_phi = Phi.shape
-
-    # Размер ячейки
-    cell_phi = 2 * np.pi / N1      # в радианах
-    cell_Z = 2.0 / N2              # в безразмерных Z
-
-    # Сторона квадрата: area = s_frac × cell_area
-    # В координатах: квадрат со стороной a_phi (рад) и a_Z (безразм.)
-    # Для квадратных лунок: a_phi/cell_phi = a_Z/cell_Z = sqrt(s_frac)
+    cell_phi = 2 * np.pi / N1
+    cell_Z = 2.0 / N2
     side_ratio = np.sqrt(s_frac)
     a_phi = side_ratio * cell_phi
     a_Z = side_ratio * cell_Z
@@ -87,267 +77,285 @@ def add_square_dimples(H, Phi, Z, N1, N2, s_frac, ht0):
         phi_c = (i1 + 0.5) * cell_phi
         for i2 in range(N2):
             Z_c = -1.0 + (i2 + 0.5) * cell_Z
-
-            # Маска: внутри квадрата
             dphi = np.abs(Phi - phi_c)
-            # Периодическая по φ
             dphi = np.minimum(dphi, 2 * np.pi - dphi)
-            dz = np.abs(Z - Z_c)
-
+            dz = np.abs(Zm - Z_c)
             mask = (dphi < a_phi / 2) & (dz < a_Z / 2)
             H_out[mask] += ht0
 
     return H_out
 
 
-def compute_forces(P, H, Phi, phi_1D, Z_1D, theta=None):
-    """Несущая способность и трение (формула Ausas eq. 10).
+def compute_forces_ausas(P, H, Phi, phi_1D, Z_1D, theta=None):
+    """Нагрузка и трение в координатах Ausas.
 
-    Friction T = ∫_Ω⁺ (1/h + 3h·∂p/∂φ) dΩ
-    Интегрирование по Ω⁺ (full-film only, θ=1).
+    Load: WX = ∫p·cos(2πx₁) dx₁dx₂, WY = ∫p·sin(2πx₁) dx₁dx₂
+    Friction: T = ∫_Ω⁺ (1/h + 3h·∂p/∂x₁) dx₁dx₂
+
+    Пересчёт из наших координат (φ, Z):
+      dx₁ = dφ/(2π), dx₂ = B·dZ/2
+      ∂p/∂x₁ = 2π · ∂P/∂φ
     """
     d_phi = phi_1D[1] - phi_1D[0]
-    d_Z = Z_1D[1] - Z_1D[0]
 
-    # Load
-    Fx = -np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
-                    Z_1D, axis=0)
-    Fy = -np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
-                    Z_1D, axis=0)
-    W = np.sqrt(Fx**2 + Fy**2)
+    # Масштаб: dx₁·dx₂ = dφ·dZ · B/(4π)
+    scale = B_AUSAS / (4 * np.pi)
+
+    # Load (Ausas eq. 9): cos(2πx₁) = cos(φ)
+    WX = np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
+                       Z_1D, axis=0) * scale
+    WY = np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
+                       Z_1D, axis=0) * scale
+    W = np.sqrt(WX**2 + WY**2)
 
     # Friction (Ausas eq. 10)
     dP_dphi = np.gradient(P, d_phi, axis=1)
+    dP_dx1 = 2 * np.pi * dP_dphi  # ∂p/∂x₁
 
     if theta is not None:
-        # Ω⁺: full-film region (θ ≈ 1)
         full_film = theta > (1.0 - 1e-6)
     else:
-        # HS: P > 0 region
         full_film = P > 0
 
-    integrand = np.where(full_film, 1.0 / H + 3.0 * H * dP_dphi, 0.0)
-    T = np.trapezoid(np.trapezoid(integrand, phi_1D, axis=1), Z_1D, axis=0)
+    integrand = np.where(full_film, 1.0 / H + 3.0 * H * dP_dx1, 0.0)
+    T = np.trapezoid(np.trapezoid(integrand, phi_1D, axis=1),
+                      Z_1D, axis=0) * scale
 
-    return W, T
+    return WX, WY, W, T
 
 
-def run_stage_a(out_dir):
-    """Stage A: pa=0, качественная проверка."""
-    print(f"\n{'=' * 80}")
-    print(f"STAGE A: pa=0, ε={EPS}")
-    print(f"{'=' * 80}")
+def solve_ps(H, dp, dz):
+    P, theta, res, nit = _ps_solver(
+        H, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
+    return P, theta
 
-    N_phi_s, N_Z_s = 500, 50     # smooth
-    N_phi_t, N_Z_t = 750, 75     # textured
 
-    # --- Smooth ---
-    phi, Z, Phi, Zm, dp, dz = make_grid(N_phi_s, N_Z_s)
-    H_s = make_H_smooth(EPS, Phi)
-
-    # PS
-    t0 = time.time()
-    P_ps, theta_ps, res_ps, nit_ps = _ps_solver(
-        H_s, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
-    dt_ps = time.time() - t0
-    W_ps, T_ps = compute_forces(P_ps, H_s, Phi, phi, Z, theta_ps)
-    P_max_ps = np.max(P_ps)
-    print(f"\n  Smooth PS: P_max={P_max_ps:.4f} (expect ~0.128), "
-          f"W={W_ps:.4f}, T={T_ps:.4f}, {dt_ps:.1f}с")
-
-    # HS
-    t0 = time.time()
-    P_hs, _, _, _ = solve_reynolds(
-        H_s, dp, dz, R_AUSAS, L_AUSAS,
+def solve_hs(H, dp, dz):
+    P, _, _, _ = solve_reynolds(
+        H, dp, dz, R_AUSAS, L_AUSAS,
         closure="laminar", cavitation="half_sommerfeld",
         return_converged=True)
-    dt_hs = time.time() - t0
-    W_hs, T_hs = compute_forces(P_hs, H_s, Phi, phi, Z)
-    print(f"  Smooth HS: P_max={np.max(P_hs):.4f}, "
-          f"W={W_hs:.4f}, T={T_hs:.4f}, {dt_hs:.1f}с")
+    return P
 
-    # Midplane P(x) — smooth
-    iz_mid = N_Z_s // 2
-    x_norm = phi / (2 * np.pi)
+
+def find_equilibrium(Wa, Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
+                     textured=False, ht0=0.0, solver="ps",
+                     max_iter=30, tol=1e-4):
+    """Newton-Raphson для поиска равновесного (X, Y).
+
+    Нагрузка Wa приложена вертикально (по -Y): Wa_x=0, Wa_y=-Wa.
+    Условие равновесия: WX = 0, WY = Wa.
+    """
+    X, Y = 0.0, -0.3  # начальное приближение (эксцентриситет ~0.3)
+    dXY = 1e-5  # шаг для Якобиана
+
+    for it in range(max_iter):
+        H = make_H_XY(X, Y, Phi)
+        if textured:
+            H = add_square_dimples(H, Phi, Zm, N1_TEX, N2_TEX, S_FRAC, ht0)
+
+        if solver == "ps":
+            P, theta = solve_ps(H, d_phi, d_Z)
+            WX, WY, W, T = compute_forces_ausas(P, H, Phi, phi_1D, Z_1D, theta)
+        else:
+            P = solve_hs(H, d_phi, d_Z)
+            WX, WY, W, T = compute_forces_ausas(P, H, Phi, phi_1D, Z_1D)
+
+        # Невязка: WX = 0, WY = Wa
+        Rx = WX
+        Ry = WY - Wa
+        err = np.sqrt(Rx**2 + Ry**2)
+
+        if err < tol * Wa:
+            eps = np.sqrt(X**2 + Y**2)
+            return X, Y, eps, W, T, P, it + 1
+
+        # Якобиан (конечные разности)
+        J = np.zeros((2, 2))
+        for col, (dX_, dY_) in enumerate([(dXY, 0), (0, dXY)]):
+            H_p = make_H_XY(X + dX_, Y + dY_, Phi)
+            if textured:
+                H_p = add_square_dimples(H_p, Phi, Zm, N1_TEX, N2_TEX,
+                                          S_FRAC, ht0)
+            if solver == "ps":
+                Pp, thp = solve_ps(H_p, d_phi, d_Z)
+                WXp, WYp, _, _ = compute_forces_ausas(Pp, H_p, Phi, phi_1D,
+                                                       Z_1D, thp)
+            else:
+                Pp = solve_hs(H_p, d_phi, d_Z)
+                WXp, WYp, _, _ = compute_forces_ausas(Pp, H_p, Phi, phi_1D,
+                                                       Z_1D)
+            J[0, col] = (WXp - WX) / dXY
+            J[1, col] = (WYp - WY) / dXY
+
+        # Шаг Ньютона
+        det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+        if abs(det) < 1e-20:
+            break
+        dX = -(J[1, 1] * Rx - J[0, 1] * Ry) / det
+        dY = -(-J[1, 0] * Rx + J[0, 0] * Ry) / det
+
+        # Демпфирование
+        step = min(1.0, 0.1 / max(abs(dX), abs(dY), 1e-10))
+        X += step * dX
+        Y += step * dY
+
+    eps = np.sqrt(X**2 + Y**2)
+    return X, Y, eps, W, T, P, max_iter
+
+
+# ===================================================================
+#  Stage A: фиксированный ε, качественная проверка
+# ===================================================================
+
+def run_stage_a(out_dir):
+    EPS = 0.6
+    print(f"\n{'=' * 80}")
+    print(f"STAGE A: ε={EPS}, pa=0")
+    print(f"{'=' * 80}")
+
+    N_phi_s, N_Z_s = 500, 50
+    N_phi_t, N_Z_t = 750, 75
+
+    # Smooth
+    phi, Z, Phi, Zm, dp, dz = make_grid(N_phi_s, N_Z_s)
+    H_s = make_H_XY(EPS, 0.0, Phi)
+
+    P_ps, theta_ps = solve_ps(H_s, dp, dz)
+    _, _, W_ps, T_ps = compute_forces_ausas(P_ps, H_s, Phi, phi, Z, theta_ps)
+    print(f"\n  Smooth PS: P_max={np.max(P_ps):.4f}, W={W_ps:.4f}, T={T_ps:.4f}")
+
+    P_hs = solve_hs(H_s, dp, dz)
+    _, _, W_hs, T_hs = compute_forces_ausas(P_hs, H_s, Phi, phi, Z)
+    print(f"  Smooth HS: P_max={np.max(P_hs):.4f}, W={W_hs:.4f}, T={T_hs:.4f}")
+
+    # Midplane smooth
+    iz = N_Z_s // 2
+    x = phi / (2 * np.pi)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x_norm, P_ps[iz_mid, :], "b-", linewidth=2, label="PS (Payvar-Salant)")
-    ax.plot(x_norm, P_hs[iz_mid, :], "r--", linewidth=1.5, label="HS (Half-Sommerfeld)")
-    ax.set_xlabel("x = φ/(2π)")
-    ax.set_ylabel("P (безразмерное)")
-    ax.set_title(f"Midplane P(x), smooth, ε={EPS} (cf. Ausas Fig. 4a)")
+    ax.plot(x, P_ps[iz, :], "b-", lw=2, label="PS")
+    ax.plot(x, P_hs[iz, :], "r--", lw=1.5, label="HS")
+    ax.set_xlabel("x₁ = φ/(2π)")
+    ax.set_ylabel("p")
+    ax.set_title(f"Smooth midplane, ε={EPS} (cf. Ausas Fig. 4a)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "ausas_fig4a_smooth.png"), dpi=300)
     fig.savefig(os.path.join(out_dir, "ausas_fig4a_smooth.pdf"))
     plt.close(fig)
-    print(f"  График: ausas_fig4a_smooth.png")
 
-    # --- Textured 50×5, ht0=0.30 ---
+    # Textured
     phi_t, Z_t, Phi_t, Zm_t, dp_t, dz_t = make_grid(N_phi_t, N_Z_t)
-    H_t0 = make_H_smooth(EPS, Phi_t)
+    H0 = make_H_XY(EPS, 0.0, Phi_t)
     ht0 = 0.30
-    H_tex = add_square_dimples(H_t0, Phi_t, Zm_t, N1_TEX, N2_TEX, S_FRAC, ht0)
+    H_tex = add_square_dimples(H0, Phi_t, Zm_t, N1_TEX, N2_TEX, S_FRAC, ht0)
 
-    # PS
-    t0 = time.time()
-    P_ps_t, theta_ps_t, _, _ = _ps_solver(
-        H_tex, dp_t, dz_t, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
-    dt = time.time() - t0
-    W_ps_t, T_ps_t = compute_forces(P_ps_t, H_tex, Phi_t, phi_t, Z_t, theta_ps_t)
-    print(f"\n  Textured PS (ht0={ht0}): P_max={np.max(P_ps_t):.4f}, "
-          f"W={W_ps_t:.4f}, T={T_ps_t:.4f}, {dt:.1f}с")
+    P_ps_t, theta_t = solve_ps(H_tex, dp_t, dz_t)
+    _, _, W_t, T_t = compute_forces_ausas(P_ps_t, H_tex, Phi_t, phi_t, Z_t, theta_t)
+    print(f"\n  Tex PS (ht0={ht0}): P_max={np.max(P_ps_t):.4f}, W={W_t:.4f}, T={T_t:.4f}")
 
-    # HS
-    t0 = time.time()
-    P_hs_t, _, _, _ = solve_reynolds(
-        H_tex, dp_t, dz_t, R_AUSAS, L_AUSAS,
-        closure="laminar", cavitation="half_sommerfeld",
-        return_converged=True)
-    dt = time.time() - t0
-    W_hs_t, T_hs_t = compute_forces(P_hs_t, H_tex, Phi_t, phi_t, Z_t)
-    print(f"  Textured HS (ht0={ht0}): P_max={np.max(P_hs_t):.4f}, "
-          f"W={W_hs_t:.4f}, T={T_hs_t:.4f}, {dt:.1f}с")
+    P_hs_t = solve_hs(H_tex, dp_t, dz_t)
+    _, _, W_ht, T_ht = compute_forces_ausas(P_hs_t, H_tex, Phi_t, phi_t, Z_t)
+    print(f"  Tex HS (ht0={ht0}): P_max={np.max(P_hs_t):.4f}, W={W_ht:.4f}, T={T_ht:.4f}")
 
-    # Midplane P(x) — textured
-    iz_mid_t = N_Z_t // 2
-    x_norm_t = phi_t / (2 * np.pi)
+    # Midplane textured
+    iz_t = N_Z_t // 2
+    x_t = phi_t / (2 * np.pi)
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x_norm_t, P_ps_t[iz_mid_t, :], "b-", linewidth=1.5,
-            label="PS (Payvar-Salant)")
-    ax.plot(x_norm_t, P_hs_t[iz_mid_t, :], "r--", linewidth=1,
-            label="HS (Half-Sommerfeld)")
-    ax.set_xlabel("x = φ/(2π)")
-    ax.set_ylabel("P (безразмерное)")
-    ax.set_title(f"Midplane P(x), textured 50×5 ht0={ht0}, ε={EPS} "
-                 f"(cf. Ausas Fig. 4b)")
+    ax.plot(x_t, P_ps_t[iz_t, :], "b-", lw=1.5, label="PS")
+    ax.plot(x_t, P_hs_t[iz_t, :], "r--", lw=1, label="HS")
+    ax.set_xlabel("x₁ = φ/(2π)")
+    ax.set_ylabel("p")
+    ax.set_title(f"Textured 50×5 ht0={ht0}, ε={EPS} (cf. Fig. 4b)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "ausas_fig4b_textured.png"), dpi=300)
     fig.savefig(os.path.join(out_dir, "ausas_fig4b_textured.pdf"))
     plt.close(fig)
-    print(f"  График: ausas_fig4b_textured.png")
 
-    # θ(x) — кавитационная зона
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x_norm_t, theta_ps_t[iz_mid_t, :], "b-", linewidth=1.5,
-            label="PS θ")
-    ax.set_xlabel("x = φ/(2π)")
-    ax.set_ylabel("θ")
-    ax.set_title(f"θ(x) midplane, textured 50×5 ht0={ht0}, ε={EPS}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ausas_theta_textured.png"), dpi=300)
-    plt.close(fig)
-    print(f"  График: ausas_theta_textured.png")
-
-    # Контурная карта P(φ,Z) textured PS
+    # P contour
     fig, axes = plt.subplots(1, 2, figsize=(14, 4), sharey=True)
     for ax, P, title in [(axes[0], P_ps_t, "PS"), (axes[1], P_hs_t, "HS")]:
-        c = ax.contourf(x_norm_t, Z_t, P, levels=50, cmap="hot_r")
-        fig.colorbar(c, ax=ax, label="P")
-        ax.set_xlabel("x = φ/(2π)")
-        ax.set_title(f"{title}, textured 50×5 ht0={ht0}")
+        c = ax.contourf(x_t, Z_t, P, levels=50, cmap="hot_r")
+        fig.colorbar(c, ax=ax, label="p")
+        ax.set_xlabel("x₁")
+        ax.set_title(f"{title}, ht0={ht0}")
     axes[0].set_ylabel("Z")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "ausas_P_contour.png"), dpi=300)
     plt.close(fig)
-    print(f"  График: ausas_P_contour.png")
 
-    return {"P_max_smooth_ps": P_max_ps, "T_smooth_ps": T_ps,
-            "T_tex_ps": T_ps_t}
+    print(f"  Графики сохранены")
 
+
+# ===================================================================
+#  Stage B: поиск равновесия, Table 1 / Fig. 8
+# ===================================================================
 
 def run_stage_b(out_dir):
-    """Stage B: friction vs ht0 (Table 1, Fig. 8).
-
-    pa=0 (наш солвер пока не поддерживает ненулевой Dirichlet).
-    Трактовать как semi-quantitative.
-    """
     print(f"\n{'=' * 80}")
-    print(f"STAGE B: Friction vs ht0 (Table 1 / Fig. 8)")
-    print(f"pa = 0 (наш солвер), Ausas pa = {PA_STAGE_B}")
+    print(f"STAGE B: Friction vs ht0 с поиском равновесия")
     print(f"{'=' * 80}")
 
     N_phi, N_Z = 750, 75
     phi, Z, Phi, Zm, dp, dz = make_grid(N_phi, N_Z)
-    H_s = make_H_smooth(EPS, Phi)
 
-    # Smooth reference
-    P_ps, theta_ps, _, _ = _ps_solver(
-        H_s, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
-    _, T_smooth = compute_forces(P_ps, H_s, Phi, phi, Z, theta_ps)
-    print(f"\n  Smooth: T={T_smooth:.4f} (Ausas Table 1: 1.201)")
+    # Выбираем Wa ≈ 0.0076 (средний из Ausas Fig. 6)
+    Wa = 0.0076
 
-    P_hs, _, _, _ = solve_reynolds(
-        H_s, dp, dz, R_AUSAS, L_AUSAS,
-        closure="laminar", cavitation="half_sommerfeld",
-        return_converged=True)
-    _, T_smooth_hs = compute_forces(P_hs, H_s, Phi, phi, Z)
-    print(f"  Smooth HS: T={T_smooth_hs:.4f}")
+    # Smooth равновесие
+    print(f"\n  Поиск равновесия для Wa={Wa} (smooth, PS)...")
+    t0 = time.time()
+    X_s, Y_s, eps_s, W_s, T_s, _, nit_s = find_equilibrium(
+        Wa, Phi, Zm, phi, Z, dp, dz, solver="ps")
+    dt = time.time() - t0
+    print(f"  Smooth PS: X={X_s:.4f}, Y={Y_s:.4f}, ε={eps_s:.4f}, "
+          f"W={W_s:.6f}, T={T_s:.4f}, {nit_s} iter, {dt:.1f}с")
+    print(f"  Ausas Table 1: T_smooth ≈ 1.201")
 
-    # Sweep по ht0
-    print(f"\n  {'ht0':>6} {'T_PS':>8} {'T_HS':>8} {'T/T_s PS':>10} {'T/T_s HS':>10}")
-    print("  " + "-" * 50)
+    # Textured для каждого ht0
+    print(f"\n  {'ht0':>6} {'ε_eq':>6} {'W':>8} {'T_PS':>8} "
+          f"{'T/T_s':>7} {'nit':>4} {'time':>5}")
+    print("  " + "-" * 55)
 
     T_ps_arr = []
-    T_hs_arr = []
     for ht0 in HT0_VALUES:
-        H_tex = add_square_dimples(H_s.copy(), Phi, Zm, N1_TEX, N2_TEX,
-                                    S_FRAC, ht0)
-        # PS
-        P_t, theta_t, _, _ = _ps_solver(
-            H_tex, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
-        _, T_t = compute_forces(P_t, H_tex, Phi, phi, Z, theta_t)
+        t0 = time.time()
+        X_t, Y_t, eps_t, W_t, T_t, _, nit_t = find_equilibrium(
+            Wa, Phi, Zm, phi, Z, dp, dz,
+            textured=True, ht0=ht0, solver="ps")
+        dt = time.time() - t0
         T_ps_arr.append(T_t)
+        ratio = T_t / T_s if T_s > 0 else 0
+        print(f"  {ht0:6.2f} {eps_t:6.4f} {W_t:8.6f} {T_t:8.4f} "
+              f"{ratio:7.4f} {nit_t:4d} {dt:5.1f}с")
 
-        # HS
-        P_hs_t, _, _, _ = solve_reynolds(
-            H_tex, dp, dz, 1.0, 1.0,
-            closure="laminar", cavitation="half_sommerfeld",
-            return_converged=True)
-        _, T_hs_t = compute_forces(P_hs_t, H_tex, Phi, phi, Z)
-        T_hs_arr.append(T_hs_t)
-
-        ratio_ps = T_t / T_smooth if T_smooth > 0 else 0
-        ratio_hs = T_hs_t / T_smooth_hs if T_smooth_hs > 0 else 0
-        print(f"  {ht0:6.2f} {T_t:8.4f} {T_hs_t:8.4f} "
-              f"{ratio_ps:10.4f} {ratio_hs:10.4f}")
-
-    # График T(ht0) — Fig. 8 analogue
+    # График
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot([0] + HT0_VALUES, [T_smooth] + T_ps_arr,
-            "bo-", linewidth=2, markersize=6, label="PS (Payvar-Salant)")
-    ax.plot([0] + HT0_VALUES, [T_smooth_hs] + T_hs_arr,
-            "rs--", linewidth=2, markersize=6, label="HS (Half-Sommerfeld)")
-    ax.set_xlabel("ht0 (глубина лунки)")
+    ax.plot([0] + HT0_VALUES, [T_s] + T_ps_arr,
+            "bo-", lw=2, markersize=6, label="PS (наш)")
+    ax.axhline(1.201, color="gray", ls=":", lw=1, label="Ausas smooth (1.201)")
+    ax.set_xlabel("ht0")
     ax.set_ylabel("T (friction)")
-    ax.set_title(f"Friction vs dimple depth, ε={EPS}, 50×5 square, s={S_FRAC}")
+    ax.set_title(f"Friction vs ht0, Wa={Wa}, 50×5 square, s={S_FRAC}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ausas_fig8_friction.png"), dpi=300)
-    fig.savefig(os.path.join(out_dir, "ausas_fig8_friction.pdf"))
+    fig.savefig(os.path.join(out_dir, "ausas_fig8_equilibrium.png"), dpi=300)
+    fig.savefig(os.path.join(out_dir, "ausas_fig8_equilibrium.pdf"))
     plt.close(fig)
-    print(f"\n  График: ausas_fig8_friction.png")
+    print(f"\n  График: ausas_fig8_equilibrium.png")
 
-    # Acceptance checklist
-    print(f"\n{'=' * 80}")
-    print("ACCEPTANCE CHECKLIST")
-    print(f"{'=' * 80}")
-    print(f"  [{'✓' if abs(T_smooth - 1.201) / 1.201 < 0.20 else '✗'}] "
-          f"Smooth T={T_smooth:.4f} (Ausas: 1.201, pa=0 vs pa=0.0075)")
-    print(f"  Note: pa=0 может дать другой T — semi-quantitative")
-
-    # Тренд: PS friction с ht0 — слабый рост?
-    trend_ps = T_ps_arr[-1] > T_ps_arr[0]
-    trend_hs = T_hs_arr[-1] > T_hs_arr[0]
-    print(f"  [{'✓' if trend_ps else '✗'}] PS friction растёт с ht0 "
-          f"(Fig. 8 trend)")
-    print(f"  [{'✓' if trend_hs else '✗'}] HS friction растёт с ht0")
-    print(f"{'=' * 80}")
+    # Acceptance
+    print(f"\n  T_smooth = {T_s:.4f} (Ausas: 1.201)")
+    if abs(T_s - 1.201) / 1.201 < 0.10:
+        print(f"  ✓ Совпадение < 10%")
+    elif abs(T_s - 1.201) / 1.201 < 0.20:
+        print(f"  ~ Совпадение < 20% (pa=0 vs pa=0.0075)")
+    else:
+        print(f"  ✗ Расхождение > 20% — нужна проверка")
 
 
 def main():
@@ -356,12 +364,12 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 80)
-    print("ВАЛИДАЦИЯ PAYVAR-SALANT vs AUSAS et al. (2006)")
-    print(f"ε={EPS}, B={B_AUSAS}, texture 50×5, s={S_FRAC}")
+    print("ВАЛИДАЦИЯ PS vs AUSAS et al. (2006)")
+    print(f"B={B_AUSAS}, texture 50×5, s={S_FRAC}")
     print(f"Результаты → {out_dir}")
     print("=" * 80)
 
-    stage_a_results = run_stage_a(out_dir)
+    run_stage_a(out_dir)
     run_stage_b(out_dir)
 
     print(f"\nВсе результаты → {out_dir}")
