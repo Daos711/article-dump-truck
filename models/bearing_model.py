@@ -167,16 +167,37 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     cav_frac = 0.0
 
     if is_ps:
-        # Прямой вызов GPU (или CPU-fallback) solver'а
-        P, theta, residual, n_iter = _ps_solver(
-            H, d_phi, d_Z, R, L,
-            tol=1e-6,
-            max_iter=10_000_000,
-        )
-        result = None  # не используется далее
-        n_outer = n_iter
-        converged = True
-        cav_frac = float(np.mean(theta < 1.0))
+        if alpha_pv is not None:
+            # PV+PS: пьезовязкий Payvar-Salant
+            from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
+                solve_payvar_salant_piezoviscous,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_piezoviscous(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv,
+                p_scale=p_scale,
+                tol=1e-6,
+                max_iter=10_000_000,
+                relax_mu=0.5,
+                relax_g=0.7,
+                max_outer=30,
+                tol_outer=1e-3,
+                verbose=False,
+            )
+            n_outer = 0
+            converged = True
+            cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
+        else:
+            # Изовязкий PS: GPU-solver напрямую
+            P, theta, residual, n_iter = _ps_solver(
+                H, d_phi, d_Z, R, L,
+                tol=1e-6,
+                max_iter=10_000_000,
+            )
+            n_outer = n_iter
+            converged = True
+            cav_frac = float(np.mean(theta < 1.0))
+        result = None
     else:
         result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
 
