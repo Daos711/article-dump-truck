@@ -130,16 +130,19 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     is_ps = (cavitation == "payvar_salant")
 
     if is_ps:
-        # Payvar-Salant: минимальный набор kwargs, без subcell_quad/PV
-        solver_kw = dict(
-            closure=closure,
-            cavitation=cavitation,
-            tol=1e-6,
-            max_iter=10_000_000,
-            P_init=P_init,
-            phi_1D=phi_1D,
-            Z_1D=Z_1D,
-        )
+        # Payvar-Salant: вызываем GPU-solver напрямую (API использует только CPU)
+        try:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_gpu,
+            )
+            _ps_solver = solve_payvar_salant_gpu
+        except ImportError:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_cpu,
+            )
+            _ps_solver = solve_payvar_salant_cpu
+            import warnings
+            warnings.warn("GPU Payvar-Salant недоступен, используется CPU")
     else:
         solver_kw = dict(
             closure=closure,
@@ -160,39 +163,32 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
             solver_kw["relax_pv"] = 0.4
             solver_kw["max_outer_pv"] = 50
 
-    result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
-
     theta = None
     cav_frac = 0.0
 
     if is_ps:
-        # Payvar-Salant: формат определяется по длине result
-        # Возможные варианты:
-        #   3: (P, theta, (residual, n_iter))  — вложенный tuple
-        #   5: (P, theta, residual, n_outer, n_inner) — как JFO
-        #   4: (P, theta, residual, n_iter)
-        if len(result) == 3:
-            P, theta, info = result
-            residual, n_iter = info
-        elif len(result) == 5:
-            P, theta, residual, _n_outer, n_iter = result
-        elif len(result) == 4:
-            P, theta, residual, n_iter = result
-        else:
-            raise ValueError(
-                f"Payvar-Salant: неожиданный формат result, "
-                f"len={len(result)}, types={[type(r).__name__ for r in result]}")
+        # Прямой вызов GPU (или CPU-fallback) solver'а
+        P, theta, residual, n_iter = _ps_solver(
+            H, d_phi, d_Z, R, L,
+            tol=1e-6,
+            max_iter=10_000_000,
+        )
+        result = None  # не используется далее
         n_outer = n_iter
         converged = True
         cav_frac = float(np.mean(theta < 1.0))
-    elif alpha_pv is not None:
-        # PV-путь: (P, delta, n_iter, n_outer)
-        P, residual, n_iter, n_outer = result
-        converged = True  # PV-path пока не возвращает converged
     else:
-        # Стандартный: (P, delta, n_iter, converged)
-        P, residual, n_iter, converged = result
-        n_outer = 0
+        result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
+
+    if not is_ps:
+        if alpha_pv is not None:
+            # PV-путь: (P, delta, n_iter, n_outer)
+            P, residual, n_iter, n_outer = result
+            converged = True
+        else:
+            # Стандартный: (P, delta, n_iter, converged)
+            P, residual, n_iter, converged = result
+            n_outer = 0
 
     if not converged:
         import warnings
