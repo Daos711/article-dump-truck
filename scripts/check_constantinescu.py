@@ -111,7 +111,8 @@ def main():
                 H_s, d_phi, d_Z, base_params.R, base_params.L, ETA,
                 base_params.n, base_params.c,
                 phi_1D, Z_1D, Phi_mesh,
-                closure=cl_val, cavitation="half_sommerfeld")
+                closure=cl_val, cavitation="half_sommerfeld",
+                closure_kw=cl_kw if cl_kw else None)
             smooth[cl_name] = {"W": W_s, "f": f_s, "pmax": pmax_s}
             print(f"    Smooth {cl_name:>15s}: W={W_s:.0f}")
 
@@ -142,7 +143,8 @@ def main():
                 _, W_t, f_t, _, _, pmax_t, _, _, _, _ = solve_and_compute(
                     H_tex, d_phi, d_Z, p.R, p.L, ETA, p.n, p.c,
                     phi_1D, Z_1D, Phi_mesh,
-                    closure=cl_val, cavitation="half_sommerfeld")
+                    closure=cl_val, cavitation="half_sommerfeld",
+                    closure_kw=cl_kw if cl_kw else None)
                 sc = smooth[cl_name]
                 gw = W_t / sc["W"] if sc["W"] > 0 else 0
                 gf = f_t / sc["f"] if sc["f"] > 0 else 0
