@@ -31,10 +31,14 @@ except ImportError:
 from reynolds_solver import solve_reynolds  # для HS
 
 # ─── Параметры Ausas ──────────────────────────────────────────────
-B_AUSAS = 0.1          # L/(2R) в безразмерном виде
+B_AUSAS = 0.1          # B = L/(2πR) в безразмерном виде
 EPS = 0.6              # эксцентриситет (оценка по Fig. 4)
 PA = 0.0               # Stage A: pa=0
 PA_STAGE_B = 0.0075    # Stage B: feeding pressure
+
+# Геометрия: R=1, L = 2πR·B
+R_AUSAS = 1.0
+L_AUSAS = 2 * np.pi * R_AUSAS * B_AUSAS  # ≈ 0.6283
 
 # Текстура: 50×5 квадратных лунок по всему домену
 N1_TEX = 50            # по φ
@@ -106,9 +110,9 @@ def compute_forces(P, H, Phi, phi_1D, Z_1D, theta=None):
     d_Z = Z_1D[1] - Z_1D[0]
 
     # Load
-    Fx = -np.trapz(np.trapz(P * np.cos(Phi), phi_1D, axis=1),
+    Fx = -np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
                     Z_1D, axis=0)
-    Fy = -np.trapz(np.trapz(P * np.sin(Phi), phi_1D, axis=1),
+    Fy = -np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
                     Z_1D, axis=0)
     W = np.sqrt(Fx**2 + Fy**2)
 
@@ -123,7 +127,7 @@ def compute_forces(P, H, Phi, phi_1D, Z_1D, theta=None):
         full_film = P > 0
 
     integrand = np.where(full_film, 1.0 / H + 3.0 * H * dP_dphi, 0.0)
-    T = np.trapz(np.trapz(integrand, phi_1D, axis=1), Z_1D, axis=0)
+    T = np.trapezoid(np.trapezoid(integrand, phi_1D, axis=1), Z_1D, axis=0)
 
     return W, T
 
@@ -144,7 +148,7 @@ def run_stage_a(out_dir):
     # PS
     t0 = time.time()
     P_ps, theta_ps, res_ps, nit_ps = _ps_solver(
-        H_s, dp, dz, 1.0, 1.0, tol=1e-6, max_iter=10_000_000)
+        H_s, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
     dt_ps = time.time() - t0
     W_ps, T_ps = compute_forces(P_ps, H_s, Phi, phi, Z, theta_ps)
     P_max_ps = np.max(P_ps)
@@ -154,7 +158,7 @@ def run_stage_a(out_dir):
     # HS
     t0 = time.time()
     P_hs, _, _, _ = solve_reynolds(
-        H_s, dp, dz, 1.0, 1.0,
+        H_s, dp, dz, R_AUSAS, L_AUSAS,
         closure="laminar", cavitation="half_sommerfeld",
         return_converged=True)
     dt_hs = time.time() - t0
@@ -188,7 +192,7 @@ def run_stage_a(out_dir):
     # PS
     t0 = time.time()
     P_ps_t, theta_ps_t, _, _ = _ps_solver(
-        H_tex, dp_t, dz_t, 1.0, 1.0, tol=1e-6, max_iter=10_000_000)
+        H_tex, dp_t, dz_t, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
     dt = time.time() - t0
     W_ps_t, T_ps_t = compute_forces(P_ps_t, H_tex, Phi_t, phi_t, Z_t, theta_ps_t)
     print(f"\n  Textured PS (ht0={ht0}): P_max={np.max(P_ps_t):.4f}, "
@@ -197,7 +201,7 @@ def run_stage_a(out_dir):
     # HS
     t0 = time.time()
     P_hs_t, _, _, _ = solve_reynolds(
-        H_tex, dp_t, dz_t, 1.0, 1.0,
+        H_tex, dp_t, dz_t, R_AUSAS, L_AUSAS,
         closure="laminar", cavitation="half_sommerfeld",
         return_converged=True)
     dt = time.time() - t0
@@ -273,12 +277,12 @@ def run_stage_b(out_dir):
 
     # Smooth reference
     P_ps, theta_ps, _, _ = _ps_solver(
-        H_s, dp, dz, 1.0, 1.0, tol=1e-6, max_iter=10_000_000)
+        H_s, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
     _, T_smooth = compute_forces(P_ps, H_s, Phi, phi, Z, theta_ps)
     print(f"\n  Smooth: T={T_smooth:.4f} (Ausas Table 1: 1.201)")
 
     P_hs, _, _, _ = solve_reynolds(
-        H_s, dp, dz, 1.0, 1.0,
+        H_s, dp, dz, R_AUSAS, L_AUSAS,
         closure="laminar", cavitation="half_sommerfeld",
         return_converged=True)
     _, T_smooth_hs = compute_forces(P_hs, H_s, Phi, phi, Z)
@@ -295,7 +299,7 @@ def run_stage_b(out_dir):
                                     S_FRAC, ht0)
         # PS
         P_t, theta_t, _, _ = _ps_solver(
-            H_tex, dp, dz, 1.0, 1.0, tol=1e-6, max_iter=10_000_000)
+            H_tex, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000)
         _, T_t = compute_forces(P_t, H_tex, Phi, phi, Z, theta_t)
         T_ps_arr.append(T_t)
 
