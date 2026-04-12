@@ -326,11 +326,31 @@ def run_scenario_2(out_dir):
     print(f"  Partial tex PS: W={W_p:.4f} ({W_p/W_s:.3f}×smooth), "
           f"P_max={Pmax_p:.4f} ({Pmax_p/Pmax_s:.3f}×smooth), {dt_p:.1f}с")
 
+    # Partial shifted: 200°-360°
+    phi_c_sh, Z_c_sh = make_dimple_centers(7, 5, 200, 360)
+    H_sh = add_square_dimples(H_s, Phi, Zm, phi_c_sh, Z_c_sh,
+                               a_phi, a_Z, depth)
+    P_sh, theta_sh = solve_ps(H_sh, dp, dz)
+    W_sh, _, Pmax_sh, _, _ = compute_metrics(P_sh, H_sh, Phi, phi, Z)
+    print(f"  Partial 200-360 PS: W={W_sh:.4f} ({W_sh/W_s:.3f}×smooth), "
+          f"P_max={Pmax_sh:.4f} ({Pmax_sh/Pmax_s:.3f}×smooth)")
+
+    # Partial narrow: 220°-340°
+    phi_c_n, Z_c_n = make_dimple_centers(5, 5, 220, 340)
+    H_n = add_square_dimples(H_s, Phi, Zm, phi_c_n, Z_c_n,
+                              a_phi, a_Z, depth)
+    P_n, theta_n = solve_ps(H_n, dp, dz)
+    W_n, _, Pmax_n, _, _ = compute_metrics(P_n, H_n, Phi, phi, Z)
+    print(f"  Partial 220-340 PS: W={W_n:.4f} ({W_n/W_s:.3f}×smooth), "
+          f"P_max={Pmax_n:.4f} ({Pmax_n/Pmax_s:.3f}×smooth)")
+
     iz = N_Z // 2
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(phi, P_s[iz, :], "k-", lw=2, label="Smooth")
-    ax.plot(phi, P_f[iz, :], "b--", lw=1.5, label="Full texture")
-    ax.plot(phi, P_p[iz, :], "r-", lw=1.5, label="Partial texture")
+    ax.plot(phi, P_f[iz, :], "b--", lw=1.5, label="Full 16×5")
+    ax.plot(phi, P_p[iz, :], "r-", lw=1.5, label="Partial 180-360")
+    ax.plot(phi, P_sh[iz, :], "g-", lw=1.5, label="Partial 200-360")
+    ax.plot(phi, P_n[iz, :], "m-", lw=1.5, label="Partial 220-340")
     ax.set_xlabel("θ (рад)")
     ax.set_ylabel("P (безразмерное)")
     ax.set_title("Midplane P(θ), ε=0.6 (cf. Manser Fig. 20)")
@@ -342,10 +362,14 @@ def run_scenario_2(out_dir):
 
     print(f"\n  CHECKLIST (Fig. 20 trends):")
     print(f"  [{'✓' if Pmax_f < Pmax_s else '✗'}] Full: P_max_tex < P_max_smooth")
-    print(f"  [{'✓' if Pmax_p >= 0.95 * Pmax_s else '✗'}] Partial: P_max ≥ smooth")
+    print(f"  [{'✓' if Pmax_p >= 0.95 * Pmax_s else '✗'}] Partial 180-360: P_max ≥ smooth")
     print(f"  [{'✓' if W_f < W_s else '✗'}] Full: W < W_smooth")
-    print(f"  [{'✓' if W_p >= 0.95 * W_s else '✗'}] Partial: W ≥ W_smooth")
-    print(f"\n  Gain_W: full={W_f/W_s:.4f}, partial={W_p/W_s:.4f}")
+    print(f"  [{'✓' if W_p >= 0.95 * W_s else '✗'}] Partial 180-360: W ≥ W_smooth")
+    print(f"\n  Gain_W summary:")
+    print(f"    full 16×5 (0-360):    {W_f/W_s:.4f}")
+    print(f"    partial 8×5 (180-360): {W_p/W_s:.4f}")
+    print(f"    partial 7×5 (200-360): {W_sh/W_s:.4f}")
+    print(f"    partial 5×5 (220-340): {W_n/W_s:.4f}")
     print(f"  Expected Manser: full ≈ 0.44, partial ≈ 1.05")
 
 
