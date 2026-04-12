@@ -177,6 +177,41 @@ def plot_gain_comparison(results_nopv, results_pv, label, out_dir):
     print(f"  График: gain_pv_comparison_{label}.png/pdf")
 
 
+def load_from_csv(out_dir, label):
+    """Загрузить results dict из CSV, сохранённых save_csv()."""
+    results = {}
+    for oil_key, oil_name, _ in OILS:
+        path = os.path.join(out_dir, f"{label}_{oil_key}.csv")
+        if not os.path.exists(path):
+            return None
+        rows = []
+        with open(path, "r", encoding="utf-8") as fcsv:
+            reader = csv.DictReader(fcsv)
+            rows = list(reader)
+        n = len(rows)
+        W = np.zeros((2, n))
+        f_arr = np.zeros((2, n))
+        pmax = np.zeros((2, n))
+        cav = np.zeros((2, n))
+        for i, row in enumerate(rows):
+            W[0, i] = float(row["W_smooth"])
+            W[1, i] = float(row["W_tex"])
+            f_arr[0, i] = float(row["f_smooth"])
+            f_arr[1, i] = float(row["f_tex"])
+            pmax[0, i] = float(row["pmax_smooth_MPa"]) * 1e6
+            pmax[1, i] = float(row["pmax_tex_MPa"]) * 1e6
+            cav[0, i] = float(row["cav_smooth"])
+            cav[1, i] = float(row["cav_tex"])
+        gain_W = np.where(W[0] > 0, W[1] / W[0], np.nan)
+        gain_f = np.where(f_arr[0] > 0, f_arr[1] / f_arr[0], np.nan)
+        gain_pmax = np.where(pmax[0] > 0, pmax[1] / pmax[0], np.nan)
+        results[oil_key] = {
+            "W": W, "f": f_arr, "pmax": pmax, "cav": cav,
+            "gain_W": gain_W, "gain_f": gain_f, "gain_pmax": gain_pmax,
+        }
+    return results
+
+
 def run_baseline(out_dir):
     """Этап 1: baseline текстура из pump_params.py."""
     print(f"\n{'=' * 80}")
@@ -282,17 +317,31 @@ def main():
         description="Пересчёт насоса с PV+PS")
     parser.add_argument("--stage", type=int, default=0,
                         help="0=оба, 1=baseline, 2=candidates")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить CSV и перестроить только графики")
+    parser.add_argument("--data-dir", type=str, default=None)
     args = parser.parse_args()
 
-    out_dir = os.path.join(os.path.dirname(__file__), "..",
-                           "results", "pump_pv_ps")
+    default_dir = os.path.join(os.path.dirname(__file__), "..",
+                                "results", "pump_pv_ps")
+    out_dir = args.data_dir or default_dir
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 80)
     print("ПЕРЕСЧЁТ ПОДШИПНИКА НАСОСА — PV + PAYVAR-SALANT")
-    print(f"Сетка: {N_PHI}×{N_Z}, ε = 0.1..0.8 (15 точек)")
     print(f"Результаты → {out_dir}")
     print("=" * 80)
+
+    if args.plot_only:
+        print("--plot-only: загрузка CSV baseline")
+        results_nopv = load_from_csv(out_dir, "baseline_nopv")
+        results_pv = load_from_csv(out_dir, "baseline_pv")
+        if results_nopv is None or results_pv is None:
+            print("CSV не найдены")
+            sys.exit(1)
+        print_gain_table(results_nopv, results_pv, "baseline")
+        plot_gain_comparison(results_nopv, results_pv, "baseline", out_dir)
+        return
 
     if args.stage in (0, 1):
         results_nopv, results_pv = run_baseline(out_dir)

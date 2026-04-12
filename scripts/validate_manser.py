@@ -280,7 +280,7 @@ def run_scenario_1(out_dir):
 #  Сценарий 2
 # ===================================================================
 
-def run_scenario_2(out_dir):
+def compute_scenario_2(out_dir):
     print(f"\n{'=' * 80}")
     print(f"СЦЕНАРИЙ 2: Manser JFO (Fig. 20 trends)")
     print(f"R={S2_R*1e3:.0f}мм, L={S2_L*1e3:.0f}мм, C={S2_C*1e6:.0f}мкм, "
@@ -344,6 +344,31 @@ def run_scenario_2(out_dir):
     print(f"  Partial 220-340 PS: W={W_n:.4f} ({W_n/W_s:.3f}×smooth), "
           f"P_max={Pmax_n:.4f} ({Pmax_n/Pmax_s:.3f}×smooth)")
 
+    np.savez(os.path.join(out_dir, "scenario_2.npz"),
+             phi=phi, Z=Z, N_Z=N_Z,
+             P_s=P_s, P_f=P_f, P_p=P_p, P_sh=P_sh, P_n=P_n,
+             W_s=W_s, W_f=W_f, W_p=W_p, W_sh=W_sh, W_n=W_n,
+             Pmax_s=Pmax_s, Pmax_f=Pmax_f, Pmax_p=Pmax_p,
+             Pmax_sh=Pmax_sh, Pmax_n=Pmax_n)
+    print(f"  scenario_2.npz сохранён")
+
+
+def plot_scenario_2(out_dir):
+    npz_path = os.path.join(out_dir, "scenario_2.npz")
+    if not os.path.exists(npz_path):
+        print(f"  scenario_2.npz не найден")
+        return
+    d = np.load(npz_path)
+    phi = d["phi"]
+    N_Z = int(d["N_Z"])
+    P_s, P_f, P_p = d["P_s"], d["P_f"], d["P_p"]
+    P_sh, P_n = d["P_sh"], d["P_n"]
+    W_s, W_f, W_p = float(d["W_s"]), float(d["W_f"]), float(d["W_p"])
+    W_sh, W_n = float(d["W_sh"]), float(d["W_n"])
+    Pmax_s = float(d["Pmax_s"])
+    Pmax_f, Pmax_p = float(d["Pmax_f"]), float(d["Pmax_p"])
+    Pmax_sh, Pmax_n = float(d["Pmax_sh"]), float(d["Pmax_n"])
+
     iz = N_Z // 2
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(phi, P_s[iz, :], "k-", lw=2, label="Smooth")
@@ -374,8 +399,16 @@ def run_scenario_2(out_dir):
 
 
 def main():
-    out_dir = os.path.join(os.path.dirname(__file__), "..",
-                           "results", "validation_manser")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить npz и построить графики")
+    parser.add_argument("--data-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    default_dir = os.path.join(os.path.dirname(__file__), "..",
+                                "results", "validation_manser")
+    out_dir = args.data_dir or default_dir
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 80)
@@ -383,9 +416,14 @@ def main():
     print(f"Результаты → {out_dir}")
     print("=" * 80)
 
-    # Scenario 1 временно отключён: точный layout Tala-Ighil не восстановлен
-    # run_scenario_1(out_dir)
-    run_scenario_2(out_dir)
+    if args.plot_only:
+        print("--plot-only: загрузка npz")
+    else:
+        # Scenario 1 временно отключён: точный layout Tala-Ighil не восстановлен
+        # run_scenario_1(out_dir)
+        compute_scenario_2(out_dir)
+
+    plot_scenario_2(out_dir)
 
 
 if __name__ == "__main__":

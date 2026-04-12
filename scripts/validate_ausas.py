@@ -188,7 +188,7 @@ def find_equilibrium(Wa, Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
     return X, Y, eps, W, T_eq, T_c_eq, T_p_eq, cav, max_iter
 
 
-def run_stage_a(out_dir):
+def compute_stage_a(out_dir):
     EPS = 0.6
     print(f"\n{'=' * 80}")
     print(f"STAGE A: ε={EPS}, pa=0")
@@ -215,20 +215,6 @@ def run_stage_a(out_dir):
     print(f"  Smooth HS: P_max={np.max(P_hs):.4f}, W={W_hs:.4f}, "
           f"T={T_hs:.4f} (Tc={Tc_hs:.4f} + Tp={Tp_hs:.4f})")
 
-    iz = N_Z_s // 2
-    x = phi / (2 * np.pi)
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(x, P_ps[iz, :], "b-", lw=2, label="PS")
-    ax.plot(x, P_hs[iz, :], "r--", lw=1.5, label="HS")
-    ax.set_xlabel("x₁ = φ/(2π)")
-    ax.set_ylabel("p")
-    ax.set_title(f"Smooth midplane, ε={EPS} (cf. Ausas Fig. 4a)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ausas_fig4a_smooth.png"), dpi=300)
-    plt.close(fig)
-
     phi_t, Z_t, Phi_t, Zm_t, dp_t, dz_t = make_grid(N_phi_t, N_Z_t)
     H0 = make_H_XY(EPS, 0.0, Phi_t)
     ht0 = 0.30
@@ -245,6 +231,43 @@ def run_stage_a(out_dir):
         P_hs_t, H_tex, Phi_t, phi_t, Z_t)
     print(f"  Tex HS (ht0={ht0}): P_max={np.max(P_hs_t):.4f}, W={W_ht:.4f}, "
           f"T={T_ht:.4f} (Tc={Tc_ht:.4f} + Tp={Tp_ht:.4f})")
+
+    np.savez(os.path.join(out_dir, "stage_a.npz"),
+             EPS=EPS, ht0=ht0,
+             phi=phi, Z=Z, P_ps=P_ps, P_hs=P_hs,
+             phi_t=phi_t, Z_t=Z_t, P_ps_t=P_ps_t, P_hs_t=P_hs_t,
+             N_Z_s=N_Z_s, N_Z_t=N_Z_t)
+    print(f"  stage_a.npz сохранён")
+
+
+def plot_stage_a(out_dir):
+    npz_path = os.path.join(out_dir, "stage_a.npz")
+    if not os.path.exists(npz_path):
+        print(f"  stage_a.npz не найден — пропуск графиков Stage A")
+        return
+    d = np.load(npz_path)
+    EPS = float(d["EPS"])
+    ht0 = float(d["ht0"])
+    phi, Z = d["phi"], d["Z"]
+    P_ps, P_hs = d["P_ps"], d["P_hs"]
+    phi_t, Z_t = d["phi_t"], d["Z_t"]
+    P_ps_t, P_hs_t = d["P_ps_t"], d["P_hs_t"]
+    N_Z_s = int(d["N_Z_s"])
+    N_Z_t = int(d["N_Z_t"])
+
+    iz = N_Z_s // 2
+    x = phi / (2 * np.pi)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(x, P_ps[iz, :], "b-", lw=2, label="PS")
+    ax.plot(x, P_hs[iz, :], "r--", lw=1.5, label="HS")
+    ax.set_xlabel("x₁ = φ/(2π)")
+    ax.set_ylabel("p")
+    ax.set_title(f"Smooth midplane, ε={EPS} (cf. Ausas Fig. 4a)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "ausas_fig4a_smooth.png"), dpi=300)
+    plt.close(fig)
 
     iz_t = N_Z_t // 2
     x_t = phi_t / (2 * np.pi)
@@ -270,10 +293,10 @@ def run_stage_a(out_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "ausas_P_contour.png"), dpi=300)
     plt.close(fig)
-    print(f"  Графики сохранены")
+    print(f"  Stage A графики: ausas_fig4a_smooth, ausas_fig4b_textured, ausas_P_contour")
 
 
-def run_stage_b(out_dir):
+def compute_stage_b(out_dir):
     print(f"\n{'=' * 80}")
     print(f"STAGE B: Все Wa, smooth + textured, с равновесием")
     print(f"{'=' * 80}")
@@ -344,9 +367,29 @@ def run_stage_b(out_dir):
         ratio = T / T_s_ref if T_s_ref > 0 else 0
         print(f"  {ht0_v:6.2f} {eps:6.4f} {T:8.4f} {ratio:7.4f}")
 
-    # График
+    # Сохранить данные для --plot-only
+    T_smooth_arr = np.array([smooth_data[w]["T"] for w in WA_VALUES])
+    np.savez(os.path.join(out_dir, "stage_b.npz"),
+             Wa_values=np.array(WA_VALUES), T_smooth=T_smooth_arr,
+             ht0_values=np.array(HT0_VALUES),
+             T_s_ref=T_s_ref, T_arr=np.array(T_arr), Wa_ref=Wa_ref)
+
+
+def plot_stage_b(out_dir):
+    npz_path = os.path.join(out_dir, "stage_b.npz")
+    if not os.path.exists(npz_path):
+        print(f"  stage_b.npz не найден — пропуск графиков Stage B")
+        return
+    d = np.load(npz_path)
+    Wa_values = d["Wa_values"]
+    T_smooth_arr = d["T_smooth"]
+    ht0_values = d["ht0_values"]
+    T_s_ref = float(d["T_s_ref"])
+    T_arr = d["T_arr"]
+    Wa_ref = float(d["Wa_ref"])
+
     fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot([0] + HT0_VALUES, [T_s_ref] + T_arr,
+    ax.plot([0] + list(ht0_values), [T_s_ref] + list(T_arr),
             "bo-", lw=2, markersize=6, label=f"PS (Wa={Wa_ref})")
     ax.set_xlabel("ht0")
     ax.set_ylabel("T (friction)")
@@ -357,10 +400,8 @@ def run_stage_b(out_dir):
     fig.savefig(os.path.join(out_dir, "ausas_fig8_equilibrium.png"), dpi=300)
     plt.close(fig)
 
-    # T(Wa) для smooth
     fig, ax = plt.subplots(figsize=(8, 6))
-    T_smooth_arr = [smooth_data[w]["T"] for w in WA_VALUES]
-    ax.plot(WA_VALUES, T_smooth_arr, "bo-", lw=2, markersize=6, label="PS smooth")
+    ax.plot(Wa_values, T_smooth_arr, "bo-", lw=2, markersize=6, label="PS smooth")
     ax.set_xlabel("Wa")
     ax.set_ylabel("T (friction)")
     ax.set_title("Friction vs Wa (smooth)")
@@ -369,12 +410,20 @@ def run_stage_b(out_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "ausas_T_vs_Wa.png"), dpi=300)
     plt.close(fig)
-    print(f"  Графики сохранены")
 
 
 def main():
-    out_dir = os.path.join(os.path.dirname(__file__), "..",
-                           "results", "validation_ausas")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Загрузить npz и построить графики")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Папка с npz")
+    args = parser.parse_args()
+
+    default_dir = os.path.join(os.path.dirname(__file__), "..",
+                                "results", "validation_ausas")
+    out_dir = args.data_dir or default_dir
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 80)
@@ -383,8 +432,15 @@ def main():
     print(f"Результаты → {out_dir}")
     print("=" * 80)
 
-    run_stage_a(out_dir)
-    run_stage_b(out_dir)
+    if args.plot_only:
+        print("--plot-only: загрузка npz")
+    else:
+        compute_stage_a(out_dir)
+        compute_stage_b(out_dir)
+
+    print("\nПостроение графиков:")
+    plot_stage_a(out_dir)
+    plot_stage_b(out_dir)
     print(f"\nВсе результаты → {out_dir}")
 
 
