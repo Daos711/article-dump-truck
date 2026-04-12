@@ -133,6 +133,7 @@ def solve_hs(H, dp, dz):
     P, _, _, _ = solve_reynolds(
         H, dp, dz, R_SOLVER, L_SOLVER,
         closure="laminar", cavitation="half_sommerfeld",
+        tol=1e-5, max_iter=1_000_000,
         return_converged=True)
     return P
 
@@ -152,9 +153,9 @@ def compute_metrics(P, H, Phi, phi_1D, Z_1D, theta=None):
     # Integral domain: θ ∈ [0,2π], Z_M ∈ [0,1] → Z ∈ [-1,1]
     # dA_M = dθ · dZ_M, dZ_M = dZ/2. Scale = 1/2.
     scale = 0.5
-    WX = -np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
+    WX = np.trapezoid(np.trapezoid(P * np.cos(Phi), phi_1D, axis=1),
                         Z_1D, axis=0) * scale
-    WY = -np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
+    WY = np.trapezoid(np.trapezoid(P * np.sin(Phi), phi_1D, axis=1),
                         Z_1D, axis=0) * scale
     W = np.sqrt(WX**2 + WY**2)
 
@@ -231,7 +232,7 @@ def run_scenario_1(out_dir):
     W_target = S1_F / (S1_P_SCALE * S1_R * S1_L)
     print(f"  W̄_target = {W_target:.4f}")
 
-    N_phi, N_Z = 891, 142
+    N_phi, N_Z = 450, 70
     phi, Z, Phi, Zm, dp, dz = make_grid(N_phi, N_Z)
 
     # Безразмерные размеры лунки
