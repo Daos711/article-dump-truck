@@ -120,10 +120,11 @@ def solve_hs(H, dp, dz):
     return P
 
 
-def solve_ps(H, dp, dz, hs_warmup_iter=0):
+def solve_ps(H, dp, dz, hs_warmup_iter=200_000, hs_warmup_omega=1.5):
     P, theta, res, nit = _ps_solver(
         H, dp, dz, R_SOLVER, L_SOLVER, tol=1e-6, max_iter=10_000_000,
-        hs_warmup_iter=hs_warmup_iter)
+        hs_warmup_iter=hs_warmup_iter,
+        hs_warmup_omega=hs_warmup_omega)
     return P, theta
 
 
