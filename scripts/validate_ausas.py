@@ -106,7 +106,7 @@ def compute_forces_ausas(P, H, Phi, phi_1D, Z_1D, theta=None):
 def solve_ps(H, dp, dz):
     P, theta, res, nit = _ps_solver(
         H, dp, dz, R_AUSAS, L_AUSAS, tol=1e-6, max_iter=10_000_000,
-        hs_warmup_iter=500_000)
+        hs_warmup_iter=500_000, hs_warmup_omega=1.5)
     return P, theta
 
 
@@ -300,6 +300,11 @@ def run_stage_b(out_dir):
 
     # Ausas reference
     print(f"\n  Ausas Fig. 6 ref: T(0.002)≈0.88, T(0.0076)≈1.10, T(0.0132)≈1.30")
+
+    # Textured Stage B включается флагом AUSAS_TEX=1
+    if os.environ.get("AUSAS_TEX", "0") != "1":
+        print(f"\n  [textured Stage B skipped — set AUSAS_TEX=1 to enable]")
+        return
 
     # --- Textured ht0=0.30 для всех Wa ---
     ht0 = 0.30
