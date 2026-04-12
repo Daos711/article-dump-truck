@@ -321,6 +321,11 @@ def compute_stage_b(out_dir):
     # Ausas reference
     print(f"\n  Ausas Fig. 6 ref: T(0.002)≈0.88, T(0.0076)≈1.10, T(0.0132)≈1.30")
 
+    # Сохранить smooth-часть сразу (для T_vs_Wa графика)
+    T_smooth_arr = np.array([smooth_data[w]["T"] for w in WA_VALUES])
+    np.savez(os.path.join(out_dir, "stage_b_smooth.npz"),
+             Wa_values=np.array(WA_VALUES), T_smooth=T_smooth_arr)
+
     # Textured Stage B включается флагом AUSAS_TEX=1
     if os.environ.get("AUSAS_TEX", "0") != "1":
         print(f"\n  [textured Stage B skipped — set AUSAS_TEX=1 to enable]")
@@ -373,38 +378,47 @@ def compute_stage_b(out_dir):
 
 
 def plot_stage_b(out_dir):
-    npz_path = os.path.join(out_dir, "stage_b.npz")
-    if not os.path.exists(npz_path):
-        print(f"  stage_b.npz не найден — пропуск графиков Stage B")
-        return
-    d = np.load(npz_path)
-    Wa_values = d["Wa_values"]
-    T_smooth_arr = d["T_smooth"]
-    ht0_values = d["ht0_values"]
-    T_s_ref = float(d["T_s_ref"])
-    T_arr = d["T_arr"]
-    Wa_ref = float(d["Wa_ref"])
+    # Smooth T(Wa) — всегда, если есть stage_b_smooth.npz или stage_b.npz
+    smooth_npz = os.path.join(out_dir, "stage_b_smooth.npz")
+    full_npz = os.path.join(out_dir, "stage_b.npz")
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot([0] + list(ht0_values), [T_s_ref] + list(T_arr),
-            "bo-", lw=2, markersize=6, label=f"PS (Wa={Wa_ref})")
-    ax.set_xlabel("ht0")
-    ax.set_ylabel("T (friction)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ausas_fig8_equilibrium.png"), dpi=300)
-    plt.close(fig)
+    if os.path.exists(smooth_npz) or os.path.exists(full_npz):
+        src = full_npz if os.path.exists(full_npz) else smooth_npz
+        d = np.load(src)
+        Wa_values = d["Wa_values"]
+        T_smooth_arr = d["T_smooth"]
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot(Wa_values, T_smooth_arr, "bo-", lw=2, markersize=6,
+                label="PS smooth")
+        ax.set_xlabel("Wa")
+        ax.set_ylabel("T (friction)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "ausas_T_vs_Wa.png"), dpi=300)
+        plt.close(fig)
+        print(f"  Stage B smooth график: ausas_T_vs_Wa.png")
+    else:
+        print(f"  stage_b_smooth.npz не найден")
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.plot(Wa_values, T_smooth_arr, "bo-", lw=2, markersize=6, label="PS smooth")
-    ax.set_xlabel("Wa")
-    ax.set_ylabel("T (friction)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ausas_T_vs_Wa.png"), dpi=300)
-    plt.close(fig)
+    # Textured T(ht0) — только если есть stage_b.npz (textured Stage B)
+    if os.path.exists(full_npz):
+        d = np.load(full_npz)
+        ht0_values = d["ht0_values"]
+        T_s_ref = float(d["T_s_ref"])
+        T_arr = d["T_arr"]
+        Wa_ref = float(d["Wa_ref"])
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.plot([0] + list(ht0_values), [T_s_ref] + list(T_arr),
+                "bo-", lw=2, markersize=6, label=f"PS (Wa={Wa_ref})")
+        ax.set_xlabel("ht0")
+        ax.set_ylabel("T (friction)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "ausas_fig8_equilibrium.png"), dpi=300)
+        plt.close(fig)
+        print(f"  Stage B textured график: ausas_fig8_equilibrium.png")
 
 
 def main():
