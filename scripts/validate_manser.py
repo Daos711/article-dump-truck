@@ -378,7 +378,6 @@ def plot_scenario_2(out_dir):
     ax.plot(phi, P_n[iz, :], "m-", lw=1.5, label="Partial 220-340")
     ax.set_xlabel("θ (рад)")
     ax.set_ylabel("P (безразмерное)")
-    ax.set_title("Midplane P(θ), ε=0.6 (cf. Manser Fig. 20)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
