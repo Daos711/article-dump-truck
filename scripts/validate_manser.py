@@ -120,11 +120,13 @@ def solve_hs(H, dp, dz):
     return P
 
 
-def solve_ps(H, dp, dz, hs_warmup_iter=200_000, hs_warmup_omega=1.5):
+def solve_ps(H, dp, dz, hs_warmup_iter=200_000, hs_warmup_omega=1.5,
+             phi_bc="periodic"):
     P, theta, res, nit = _ps_solver(
         H, dp, dz, R_SOLVER, L_SOLVER, tol=1e-6, max_iter=10_000_000,
         hs_warmup_iter=hs_warmup_iter,
-        hs_warmup_omega=hs_warmup_omega)
+        hs_warmup_omega=hs_warmup_omega,
+        phi_bc=phi_bc)
     return P, theta
 
 
@@ -344,13 +346,54 @@ def compute_scenario_2(out_dir):
     print(f"  Partial 220-340 PS: W={W_n:.4f} ({W_n/W_s:.3f}×smooth), "
           f"P_max={Pmax_n:.4f} ({Pmax_n/Pmax_s:.3f}×smooth)")
 
+    # ======================================================
+    # GROOVE-режим: canavka at θ=0, non-periodic BC
+    # ======================================================
+    print(f"\n{'-' * 50}")
+    print(f"  GROOVE режим (phi_bc='groove', канавка θ=0)")
+    print(f"{'-' * 50}")
+
+    # Smooth groove
+    t0 = time.time()
+    P_sg, theta_sg = solve_ps(H_s, dp, dz, phi_bc="groove")
+    dt = time.time() - t0
+    W_sg, _, Pmax_sg, _, _ = compute_metrics(P_sg, H_s, Phi, phi, Z)
+    print(f"  Smooth groove: W={W_sg:.4f}, P_max={Pmax_sg:.4f} "
+          f"({Pmax_sg * S2_P_SCALE / 1e6:.2f}МПа), {dt:.1f}с")
+
+    # Full 16×5 groove
+    t0 = time.time()
+    P_fg, theta_fg = solve_ps(H_f, dp, dz, phi_bc="groove")
+    dt = time.time() - t0
+    W_fg, _, Pmax_fg, _, _ = compute_metrics(P_fg, H_f, Phi, phi, Z)
+    print(f"  Full tex groove: W={W_fg:.4f} ({W_fg/W_sg:.3f}×smooth_g), "
+          f"P_max={Pmax_fg:.4f}, {dt:.1f}с")
+
+    # Partial 8×5 groove (180-360)
+    t0 = time.time()
+    P_pg, theta_pg = solve_ps(H_p, dp, dz, phi_bc="groove")
+    dt = time.time() - t0
+    W_pg, _, Pmax_pg, _, _ = compute_metrics(P_pg, H_p, Phi, phi, Z)
+    print(f"  Partial tex groove: W={W_pg:.4f} ({W_pg/W_sg:.3f}×smooth_g), "
+          f"P_max={Pmax_pg:.4f}, {dt:.1f}с")
+
+    print(f"\n  Сравнение partial 180-360°:")
+    print(f"    periodic: W/W_smooth = {W_p/W_s:.4f}")
+    print(f"    groove:   W/W_smooth = {W_pg/W_sg:.4f}")
+    print(f"    Ожидание: рост относительно periodic, тренд к 1.05 (Manser)")
+
     np.savez(os.path.join(out_dir, "scenario_2.npz"),
              phi=phi, Z=Z, N_Z=N_Z,
              P_s=P_s, P_f=P_f, P_p=P_p, P_sh=P_sh, P_n=P_n,
              W_s=W_s, W_f=W_f, W_p=W_p, W_sh=W_sh, W_n=W_n,
              Pmax_s=Pmax_s, Pmax_f=Pmax_f, Pmax_p=Pmax_p,
-             Pmax_sh=Pmax_sh, Pmax_n=Pmax_n)
-    print(f"  scenario_2.npz сохранён")
+             Pmax_sh=Pmax_sh, Pmax_n=Pmax_n,
+             # Groove:
+             P_sg=P_sg, P_fg=P_fg, P_pg=P_pg,
+             W_sg=W_sg, W_fg=W_fg, W_pg=W_pg,
+             Pmax_sg=Pmax_sg, Pmax_fg=Pmax_fg, Pmax_pg=Pmax_pg,
+             theta_pg=theta_pg if theta_pg is not None else np.array([]))
+    print(f"  scenario_2.npz сохранён (periodic + groove)")
 
 
 def plot_scenario_2(out_dir):
@@ -389,12 +432,55 @@ def plot_scenario_2(out_dir):
     print(f"  [{'✓' if Pmax_p >= 0.95 * Pmax_s else '✗'}] Partial 180-360: P_max ≥ smooth")
     print(f"  [{'✓' if W_f < W_s else '✗'}] Full: W < W_smooth")
     print(f"  [{'✓' if W_p >= 0.95 * W_s else '✗'}] Partial 180-360: W ≥ W_smooth")
-    print(f"\n  Gain_W summary:")
+    print(f"\n  Gain_W summary (periodic):")
     print(f"    full 16×5 (0-360):    {W_f/W_s:.4f}")
     print(f"    partial 8×5 (180-360): {W_p/W_s:.4f}")
     print(f"    partial 7×5 (200-360): {W_sh/W_s:.4f}")
     print(f"    partial 5×5 (220-340): {W_n/W_s:.4f}")
     print(f"  Expected Manser: full ≈ 0.44, partial ≈ 1.05")
+
+    # Groove plots (если есть данные)
+    if "P_sg" in d.files:
+        P_sg, P_fg, P_pg = d["P_sg"], d["P_fg"], d["P_pg"]
+        W_sg, W_fg, W_pg = float(d["W_sg"]), float(d["W_fg"]), float(d["W_pg"])
+        Z = d["Z"]
+
+        # Midplane groove
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(phi, P_sg[iz, :], "k-", lw=2, label="Smooth (groove)")
+        ax.plot(phi, P_fg[iz, :], "b--", lw=1.5, label="Full 16×5 (groove)")
+        ax.plot(phi, P_pg[iz, :], "r-", lw=1.5, label="Partial 180-360 (groove)")
+        ax.set_xlabel("θ (рад)")
+        ax.set_ylabel("P (безразмерное)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "manser_fig20_midplane_groove.png"),
+                    dpi=300)
+        plt.close(fig)
+        print(f"\n  График: manser_fig20_midplane_groove.png")
+
+        # 2D contour P(θ,Z) для partial 180-360 с groove
+        fig, ax = plt.subplots(figsize=(12, 4))
+        c = ax.contourf(phi, Z, P_pg, levels=50, cmap="hot_r")
+        fig.colorbar(c, ax=ax, label="P (безразмерное)")
+        ax.set_xlabel("θ (рад)")
+        ax.set_ylabel("Z")
+        ax.axvline(0, color="cyan", lw=1, ls=":", label="θ=0 (groove)")
+        ax.axvline(2 * np.pi, color="cyan", lw=1, ls=":")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "manser_partial_groove_contour.png"),
+                    dpi=300)
+        plt.close(fig)
+        print(f"  График: manser_partial_groove_contour.png")
+
+        print(f"\n  Groove Gain_W summary:")
+        print(f"    full 16×5 (0-360):     {W_fg/W_sg:.4f}")
+        print(f"    partial 8×5 (180-360):  {W_pg/W_sg:.4f}")
+        print(f"  Сравнение partial 180-360:")
+        print(f"    periodic: {W_p/W_s:.4f}")
+        print(f"    groove:   {W_pg/W_sg:.4f}")
 
 
 def main():
