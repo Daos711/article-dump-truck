@@ -34,7 +34,7 @@ except ImportError:
 from reynolds_solver import solve_reynolds
 
 R_SOLVER = 1.0
-L_SOLVER = 4.0   # α² = (2R/L)² = 0.25 = (R/L)² Manser
+L_SOLVER = 2.0   # α² = (2R/L)² = 1.0 для L/D=1
 
 
 # ─── Сценарий 1: Tala-Ighil parameters ────────────────────────────
