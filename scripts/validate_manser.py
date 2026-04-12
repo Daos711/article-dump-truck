@@ -120,7 +120,7 @@ def solve_hs(H, dp, dz):
     return P
 
 
-def solve_ps(H, dp, dz, hs_warmup_iter=200_000):
+def solve_ps(H, dp, dz, hs_warmup_iter=0):
     P, theta, res, nit = _ps_solver(
         H, dp, dz, R_SOLVER, L_SOLVER, tol=1e-6, max_iter=10_000_000,
         hs_warmup_iter=hs_warmup_iter)
@@ -358,7 +358,8 @@ def main():
     print(f"Результаты → {out_dir}")
     print("=" * 80)
 
-    run_scenario_1(out_dir)
+    # Scenario 1 временно отключён: точный layout Tala-Ighil не восстановлен
+    # run_scenario_1(out_dir)
     run_scenario_2(out_dir)
 
 
