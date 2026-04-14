@@ -84,7 +84,7 @@ def load_fn(t):
 # ─── Параметры расчёта ───────────────────────────────────────────
 MASS_M = 1e-4
 DT = 1e-3
-N_PERIODS = 10
+N_PERIODS = 2
 NT = int(N_PERIODS * T_VIB / DT)
 
 
