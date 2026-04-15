@@ -142,7 +142,7 @@ def make_H_for(case, X, Y, Phi, Zm, tex_params):
 
 def find_equilibrium(case, W_applied, mag_model, Phi, Zm, phi_1D, Z_1D,
                      d_phi, d_Z, tex_params, X0=0.0, Y0=-0.4,
-                     max_iter=30, tol=1e-4):
+                     max_iter=50, tol=1e-4):
     X, Y = X0, Y0
     dXY = 1e-5
     P_last, theta_last = None, None
@@ -173,7 +173,12 @@ def find_equilibrium(case, W_applied, mag_model, Phi, Zm, phi_1D, Z_1D,
             break
         dX = -(J[1, 1] * Rx - J[0, 1] * Ry) / det
         dY = -(-J[1, 0] * Rx + J[0, 0] * Ry) / det
-        step = min(1.0, 0.1 / max(abs(dX), abs(dY), 1e-10))
+        step = min(1.0, 0.08 / max(abs(dX), abs(dY), 1e-10))
+        X_new = X + step * dX
+        Y_new = Y + step * dY
+        eps_new = np.sqrt(X_new**2 + Y_new**2)
+        if eps_new > 0.95:
+            step *= 0.5
         X += step * dX
         Y += step * dY
         P_last, theta_last = P, theta
@@ -318,10 +323,12 @@ def main():
                 },
                 "mag_share_targets": MAG_SHARE_TARGETS,
             },
-            "smooth": [{k: (v if isinstance(v, (int, float)) else float(v))
-                        for k, v in r.items()} for r in results["smooth"]],
-            "textured": [{k: (v if isinstance(v, (int, float)) else float(v))
-                          for k, v in r.items()} for r in results["textured"]],
+            "smooth": [
+                {k: (v if isinstance(v, (int, float, str)) else float(v))
+                 for k, v in r.items()} for r in results["smooth"]],
+            "textured": [
+                {k: (v if isinstance(v, (int, float, str)) else float(v))
+                 for k, v in r.items()} for r in results["textured"]],
         }, f, indent=2, ensure_ascii=False)
     print(f"JSON: {json_path}")
 

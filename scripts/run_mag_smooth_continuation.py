@@ -101,14 +101,16 @@ def compute_metrics(P, H, theta=None):
 
 
 def find_equilibrium(W_applied, mag_model, Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
-                     X0=0.0, Y0=-0.4, max_iter=30, tol=1e-4):
+                     X0=0.0, Y0=-0.4, max_iter=50, tol=1e-4):
     """2D Newton-Raphson: find (X,Y) such that
        F_hydro(X,Y) + F_mag(X,Y) = W_applied.
+    С адаптивным демпфированием (backtracking).
     """
     X, Y = X0, Y0
     dXY = 1e-5
     P_last = None
     theta_last = None
+    prev_rel_R = np.inf
 
     for it in range(max_iter):
         H = make_H(X, Y, Phi)
@@ -141,10 +143,20 @@ def find_equilibrium(W_applied, mag_model, Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
             break
         dX = -(J[1, 1] * Rx - J[0, 1] * Ry) / det
         dY = -(-J[1, 0] * Rx + J[0, 0] * Ry) / det
-        step = min(1.0, 0.1 / max(abs(dX), abs(dY), 1e-10))
+
+        # Backtracking: уменьшить шаг если residual вырос или step too big
+        step_cap = 0.08  # максимум 0.08 по X или Y за шаг
+        step = min(1.0, step_cap / max(abs(dX), abs(dY), 1e-10))
+        # Ещё ограничиваем X, Y в допустимой области |ε|<0.97
+        X_new = X + step * dX
+        Y_new = Y + step * dY
+        eps_new = np.sqrt(X_new**2 + Y_new**2)
+        if eps_new > 0.95:
+            step *= 0.5
         X += step * dX
         Y += step * dY
         P_last, theta_last = P, theta
+        prev_rel_R = rel_R
 
     eps = np.sqrt(X**2 + Y**2)
     H = make_H(X, Y, Phi)
@@ -218,6 +230,7 @@ def main():
     results = []
     X_prev, Y_prev = baseline["X"], baseline["Y"]
 
+    prev_target = 0.0
     for target in MAG_SHARE_TARGETS:
         if target == 0.0:
             mag = MagneticForceModel(K_mag=0.0)
@@ -230,6 +243,22 @@ def main():
         t0 = time.time()
         r = find_equilibrium(W_applied, mag, Phi, Zm, phi, Z, dp, dz,
                               X0=X_prev, Y0=Y_prev)
+
+        # Retry через промежуточные sub-steps если не сошёлся
+        if r["rel_residual"] > 1e-3 and target > prev_target:
+            print(f"  share={target*100:.1f}%: NR не сошёлся "
+                  f"(res={r['rel_residual']:.1e}), retry с substeps...")
+            n_sub = 4
+            X_mid, Y_mid = X_prev, Y_prev
+            for isub in range(1, n_sub + 1):
+                sub_target = prev_target + (target - prev_target) * isub / n_sub
+                mag_sub = calibrate_Kmag(
+                    baseline["X"], baseline["Y"], W_applied, sub_target)
+                r = find_equilibrium(W_applied, mag_sub, Phi, Zm, phi, Z,
+                                      dp, dz, X0=X_mid, Y0=Y_mid)
+                X_mid, Y_mid = r["X"], r["Y"]
+            K_out = mag_sub.K_mag
+
         dt_r = time.time() - t0
 
         # load shares
@@ -252,6 +281,7 @@ def main():
               f"res={r['rel_residual']:.1e}, {dt_r:.1f}с")
 
         X_prev, Y_prev = r["X"], r["Y"]
+        prev_target = target
 
     # --- Acceptance checks ---
     print("\n" + "=" * 72)
