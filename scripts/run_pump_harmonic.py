@@ -65,11 +65,11 @@ OMEGA_VIB = 2 * np.pi * F_VIB
 T_VIB = 1.0 / N_BLADES
 
 # ─── Начальные условия и нагрузка ────────────────────────────────
-EPS_STATIC = 0.5
+EPS_STATIC = 0.6
 X0 = EPS_STATIC
 Y0 = 0.0
 
-W_STATIC_X = -0.02          # подобрано в calibrate_load.py для ε≈0.5
+W_STATIC_X = -0.01          # подобрано calibrate_load: ε≈0.60 (3128 Н)
 W_STATIC_Y = 0.0
 DELTA_W = 0.1 * abs(W_STATIC_X)
 
