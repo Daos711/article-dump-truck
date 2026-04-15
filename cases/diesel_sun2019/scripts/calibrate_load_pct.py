@@ -25,15 +25,17 @@ from scaling import (
     make_load_fn_from_crank, CYCLE_TAU,
 )
 
-M_EFF_KG = 2.0
+M_EFF_KG = 5.0
 
-# Быстрый скрининг: 3 load_pct, мелкая сетка, большой dt
+# Быстрый скрининг: 3 load_pct, мелкая сетка, разумный dt
 LOAD_CANDIDATES = [20, 50, 100]
 N_RPM = 2200
-DT_CAL = 4e-3                   # 2× быстрее
-N1_CAL = 100                    # мельче сетка = 4× быстрее
+DT_CAL = 2e-3                   # назад к стабильному dt
+N1_CAL = 100
 N2_CAL = 10
 MAX_INNER_CAL = 1000
+X0_CAL = 0.0
+Y0_CAL = 0.3                    # ближе к центру — меньше overshoot
 
 
 def build_load(load_pct):
@@ -68,7 +70,7 @@ def run_one(load_fn):
         R=0.5, L=1.0,
         mass_M=M_nd,
         load_fn=load_fn,
-        X0=cfg.X0, Y0=cfg.Y0,
+        X0=X0_CAL, Y0=Y0_CAL,
         texture_relief=None,
         omega_p=cfg.omega_p, omega_theta=cfg.omega_theta,
         tol_inner=cfg.tol_inner, max_inner=MAX_INNER_CAL,
