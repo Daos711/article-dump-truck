@@ -25,7 +25,7 @@ from scaling import (
     make_load_fn_from_crank, CYCLE_TAU,
 )
 
-M_EFF_KG = 20.0
+M_EFF_KG = 2.0
 
 # Быстрый скрининг: 3 load_pct, мелкая сетка, большой dt
 LOAD_CANDIDATES = [20, 50, 100]
