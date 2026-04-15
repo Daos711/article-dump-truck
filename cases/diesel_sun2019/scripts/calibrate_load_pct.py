@@ -12,6 +12,7 @@ THIS = os.path.dirname(os.path.abspath(__file__))
 CASE_DIR = os.path.dirname(THIS)
 ROOT = os.path.dirname(os.path.dirname(CASE_DIR))
 sys.path.insert(0, CASE_DIR)
+sys.path.insert(0, THIS)
 sys.path.insert(0, ROOT)
 
 import numpy as np
@@ -36,7 +37,7 @@ MAX_INNER_CAL = 1000
 
 
 def build_load(load_pct):
-    from scripts.build_load_from_indicator import build_surrogate_load
+    from build_load_from_indicator import build_surrogate_load
     crank_deg, WaX_N, WaY_N = build_surrogate_load(
         n_rpm=N_RPM, load_pct=load_pct,
         n_cyl=cfg.n_cylinders, bore_m=cfg.bore_m,
