@@ -65,6 +65,12 @@ def build_surrogate_load(n_rpm, load_pct,
     WaX += F_inertia * np.cos(crank_rad)
     WaY += F_inertia * np.sin(crank_rad)
 
+    # Распределение на один main bearing: ~40% нагрузки с цилиндра
+    # (остальное на соседние опоры)
+    BEARING_SHARE = 0.4
+    WaX *= BEARING_SHARE
+    WaY *= BEARING_SHARE
+
     return crank_deg, WaX, WaY
 
 

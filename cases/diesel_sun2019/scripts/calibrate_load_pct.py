@@ -25,17 +25,17 @@ from scaling import (
     make_load_fn_from_crank, CYCLE_TAU,
 )
 
-M_EFF_KG = 5.0
+M_EFF_KG = 10.0
 
-# Быстрый скрининг: 3 load_pct, мелкая сетка, разумный dt
-LOAD_CANDIDATES = [20, 50, 100]
+# Быстрый скрининг: 3 load_pct, мелкая сетка, малый dt для стабильности
+LOAD_CANDIDATES = [30, 50, 100]
 N_RPM = 2200
-DT_CAL = 2e-3                   # назад к стабильному dt
+DT_CAL = 5e-4
 N1_CAL = 100
 N2_CAL = 10
 MAX_INNER_CAL = 1000
 X0_CAL = 0.0
-Y0_CAL = 0.3                    # ближе к центру — меньше overshoot
+Y0_CAL = 0.8                    # ближе к равновесию при высокой нагрузке
 
 
 def build_load(load_pct):
