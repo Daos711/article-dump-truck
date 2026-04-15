@@ -66,7 +66,7 @@ def run_single(phi_start_deg, phi_end_deg, h_p_um, nphi_tex, nz_tex):
 
     # --- Гладкий ---
     H_s = make_H(eps, Phi_mesh, Z_mesh, p, textured=False)
-    _, W_s, f_s, _, _, pmax_s, _, _ = solve_and_compute(
+    _, W_s, f_s, _, _, pmax_s, _, _, _, _ = solve_and_compute(
         H_s, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
         phi_1D, Z_1D, Phi_mesh)
 
@@ -81,7 +81,7 @@ def run_single(phi_start_deg, phi_end_deg, h_p_um, nphi_tex, nz_tex):
         "H_p": p.h_p / p.c,
         "profile": PROFILE,
     }
-    _, W_t, f_t, _, _, pmax_t, _, _ = solve_and_compute(
+    _, W_t, f_t, _, _, pmax_t, _, _, _, _ = solve_and_compute(
         H_t, d_phi, d_Z, p.R, p.L, eta, p.n, p.c,
         phi_1D, Z_1D, Phi_mesh,
         subcell_quad=True, H_smooth=H_smooth, texture_params=tex_params)

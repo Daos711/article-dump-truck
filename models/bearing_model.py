@@ -68,6 +68,13 @@ def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
 
     H0 = 1 + ε·cos(φ)  — гладкий профиль
     profile : "sqrt" (эллипсоид) или "smoothcap" ((1-r²)²)
+
+    Угловая конвенция (проверено 2026-04):
+        H_min при φ = π (180°),  H_max при φ = 0.
+        dH/dφ = −ε·sin(φ).
+        Конвергентная зона: φ ∈ (0, π)   — зазор убывает.
+        Дивергентная зона:  φ ∈ (π, 2π)  — зазор растёт.
+        Текстуру для повышения W размещать в дивергентной зоне (180°–360°).
     """
     H0 = 1.0 + epsilon * np.cos(Phi_mesh)
     H0 = np.sqrt(H0**2 + (params.sigma / params.c)**2)  # регуляризация шероховатости
@@ -91,7 +98,8 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
                       alpha_pv=None,
                       subcell_quad=False,
                       H_smooth=None,
-                      texture_params=None):
+                      texture_params=None,
+                      closure_kw=None):
     """Решить уравнение Рейнольдса и вычислить интегральные характеристики.
 
     H, Phi_mesh, Z_mesh имеют shape (N_Z, N_phi) — формат солвера.
@@ -100,52 +108,111 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     ----------
     alpha_pv : float or None
         Коэффициент пьезовязкости Баруса (Па⁻¹). При None — изовязкий режим.
+        НЕ совместим с cavitation="payvar_salant" (игнорируется).
 
     Returns
     -------
-    P     : (N_Z, N_phi) — поле давления (безразмерное)
-    F     : float — несущая способность (Н)
-    mu    : float — коэффициент трения
-    Q     : float — расход смазки (м³/с)
-    h_min : float — минимальный зазор (м)
-    p_max : float — максимальное давление (Па)
-    F_tr  : float — сила трения (Н)
-    n_outer : int — число внешних итераций пьезовязкости (0 для изовязкого)
+    P       : (N_Z, N_phi) — поле давления (безразмерное)
+    F       : float — несущая способность (Н)
+    mu      : float — коэффициент трения
+    Q       : float — расход смазки (м³/с)
+    h_min   : float — минимальный зазор (м)
+    p_max   : float — максимальное давление (Па)
+    F_tr    : float — сила трения (Н)
+    n_outer : int — число внешних итераций (PV) или итераций PS (0 для HS)
+    theta   : ndarray or None — поле заполнения θ (только payvar_salant)
+    cav_frac: float — доля кавитированной зоны (0.0 для half_sommerfeld)
     """
     omega = 2 * np.pi * n / 60.0  # угловая скорость (рад/с)
 
     # Масштаб давления: p* = 6·η·ω·(R/c)² (стандартная безразмерная форма)
     p_scale = 6.0 * eta * omega * (R / c) ** 2
 
-    solver_kw = dict(
-        closure=closure,
-        cavitation=cavitation,
-        tol=1e-5,
-        max_iter=50000,
-        P_init=P_init,
-        subcell_quad=subcell_quad,
-        H_smooth=H_smooth,
-        texture_params=texture_params,
-        phi_1D=phi_1D,
-        Z_1D=Z_1D,
-        return_converged=True,
-    )
-    if alpha_pv is not None:
-        solver_kw["alpha_pv"] = alpha_pv
-        solver_kw["p_scale"] = p_scale
-        solver_kw["relax_pv"] = 0.4
-        solver_kw["max_outer_pv"] = 50
+    is_ps = (cavitation == "payvar_salant")
 
-    result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
-
-    if alpha_pv is not None:
-        # PV-путь: (P, delta, n_iter, n_outer)
-        P, residual, n_iter, n_outer = result
-        converged = True  # PV-path пока не возвращает converged
+    if is_ps:
+        # Payvar-Salant: вызываем GPU-solver напрямую (API использует только CPU)
+        try:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_gpu,
+            )
+            _ps_solver = solve_payvar_salant_gpu
+        except ImportError:
+            from reynolds_solver.cavitation.payvar_salant import (
+                solve_payvar_salant_cpu,
+            )
+            _ps_solver = solve_payvar_salant_cpu
+            import warnings
+            warnings.warn("GPU Payvar-Salant недоступен, используется CPU")
     else:
-        # Стандартный: (P, delta, n_iter, converged)
-        P, residual, n_iter, converged = result
-        n_outer = 0
+        solver_kw = dict(
+            closure=closure,
+            cavitation=cavitation,
+            tol=1e-5,
+            max_iter=50000,
+            P_init=P_init,
+            subcell_quad=subcell_quad,
+            H_smooth=H_smooth,
+            texture_params=texture_params,
+            phi_1D=phi_1D,
+            Z_1D=Z_1D,
+            return_converged=True,
+        )
+        if closure_kw:
+            solver_kw.update(closure_kw)
+        if alpha_pv is not None:
+            solver_kw["alpha_pv"] = alpha_pv
+            solver_kw["p_scale"] = p_scale
+            solver_kw["relax_pv"] = 0.4
+            solver_kw["max_outer_pv"] = 50
+
+    theta = None
+    cav_frac = 0.0
+
+    if is_ps:
+        if alpha_pv is not None:
+            # PV+PS: пьезовязкий Payvar-Salant
+            from reynolds_solver.piezoviscous.solver_pv_payvar_salant import (
+                solve_payvar_salant_piezoviscous,
+            )
+            P, theta, residual, n_iter = solve_payvar_salant_piezoviscous(
+                H, d_phi, d_Z, R, L,
+                alpha_pv=alpha_pv,
+                p_scale=p_scale,
+                tol=1e-6,
+                max_iter=10_000_000,
+                relax_mu=0.5,
+                relax_g=0.7,
+                max_outer=30,
+                tol_outer=1e-3,
+                verbose=False,
+            )
+            n_outer = 0
+            converged = True
+            cav_frac = float(np.mean(theta[1:-1, 1:-1] < 1.0 - 1e-6))
+        else:
+            # Изовязкий PS: GPU-solver напрямую
+            P, theta, residual, n_iter = _ps_solver(
+                H, d_phi, d_Z, R, L,
+                tol=1e-6,
+                max_iter=10_000_000,
+            )
+            n_outer = n_iter
+            converged = True
+            cav_frac = float(np.mean(theta < 1.0))
+        result = None
+    else:
+        result = solve_reynolds(H, d_phi, d_Z, R, L, **solver_kw)
+
+    if not is_ps:
+        if alpha_pv is not None:
+            # PV-путь: (P, delta, n_iter, n_outer)
+            P, residual, n_iter, n_outer = result
+            converged = True
+        else:
+            # Стандартный: (P, delta, n_iter, converged)
+            P, residual, n_iter, converged = result
+            n_outer = 0
 
     if not converged:
         import warnings
@@ -156,9 +223,6 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
 
     # Несущая способность: интегрирование давления
     # Меши (N_Z, N_phi): axis=0 — Z, axis=1 — φ
-    # F_x = -∫∫ p·cos(φ) R dφ (dZ·L/2)
-    # Интегрируем по φ (axis=1), потом по Z (axis=0)
-    # Z ∈ [-1,1], размерный = Z·L/2
     Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
                    Z_1D, axis=0) * R * L / 2
     Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
@@ -168,7 +232,6 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     # Сила трения на поверхности вала
     h_dim = H * c  # размерный зазор
     tau_couette = eta * omega * R / h_dim
-    # Градиент давления по φ (axis=1)
     dP_dphi = np.gradient(P_dim, phi_1D[1] - phi_1D[0], axis=1)
     tau_pressure = h_dim / 2.0 * dP_dphi / R
     tau = tau_couette + tau_pressure
@@ -188,4 +251,4 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     h_min = np.min(h_dim)
     p_max = np.max(P_dim)
 
-    return P, F, mu_val, Q, h_min, p_max, F_friction, n_outer
+    return P, F, mu_val, Q, h_min, p_max, F_friction, n_outer, theta, cav_frac
