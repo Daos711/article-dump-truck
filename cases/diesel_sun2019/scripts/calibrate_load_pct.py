@@ -22,15 +22,15 @@ from reynolds_solver import solve_ausas_journal_dynamic_gpu
 import case_config as cfg
 from scaling import (
     omega_from_rpm, force_scale, pressure_scale, mass_nondim,
-    make_load_fn_from_crank, CYCLE_TAU,
+    make_load_fn_from_crank, CYCLE_TAU, dt_from_crank_step,
 )
 
 M_EFF_KG = 10.0
 
-# Быстрый скрининг: 3 load_pct, мелкая сетка, малый dt для стабильности
-LOAD_CANDIDATES = [30, 50, 100]
+# Быстрый скрининг: 3 load_pct на мелкой сетке
+LOAD_CANDIDATES = [10, 20, 30]
 N_RPM = 2200
-DT_CAL = 5e-4
+CRANK_STEP_DEG = 0.5            # = NT 1440
 N1_CAL = 100
 N2_CAL = 10
 MAX_INNER_CAL = 1000
@@ -61,10 +61,10 @@ def run_one(load_fn):
     omega = omega_from_rpm(N_RPM)
     M_nd = mass_nondim(M_EFF_KG, cfg.eta, omega, cfg.R, cfg.c)
     B_ausas = cfg.L_bearing / (2 * cfg.R)
-    NT = int(CYCLE_TAU / DT_CAL)
+    dt_val, NT = dt_from_crank_step(CRANK_STEP_DEG)
 
     result = solve_ausas_journal_dynamic_gpu(
-        NT=NT, dt=DT_CAL,
+        NT=NT, dt=dt_val,
         N_Z=N2_CAL + 2, N_phi=N1_CAL + 2,
         d_phi=1.0 / N1_CAL, d_Z=B_ausas / N2_CAL,
         R=0.5, L=1.0,
@@ -85,8 +85,10 @@ def run_one(load_fn):
 def main():
     print("=" * 72)
     print(f"КАЛИБРОВКА LOAD_PCT (дизель, {N_RPM} rpm, m_eff={M_EFF_KG}кг)")
-    print(f"Быстрая сетка {N1_CAL}×{N2_CAL}, dt={DT_CAL}, "
-          f"NT/цикл={int(CYCLE_TAU/DT_CAL)}, max_inner={MAX_INNER_CAL}")
+    dt_preview, nt_preview = dt_from_crank_step(CRANK_STEP_DEG)
+    print(f"Быстрая сетка {N1_CAL}×{N2_CAL}, crank_step={CRANK_STEP_DEG}°, "
+          f"dt={dt_preview:.5f}, NT/цикл={nt_preview}, "
+          f"max_inner={MAX_INNER_CAL}")
     print("=" * 72)
 
     omega = omega_from_rpm(N_RPM)

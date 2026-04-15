@@ -1,9 +1,14 @@
-# Diesel main bearing — Sun et al. (2019)
+# Diesel main bearing — **Sun-geometry surrogate**
 
 Инфраструктура для нестационарного расчёта main bearing коленвала
 4-тактного дизеля с текстурой и без.
 
-## Источник параметров
+**Важно:** геометрия подшипника и параметры двигателя взяты из Sun 2019,
+но нагрузка построена **surrogate-методом** (Gaussian gas pulse + инерция),
+а не из оригинальных данных статьи. Поэтому кейс называется
+**"Sun-geometry surrogate"**, а не "Sun 2019".
+
+## Источник геометрии
 
 Sun, Wang, Hu, Zhu et al. "Effects of Textures on the Dynamic Characteristics
 of Main Bearings in Internal Combustion Engines", *Chinese Journal of
@@ -13,12 +18,16 @@ Mechanical Engineering* **32**:23 (2019).
 
 | Параметр | Значение |
 |----------|----------|
-| R (радиус journal) | 40 мм |
+| R (радиус коренной шейки) | 40 мм |
 | L (ширина подшипника) | 27 мм |
 | c (зазор) | 146 мкм |
 | η (вязкость) | 0.014347 Па·с |
 | n (обороты) | 2200 об/мин |
+| Bore (диаметр цилиндра) | 105 мм |
+| Stroke (ход поршня) | 118 мм |
+| Con-rod (длина шатуна) | 210 мм |
 | Цилиндров | 4 |
+| p_max (100% load) | 8 МПа |
 
 ## Convention (безразмеризация)
 

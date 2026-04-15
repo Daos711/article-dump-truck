@@ -35,6 +35,7 @@ import case_config as cfg
 from scaling import (
     omega_from_rpm, pressure_scale, force_scale, mass_nondim,
     make_load_fn_from_crank, CYCLE_TAU, tau_to_crank_deg,
+    dt_from_crank_step,
 )
 
 
@@ -131,17 +132,17 @@ def run_cycles(load_fn, out_dir, args):
     d_phi = 1.0 / cfg.N1
     d_Z = B_ausas / cfg.N2
 
-    NT_cycle = int(CYCLE_TAU / cfg.dt)
+    dt_val, NT_cycle = dt_from_crank_step(cfg.crank_step_deg)
 
     print("=" * 72)
-    print("SMOOTH BASELINE — diesel main bearing (Sun 2019)")
+    print("SMOOTH BASELINE — diesel main bearing (Sun-geometry surrogate)")
     print(f"R={cfg.R*1e3:.1f}мм, L={cfg.L_bearing*1e3:.1f}мм, "
           f"c={cfg.c*1e6:.0f}мкм")
     print(f"n={cfg.n_rpm} rpm, ω={omega:.1f} рад/с")
     print(f"η={cfg.eta} Па·с, m_eff={M_EFF_KG}кг → M_nd={M_nd:.3e}")
     print(f"F₀={F0:.0f} Н, p_scale={p_sc/1e6:.2f} МПа, B_ausas={B_ausas:.4f}")
     print(f"Сетка {cfg.N1}×{cfg.N2} (interior), NT_cycle={NT_cycle}, "
-          f"dt={cfg.dt}")
+          f"crank_step={cfg.crank_step_deg}°, dt={dt_val:.5f}")
     print("=" * 72)
 
     all_results = []
@@ -154,7 +155,7 @@ def run_cycles(load_fn, out_dir, args):
         t0 = time.time()
 
         kwargs = dict(
-            NT=NT_cycle, dt=cfg.dt,
+            NT=NT_cycle, dt=dt_val,
             N_Z=N_Z_, N_phi=N_phi,
             d_phi=d_phi, d_Z=d_Z,
             R=0.5, L=1.0,

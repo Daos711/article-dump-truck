@@ -22,13 +22,13 @@ from reynolds_solver import solve_ausas_journal_dynamic_gpu
 import case_config as cfg
 from scaling import (
     omega_from_rpm, force_scale, pressure_scale, mass_nondim,
-    make_load_fn_from_crank, CYCLE_TAU,
+    make_load_fn_from_crank, CYCLE_TAU, dt_from_crank_step,
 )
 
 M_EFF_KG = 10.0
 N1 = 100
 N2 = 10
-DT = 1e-3
+DT, _NT_per_cycle = dt_from_crank_step(cfg.crank_step_deg)
 
 
 def main():
@@ -37,13 +37,14 @@ def main():
     p_sc = pressure_scale(cfg.eta, omega, cfg.R, cfg.c)
     M_nd = mass_nondim(M_EFF_KG, cfg.eta, omega, cfg.R, cfg.c)
     B_ausas = cfg.L_bearing / (2 * cfg.R)
-    NT = int(CYCLE_TAU / DT)
+    NT = _NT_per_cycle
 
     print("=" * 65)
     print("SMOKE TEST — diesel smooth, 1 cycle on coarse grid")
     print(f"p_max={cfg.p_max_MPa} МПа, load_pct={cfg.load_pct}%, "
           f"m_eff={M_EFF_KG}кг")
-    print(f"Сетка {N1}×{N2}, dt={DT}, NT={NT}")
+    print(f"Сетка {N1}×{N2}, crank_step={cfg.crank_step_deg}°, "
+          f"dt={DT:.5f}, NT={NT}")
     print("=" * 65)
 
     # Build surrogate load on the fly

@@ -85,6 +85,15 @@ def tau_to_crank_deg(tau):
 CYCLE_TAU = 4 * np.pi   # безразмерный период одного 4-тактного цикла
 
 
+def dt_from_crank_step(crank_step_deg):
+    """Пересчёт шага по углу CA в безразмерный dt.
+
+    720° CA = CYCLE_TAU (4π). Тогда dt = CYCLE_TAU / (720/crank_step).
+    """
+    NT_per_cycle = int(720.0 / crank_step_deg)
+    return CYCLE_TAU / NT_per_cycle, NT_per_cycle
+
+
 # ─── Периодический интерполятор нагрузки ──────────────────────────
 
 def make_load_fn(tau_arr, WaX_arr, WaY_arr, T_cycle=CYCLE_TAU):
