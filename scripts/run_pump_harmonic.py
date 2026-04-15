@@ -65,11 +65,11 @@ OMEGA_VIB = 2 * np.pi * F_VIB
 T_VIB = 1.0 / N_BLADES
 
 # ─── Начальные условия и нагрузка ────────────────────────────────
-EPS_STATIC = 0.3
+EPS_STATIC = 0.5
 X0 = EPS_STATIC
 Y0 = 0.0
 
-W_STATIC_X = -0.005
+W_STATIC_X = -0.02          # подобрано в calibrate_load.py для ε≈0.5
 W_STATIC_Y = 0.0
 DELTA_W = 0.1 * abs(W_STATIC_X)
 
@@ -82,9 +82,9 @@ def load_fn(t):
 
 
 # ─── Параметры расчёта ───────────────────────────────────────────
-MASS_M = 1e-4
+MASS_M = 8e-4         # 50 кг ротор (эксперт)
 DT = 1e-3
-N_PERIODS = 2
+N_PERIODS = 5
 NT = int(N_PERIODS * T_VIB / DT)
 
 
@@ -274,6 +274,18 @@ def compute_metrics(r_smooth, r_tex):
     p_t = metrics["textured"]["p_max"]["max"]
     metrics["gain_hmin"] = h_t / h_s if h_s > 0 else 0
     metrics["gain_pmax"] = p_t / p_s if p_s > 0 else 0
+
+    # Размерные значения
+    metrics["dimensional"] = {
+        "smooth": {
+            "h_min_um": h_s * C * 1e6,
+            "p_max_MPa": p_s * P_SCALE / 1e6,
+        },
+        "textured": {
+            "h_min_um": h_t * C * 1e6,
+            "p_max_MPa": p_t * P_SCALE / 1e6,
+        },
+    }
     return metrics
 
 
