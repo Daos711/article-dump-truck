@@ -3,7 +3,14 @@
 
 Stationary Payvar-Salant + radial restoring surrogate. Continuation
 через shared driver (models/magnetic_equilibrium). Только accepted
-targets попадают в JSON/CSV.
+targets попадают в manifest.
+
+Output layout (magnetic_v4):
+    results/magnetic_pump/<run_id>/
+        manifest.json                — единственный source of truth
+        mag_smooth_equilibrium.csv   — debug/inspection dump
+
+Никаких записей в родительский каталог results/magnetic_pump/.
 """
 import sys
 import os
@@ -11,6 +18,7 @@ import csv
 import json
 import time
 import argparse
+import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -26,11 +34,16 @@ except ImportError:
 from models.magnetic_force import (
     RadialUnloadForceModel, sanity_checks,
 )
-from models.magnetic_equilibrium import find_equilibrium, run_continuation
+from models.magnetic_equilibrium import (
+    find_equilibrium, run_continuation,
+    is_accepted, result_to_dict,
+)
 from config import pump_params as params
 from config.oil_properties import MINERAL_OIL
 
 # ─── Расчёт ──────────────────────────────────────────────────────
+SCHEMA_VERSION = "magnetic_v4"
+
 N_PHI = 800
 N_Z = 200
 ETA = MINERAL_OIL["eta_pump"]
@@ -39,6 +52,12 @@ P_SCALE = 6 * ETA * OMEGA * (params.R / params.c) ** 2
 F0 = P_SCALE * params.R * params.L
 
 UNLOAD_SHARE_TARGETS = [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]
+
+# Единый acceptance tolerance. Записывается в manifest и повторно
+# используется textured compare / plot.
+TOL_ACCEPT = 5e-3
+STEP_CAP = 0.10
+EPS_MAX = 0.90
 
 
 def make_grid(N_phi, N_Z):
@@ -86,21 +105,11 @@ def make_H_and_force(Phi, Zm, phi_1D, Z_1D, d_phi, d_Z):
     return H_and_force
 
 
-def result_to_dict(r):
-    d = dict(
-        X=r.X, Y=r.Y, eps=r.eps, attitude_deg=r.attitude_deg,
-        Fx_hydro=r.Fx_hydro, Fy_hydro=r.Fy_hydro,
-        Fx_mag=r.Fx_mag, Fy_mag=r.Fy_mag,
-        h_min=r.h_min, p_max=r.p_max, cav_frac=r.cav_frac,
-        friction=r.friction,
-        rel_residual=r.rel_residual, n_iter=r.n_iter,
-        converged=bool(r.converged),
-        unload_share_target=r.unload_share_target,
-        unload_share_actual=r.unload_share_actual,
-        hydro_share_actual=r.hydro_share_actual,
-        K_mag=r.K_mag,
-    )
-    return d
+def make_run_id(model, n_phi, n_z, w_y_share):
+    """Run-id хранит ключевые параметры → разные runs не пересекаются."""
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    wy = f"{w_y_share:.3f}".replace(".", "")
+    return f"{stamp}_{model}_{n_phi}x{n_z}_wy{wy}"
 
 
 def main():
@@ -110,11 +119,21 @@ def main():
     parser.add_argument("--W-y-share", type=float, default=0.25)
     parser.add_argument("--model", choices=["radial", "linear"],
                         default="radial")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="explicit run_id; default: auto-generated")
+    parser.add_argument("--tol-accept", type=float, default=TOL_ACCEPT,
+                        help="acceptance threshold (rel_residual); "
+                             "used by smooth AND textured compare")
+    parser.add_argument("--step-cap", type=float, default=STEP_CAP)
+    parser.add_argument("--eps-max", type=float, default=EPS_MAX)
     args = parser.parse_args()
 
+    run_id = args.run_id or make_run_id(
+        args.model, args.n_phi, args.n_z, args.W_y_share)
     out_dir = os.path.join(os.path.dirname(__file__), "..",
-                           "results", "magnetic_pump")
+                           "results", "magnetic_pump", run_id)
     os.makedirs(out_dir, exist_ok=True)
+    print(f"Run directory: {out_dir}")
 
     # Sanity
     ok, _ = sanity_checks(verbose=True)
@@ -127,32 +146,36 @@ def main():
     print(f"Сетка {args.n_phi}×{args.n_z}, "
           f"W_applied=(0, {-args.W_y_share*F0:.1f}) Н, F₀={F0:.0f}Н")
     print(f"unload_share targets: {UNLOAD_SHARE_TARGETS}")
+    print(f"tol_accept={args.tol_accept}, step_cap={args.step_cap}, "
+          f"eps_max={args.eps_max}")
     print("=" * 72)
 
     W_applied = np.array([0.0, -args.W_y_share * F0])
     phi, Z, Phi, Zm, dp, dz = make_grid(args.n_phi, args.n_z)
     H_and_force = make_H_and_force(Phi, Zm, phi, Z, dp, dz)
 
-    # Baseline
-    print("\nBaseline (no magnet)...")
+    # ── Baseline raw (initial solve from seed) ─────────────────────
+    print("\nBaseline raw (no magnet, seed X0=0, Y0=-0.4)...")
     zero_model = RadialUnloadForceModel(K_mag=0.0)
     t0 = time.time()
-    # tol=5e-3: при PS internal tol=1e-6 и FD Jacobian noise,
-    # абсолютный 1e-4 недостижим. 5e-3 = 0.5% force residual —
-    # достаточно для exploratory surrogate case.
-    BASELINE_TOL = 5e-3
-    base = find_equilibrium(H_and_force, zero_model, W_applied,
-                             X0=0.0, Y0=-0.4,
-                             tol=BASELINE_TOL)
-    print(f"  X={base.X:+.4f}, Y={base.Y:+.4f}, ε={base.eps:.4f}, "
-          f"h_min={base.h_min*1e6:.2f}μm, p_max={base.p_max/1e6:.2f}MPa, "
-          f"res={base.rel_residual:.1e}, n_it={base.n_iter}, "
+    base_raw = find_equilibrium(
+        H_and_force, zero_model, W_applied,
+        X0=0.0, Y0=-0.4,
+        tol=args.tol_accept, step_cap=args.step_cap, eps_max=args.eps_max,
+        tol_accept=args.tol_accept)
+    base_raw.unload_share_target = 0.0
+    print(f"  X={base_raw.X:+.4f}, Y={base_raw.Y:+.4f}, "
+          f"ε={base_raw.eps:.4f}, "
+          f"h_min={base_raw.h_min*1e6:.2f}μm, "
+          f"p_max={base_raw.p_max/1e6:.2f}MPa, "
+          f"res={base_raw.rel_residual:.1e}, n_it={base_raw.n_iter}, "
+          f"status={base_raw.status}, "
           f"{time.time()-t0:.1f}с")
-    if not base.converged:
-        print(f"BASELINE НЕ сошёлся (tol={BASELINE_TOL}) — stopping")
+    if not base_raw.converged:
+        print(f"BASELINE RAW НЕ сошёлся — stopping")
         sys.exit(2)
 
-    # Continuation
+    # ── Continuation ───────────────────────────────────────────────
     if args.model == "radial":
         template = RadialUnloadForceModel(n_mag=3, H_reg=0.05, H_floor=0.02)
     else:
@@ -161,62 +184,65 @@ def main():
 
     print("\nContinuation...")
     cont = run_continuation(
-        UNLOAD_SHARE_TARGETS, base.X, base.Y, W_applied,
+        UNLOAD_SHARE_TARGETS, base_raw.X, base_raw.Y, W_applied,
         template, H_and_force,
-        tol=BASELINE_TOL,
-        step_cap=0.10, eps_max=0.90, verbose=True)
+        tol=args.tol_accept,
+        step_cap=args.step_cap, eps_max=args.eps_max,
+        tol_accept=args.tol_accept,
+        verbose=True)
 
-    # --- Acceptance checks ---
+    # canonical baseline = accepted point для target=0.0
+    # (см. ТЗ §3.2 — в downstream computations нельзя использовать
+    # base_raw, только canonical zero-target entry).
+    r0 = cont[0][1] if cont and cont[0][2] else None
+    if r0 is None or not is_accepted(r0, args.tol_accept):
+        print("\nFAIL: target=0.0 не accepted → baseline_canonical недоступен")
+        sys.exit(3)
+    base_canonical = r0
+
+    # ── Acceptance checks ──────────────────────────────────────────
     print("\n" + "=" * 72)
     print("ACCEPTANCE")
     print("=" * 72)
-    # K=0 reproduces baseline.
-    # Note: base был получен через stagnation fallback (NR застрял
-    # на 6% residual). target=0 в continuation обычно сходится лучше
-    # (с seed=base, один шаг NR). Проверяем что:
-    #   (a) target=0 accepted,
-    #   (b) его residual НЕ хуже чем у base (т.е. reproduction
-    #       не теряет точность),
-    #   (c) shape (ε, h_min, p_max) в пределах 5% (допуск на
-    #       finite FD noise + PS tol).
-    r0 = cont[0][1]
-    ok1 = (
-        cont[0][2]
-        and r0.rel_residual <= max(base.rel_residual, 5e-3)
-        and abs(r0.eps - base.eps) < 0.10
-        and abs(r0.h_min - base.h_min) / max(base.h_min, 1e-12) < 0.10
-        and abs(r0.p_max - base.p_max) / max(base.p_max, 1e-12) < 0.10
-    )
-    print(f"  [{'✓' if ok1 else '✗'}] K_mag=0 reproduces baseline "
-          f"(|Δε|={abs(r0.eps - base.eps):.3e}, res={r0.rel_residual:.1e})")
 
-    accepted = [(t, r) for (t, r, a) in cont if a]
-    # unload_share > 0 на всех accepted (кроме 0)
-    ok2 = all(r.unload_share_actual > 0 for t, r in accepted if t > 0)
+    # K=0 reproduces baseline (shape-only tolerance).
+    ok1 = (
+        is_accepted(base_canonical, args.tol_accept)
+        and abs(base_canonical.eps - base_raw.eps) < 0.10
+        and abs(base_canonical.h_min - base_raw.h_min)
+            / max(base_raw.h_min, 1e-12) < 0.10
+        and abs(base_canonical.p_max - base_raw.p_max)
+            / max(base_raw.p_max, 1e-12) < 0.10
+    )
+    print(f"  [{'✓' if ok1 else '✗'}] K_mag=0 reproduces raw baseline "
+          f"(|Δε|={abs(base_canonical.eps - base_raw.eps):.3e}, "
+          f"res_canonical={base_canonical.rel_residual:.1e})")
+
+    accepted_pairs = [(t, r) for (t, r, a) in cont if a]
+    accepted_targets = [t for t, _ in accepted_pairs]
+
+    ok2 = all(r.unload_share_actual > 0
+              for t, r in accepted_pairs if t > 0)
     print(f"  [{'✓' if ok2 else '✗'}] unload_share_actual > 0 на accepted")
 
-    # ε монотонно не возрастает — обязательное поведение после
-    # bug v3 fix (F_mag sign в residual).
-    eps_seq = [r.eps for t, r in accepted]
+    eps_seq = [r.eps for _, r in accepted_pairs]
     ok3 = all(eps_seq[i+1] <= eps_seq[i] + 1e-3
               for i in range(len(eps_seq) - 1))
     print(f"  [{'✓' if ok3 else '✗'}] ε монотонно не возрастает: "
           f"{[f'{e:.4f}' for e in eps_seq]}")
 
-    # rel_residual < BASELINE_TOL (relaxed from 1e-3 due to FD noise)
-    max_res = max(r.rel_residual for t, r in accepted)
-    ok4 = max_res < BASELINE_TOL
+    max_res = max((r.rel_residual for _, r in accepted_pairs), default=0.0)
+    ok4 = max_res < args.tol_accept
     print(f"  [{'✓' if ok4 else '✗'}] max residual = {max_res:.2e} "
-          f"< {BASELINE_TOL}")
+          f"< {args.tol_accept}")
 
-    # hydro + unload ≈ 1 (with force-balance residual margin)
     ok5 = all(abs(r.hydro_share_actual + r.unload_share_actual - 1.0)
-              < 2 * BASELINE_TOL
-              for t, r in accepted)
+              < 2 * args.tol_accept
+              for _, r in accepted_pairs)
     print(f"  [{'✓' if ok5 else '✗'}] |hydro + unload − 1| "
-          f"< {2*BASELINE_TOL}")
+          f"< {2*args.tol_accept}")
 
-    # --- Save ---
+    # ── CSV dump ──────────────────────────────────────────────────
     csv_path = os.path.join(out_dir, "mag_smooth_equilibrium.csv")
     rows = []
     for t, r, acc in cont:
@@ -237,35 +263,59 @@ def main():
                         for k, v in r.items()})
     print(f"\nCSV: {csv_path}")
 
-    json_path = os.path.join(out_dir, "mag_smooth_summary.json")
-    accepted_summary = [result_to_dict(r) for t, r, a in cont if a]
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "config": {
-                "N_phi": args.n_phi, "N_Z": args.n_z,
-                "F0_N": float(F0),
-                "W_applied_N": [float(w_) for w_ in W_applied],
-                "p_scale_Pa": float(P_SCALE),
-                "model": args.model,
-                "unload_share_targets": UNLOAD_SHARE_TARGETS,
-            },
-            "baseline": result_to_dict(base),
-            "continuation": accepted_summary,
-            "continuation_all": [
-                dict(unload_share_target=t,
-                     result=(result_to_dict(r) if r is not None else None),
-                     accepted=bool(a))
-                for t, r, a in cont
-            ],
-            "acceptance": {
-                "baseline_reproduced": bool(ok1),
-                "unload_positive": bool(ok2),
-                "eps_monotonic": bool(ok3),
-                "max_residual": float(max_res),
-                "sum_shares_ok": bool(ok5),
-            },
-        }, f, indent=2, ensure_ascii=False)
-    print(f"JSON: {json_path}")
+    # ── Manifest (magnetic_v4) ─────────────────────────────────────
+    smooth_all = []
+    for t, r, a in cont:
+        smooth_all.append(dict(
+            unload_share_target=float(t),
+            result=result_to_dict(r),
+            accepted=bool(a),
+        ))
+
+    smooth_accepted = [result_to_dict(r) for _, r, a in cont if a]
+
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "model": args.model,
+        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "config": {
+            "N_phi": int(args.n_phi),
+            "N_Z": int(args.n_z),
+            "W_applied_N": [float(w_) for w_ in W_applied],
+            "F0_N": float(F0),
+            "p_scale_Pa": float(P_SCALE),
+            "tol_accept": float(args.tol_accept),
+            "step_cap": float(args.step_cap),
+            "eps_max": float(args.eps_max),
+            "targets": [float(t) for t in UNLOAD_SHARE_TARGETS],
+        },
+        "baseline_raw": result_to_dict(base_raw),
+        "baseline_canonical": result_to_dict(base_canonical),
+        "smooth_accepted": smooth_accepted,
+        "smooth_all": smooth_all,
+        "acceptance": {
+            "baseline_reproduced": bool(ok1),
+            "unload_positive": bool(ok2),
+            "eps_monotonic": bool(ok3),
+            "max_residual": float(max_res),
+            "sum_shares_ok": bool(ok5),
+            "accepted_targets": [float(t) for t in accepted_targets],
+        },
+    }
+    manifest_path = os.path.join(out_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"Manifest: {manifest_path}")
+
+    # Convenience: pointer file на latest run, чтобы textured compare
+    # и plot могли найти manifest без явного run_id.
+    latest_path = os.path.join(
+        os.path.dirname(__file__), "..",
+        "results", "magnetic_pump", "latest_run.txt")
+    with open(latest_path, "w", encoding="utf-8") as f:
+        f.write(run_id + "\n")
+    print(f"Latest pointer: {latest_path} → {run_id}")
 
 
 if __name__ == "__main__":
