@@ -51,13 +51,25 @@ class EquilibriumResult:
 
 def _line_search(X, Y, dX, dY, mag_model, W_applied,
                   H_and_force, current_rel_R,
-                  max_backtracks=8, eps_max=0.90):
-    """Halving line search.
+                  max_backtracks=12, eps_max=0.90):
+    """Halving line search с Armijo-like критерием и fallback.
 
-    Returns (X_new, Y_new, rel_R_new, accepted) or (None..None..False) if fail.
+    Ищем наибольший λ ∈ {1, 0.5, 0.25, ...}, при котором:
+      1) ε_new < eps_max (геометрия валидна)
+      2) rel_R_new < 1.01 · current_rel_R (слабый monotonic decrease)
+
+    Если никто не удовлетворил (2), возвращаем попытку с МИНИМАЛЬНЫМ
+    rel_R среди валидных по (1) — чтобы не застревать на приближённом
+    Jacobian'е.
+
+    Returns (X_new, Y_new, rel_R_new, Fx_h, Fy_h, Fx_m, Fy_m,
+             h_min, p_max, cav, fr, lam) или None если даже
+    геометрия не валидна.
     """
-    lam = 1.0
     Wa_norm = float(np.linalg.norm(W_applied))
+    best = None
+    best_rel = np.inf
+    lam = 1.0
     for _ in range(max_backtracks + 1):
         X_try = X + lam * dX
         Y_try = Y + lam * dY
@@ -70,11 +82,17 @@ def _line_search(X, Y, dX, dY, mag_model, W_applied,
         Rx = Fx_h + Fx_m - W_applied[0]
         Ry = Fy_h + Fy_m - W_applied[1]
         rel_R = np.sqrt(Rx**2 + Ry**2) / max(Wa_norm, 1e-20)
-        if rel_R < current_rel_R:
-            return (X_try, Y_try, rel_R, Fx_h, Fy_h, Fx_m, Fy_m,
-                    h_min, p_max, cav, fr, lam)
+        candidate = (X_try, Y_try, rel_R, Fx_h, Fy_h, Fx_m, Fy_m,
+                     h_min, p_max, cav, fr, lam)
+        # Accept strictly-improving step right away
+        if rel_R < 1.01 * current_rel_R:
+            return candidate
+        # Otherwise remember the best-so-far
+        if rel_R < best_rel:
+            best_rel = rel_R
+            best = candidate
         lam *= 0.5
-    return None
+    return best
 
 
 def find_equilibrium(H_and_force, mag_model, W_applied,
