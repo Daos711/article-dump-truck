@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Textured vs smooth под одинаковым mag_share.
+"""Textured vs smooth сравнение с магнитной разгрузкой.
 
-Одна текстура (фиксированная): зона 0°–90°, a/b=1.5/1.2мм, hp=30мкм,
-sf=1.5, profile=smoothcap. Равновесие через тот же 2D Newton-Raphson.
+Только на accepted targets из smooth run. Использует тот же shared
+driver (models/magnetic_equilibrium) — идентичный NR и acceptance.
 """
 import sys
 import os
@@ -14,7 +14,6 @@ import argparse
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
-import types
 
 try:
     from reynolds_solver.cavitation.payvar_salant import solve_payvar_salant_gpu
@@ -25,12 +24,14 @@ except ImportError:
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 
 from models.magnetic_force import (
-    MagneticForceModel, calibrate_Kmag, sanity_checks
+    RadialUnloadForceModel, sanity_checks,
+    calibrate_Kmag_from_baseline_projection,
 )
+from models.magnetic_equilibrium import find_equilibrium
 from config import pump_params as params
 from config.oil_properties import MINERAL_OIL
 
-# ─── Расчёт ──────────────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────
 N_PHI = 800
 N_Z = 200
 ETA = MINERAL_OIL["eta_pump"]
@@ -38,10 +39,7 @@ OMEGA = 2 * np.pi * params.n / 60.0
 P_SCALE = 6 * ETA * OMEGA * (params.R / params.c) ** 2
 F0 = P_SCALE * params.R * params.L
 
-W_APPLIED_Y_SHARE = 0.25         # соответствует baseline smooth case
-MAG_SHARE_TARGETS = [0.0, 0.05, 0.10, 0.20, 0.30]
-
-# Фиксированная текстура
+# Reference texture
 TEX_PHI_START = 0.0
 TEX_PHI_END = 90.0
 TEX_A_MM = 1.5
@@ -65,20 +63,17 @@ def make_smooth_H0(X, Y, Phi):
     return np.sqrt(H0**2 + (params.sigma / params.c) ** 2)
 
 
-def setup_texture(Phi, Zm, d_phi, d_Z):
-    """Центры лунок в зоне [TEX_PHI_START, TEX_PHI_END]."""
-    a_phi = (TEX_B_MM * 1e-3) / params.R         # полуось по φ в рад
-    a_Z = 2 * (TEX_A_MM * 1e-3) / params.L        # полуось по Z безразм.
+def setup_texture(Phi, Zm):
+    a_phi = (TEX_B_MM * 1e-3) / params.R
+    a_Z = 2 * (TEX_A_MM * 1e-3) / params.L
     depth = (TEX_HP_UM * 1e-6) / params.c
 
     phi_s = np.deg2rad(TEX_PHI_START)
     phi_e = np.deg2rad(TEX_PHI_END)
     phi_span = phi_e - phi_s
-
     N_phi_tex = max(1, int(phi_span / (TEX_SF * 2 * a_phi)))
     N_Z_tex = max(1, int(2.0 / (TEX_SF * 2 * a_Z)))
 
-    # Центры
     margin = a_phi * 1.1
     usable = phi_span - 2 * margin
     if N_phi_tex == 1:
@@ -97,238 +92,227 @@ def setup_texture(Phi, Zm, d_phi, d_Z):
     return pg.ravel(), zg.ravel(), a_phi, a_Z, depth
 
 
-def make_textured_H(X, Y, Phi, Zm, phi_c, Z_c, a_phi, a_Z, depth):
-    H0 = make_smooth_H0(X, Y, Phi)
-    H = create_H_with_ellipsoidal_depressions(
-        H0, depth, Phi, Zm, phi_c, Z_c, a_Z, a_phi, profile=TEX_PROFILE)
-    return H
+def make_H_and_force_factory(Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
+                              textured=False, tex=None):
+    """Замыкание: build_H(X,Y) [+ texture] + PS solve + metrics."""
 
-
-def solve_ps(H, dp, dz):
-    P, theta, res, nit = _ps_solver(
-        H, dp, dz, params.R, params.L, tol=1e-6, max_iter=10_000_000)
-    return P, theta
-
-
-def compute_hydro_force(P, Phi, phi_1D, Z_1D):
-    P_dim = P * P_SCALE
-    Fx = -np.trapezoid(np.trapezoid(P_dim * np.cos(Phi), phi_1D, axis=1),
-                        Z_1D, axis=0) * params.R * params.L / 2
-    Fy = -np.trapezoid(np.trapezoid(P_dim * np.sin(Phi), phi_1D, axis=1),
-                        Z_1D, axis=0) * params.R * params.L / 2
-    return float(Fx), float(Fy)
-
-
-def compute_metrics(P, H, theta=None):
-    P_dim = P * P_SCALE
-    h_dim = H * params.c
-    h_min = float(np.min(h_dim))
-    p_max = float(np.max(P_dim))
-    if theta is not None:
+    def H_and_force(X, Y):
+        H0 = make_smooth_H0(X, Y, Phi)
+        if textured and tex is not None:
+            H = create_H_with_ellipsoidal_depressions(
+                H0, tex["depth"], Phi, Zm,
+                tex["phi_c"], tex["Z_c"],
+                tex["a_Z"], tex["a_phi"], profile=TEX_PROFILE)
+        else:
+            H = H0
+        P, theta, _, _ = _ps_solver(
+            H, d_phi, d_Z, params.R, params.L,
+            tol=1e-6, max_iter=10_000_000)
+        P_dim = P * P_SCALE
+        Fx = -np.trapezoid(
+            np.trapezoid(P_dim * np.cos(Phi), phi_1D, axis=1),
+            Z_1D, axis=0) * params.R * params.L / 2
+        Fy = -np.trapezoid(
+            np.trapezoid(P_dim * np.sin(Phi), phi_1D, axis=1),
+            Z_1D, axis=0) * params.R * params.L / 2
+        h_dim = H * params.c
+        h_min = float(np.min(h_dim))
+        p_max = float(np.max(P_dim))
         cav_frac = float(np.mean(theta < 1.0 - 1e-6))
-    else:
-        cav_frac = 0.0
-    tau_c = ETA * OMEGA * params.R / h_dim
-    F_friction = float(np.sum(tau_c) * params.R * (2 * np.pi / H.shape[1])
-                       * params.L * (2 / H.shape[0]) / 2)
-    return h_min, p_max, cav_frac, F_friction
+        tau_c = ETA * OMEGA * params.R / h_dim
+        friction = float(
+            np.sum(tau_c) * params.R * (2 * np.pi / H.shape[1])
+            * params.L * (2 / H.shape[0]) / 2)
+        return (float(Fx), float(Fy), h_min, p_max, cav_frac,
+                friction, P, theta)
+
+    return H_and_force
 
 
-def make_H_for(case, X, Y, Phi, Zm, tex_params):
-    if case == "smooth":
-        return make_smooth_H0(X, Y, Phi)
-    return make_textured_H(X, Y, Phi, Zm, **tex_params)
-
-
-def find_equilibrium(case, W_applied, mag_model, Phi, Zm, phi_1D, Z_1D,
-                     d_phi, d_Z, tex_params, X0=0.0, Y0=-0.4,
-                     max_iter=50, tol=1e-4):
-    X, Y = X0, Y0
-    dXY = 1e-5
-    P_last, theta_last = None, None
-    for it in range(max_iter):
-        H = make_H_for(case, X, Y, Phi, Zm, tex_params)
-        P, theta = solve_ps(H, d_phi, d_Z)
-        Fx_h, Fy_h = compute_hydro_force(P, Phi, phi_1D, Z_1D)
-        Fx_m, Fy_m = mag_model.force(X, Y)
-        Rx = Fx_h + Fx_m - W_applied[0]
-        Ry = Fy_h + Fy_m - W_applied[1]
-        norm_R = np.sqrt(Rx**2 + Ry**2)
-        rel_R = norm_R / max(np.linalg.norm(W_applied), 1e-20)
-        if rel_R < tol:
-            P_last, theta_last = P, theta
-            break
-
-        J = np.zeros((2, 2))
-        for col, (dX_, dY_) in enumerate([(dXY, 0), (0, dXY)]):
-            H_p = make_H_for(case, X + dX_, Y + dY_, Phi, Zm, tex_params)
-            P_p, _ = solve_ps(H_p, d_phi, d_Z)
-            Fxp, Fyp = compute_hydro_force(P_p, Phi, phi_1D, Z_1D)
-            Fxm_p, Fym_p = mag_model.force(X + dX_, Y + dY_)
-            J[0, col] = ((Fxp + Fxm_p) - (Fx_h + Fx_m)) / dXY
-            J[1, col] = ((Fyp + Fym_p) - (Fy_h + Fy_m)) / dXY
-
-        det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
-        if abs(det) < 1e-30:
-            break
-        dX = -(J[1, 1] * Rx - J[0, 1] * Ry) / det
-        dY = -(-J[1, 0] * Rx + J[0, 0] * Ry) / det
-        step = min(1.0, 0.08 / max(abs(dX), abs(dY), 1e-10))
-        X_new = X + step * dX
-        Y_new = Y + step * dY
-        eps_new = np.sqrt(X_new**2 + Y_new**2)
-        if eps_new > 0.95:
-            step *= 0.5
-        X += step * dX
-        Y += step * dY
-        P_last, theta_last = P, theta
-
-    eps = np.sqrt(X**2 + Y**2)
-    H = make_H_for(case, X, Y, Phi, Zm, tex_params)
-    h_min, p_max, cav_frac, fr = compute_metrics(P_last, H, theta_last)
-    Fx_h, Fy_h = compute_hydro_force(P_last, Phi, phi_1D, Z_1D)
-    Fx_m, Fy_m = mag_model.force(X, Y)
-    Rx = Fx_h + Fx_m - W_applied[0]
-    Ry = Fy_h + Fy_m - W_applied[1]
-    rel_R = np.sqrt(Rx**2 + Ry**2) / max(np.linalg.norm(W_applied), 1e-20)
-    attitude = np.rad2deg(np.arctan2(Y, X))
-    return dict(
+def result_to_dict(r, case=""):
+    d = dict(
         case=case,
-        X=float(X), Y=float(Y), eps=float(eps),
-        attitude_deg=float(attitude),
-        Fx_hydro=float(Fx_h), Fy_hydro=float(Fy_h),
-        Fx_mag=float(Fx_m), Fy_mag=float(Fy_m),
-        h_min=h_min, p_max=p_max, cav_frac=cav_frac, friction=fr,
-        n_iter=it + 1, rel_residual=float(rel_R),
+        X=r.X, Y=r.Y, eps=r.eps, attitude_deg=r.attitude_deg,
+        Fx_hydro=r.Fx_hydro, Fy_hydro=r.Fy_hydro,
+        Fx_mag=r.Fx_mag, Fy_mag=r.Fy_mag,
+        h_min=r.h_min, p_max=r.p_max, cav_frac=r.cav_frac,
+        friction=r.friction,
+        rel_residual=r.rel_residual, n_iter=r.n_iter,
+        converged=bool(r.converged),
+        unload_share_target=r.unload_share_target,
+        unload_share_actual=r.unload_share_actual,
+        hydro_share_actual=r.hydro_share_actual,
+        K_mag=r.K_mag,
     )
+    return d
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-phi", type=int, default=N_PHI)
     parser.add_argument("--n-z", type=int, default=N_Z)
-    parser.add_argument("--W-y-share", type=float, default=W_APPLIED_Y_SHARE)
     args = parser.parse_args()
 
     out_dir = os.path.join(os.path.dirname(__file__), "..",
                            "results", "magnetic_pump")
-    os.makedirs(out_dir, exist_ok=True)
+    # Загрузить smooth summary
+    smooth_json = os.path.join(out_dir, "mag_smooth_summary.json")
+    if not os.path.exists(smooth_json):
+        print(f"Сначала запусти run_mag_smooth_continuation.py "
+              f"(нет {smooth_json})")
+        sys.exit(1)
+    with open(smooth_json, "r", encoding="utf-8") as f:
+        sm = json.load(f)
 
     ok, _ = sanity_checks(verbose=True)
     if not ok:
         print("FAIL sanity")
         sys.exit(1)
 
-    print("\n" + "=" * 72)
-    print("TEXTURED vs SMOOTH + MAGNETIC UNLOADING")
-    print(f"Сетка {args.n_phi}×{args.n_z}")
-    print(f"Texture: zone {TEX_PHI_START}-{TEX_PHI_END}°, "
-          f"a/b={TEX_A_MM}/{TEX_B_MM}мм, hp={TEX_HP_UM}мкм, sf={TEX_SF}")
-    print(f"mag_share targets: {MAG_SHARE_TARGETS}")
-    print("=" * 72)
+    # Accepted smooth points
+    accepted = sm["continuation"]
+    if not accepted:
+        print("В smooth нет accepted targets")
+        sys.exit(1)
 
-    W_applied = np.array([0.0, -args.W_y_share * F0])
-    W_norm = float(np.linalg.norm(W_applied))
-    e_load = -W_applied / W_norm
+    W_applied = np.array(sm["config"]["W_applied_N"])
+    baseline_X = sm["baseline"]["X"]
+    baseline_Y = sm["baseline"]["Y"]
+
+    print("\n" + "=" * 72)
+    print("TEXTURED vs SMOOTH + MAGNETIC UNLOAD (accepted targets only)")
+    acc_str = ", ".join(f"{r['unload_share_target']*100:.1f}%"
+                         for r in accepted)
+    print(f"Accepted: [{acc_str}]")
+    print("=" * 72)
 
     phi, Z, Phi, Zm, dp, dz = make_grid(args.n_phi, args.n_z)
-    phi_c, Z_c, a_phi, a_Z, depth = setup_texture(Phi, Zm, dp, dz)
+    phi_c, Z_c, a_phi, a_Z, depth = setup_texture(Phi, Zm)
     n_dimples = len(phi_c)
-    tex_params = dict(phi_c=phi_c, Z_c=Z_c, a_phi=a_phi, a_Z=a_Z, depth=depth)
-    print(f"\nТекстура: {n_dimples} лунок (полуоси в Ausas: "
-          f"a_phi={a_phi:.4f} рад, a_Z={a_Z:.4f})")
+    tex = dict(phi_c=phi_c, Z_c=Z_c, a_phi=a_phi, a_Z=a_Z, depth=depth)
+    print(f"Texture: {n_dimples} лунок, zone "
+          f"{TEX_PHI_START}-{TEX_PHI_END}°")
 
-    # Baseline smooth для калибровки K_mag
-    print("\n[Baseline smooth]")
-    mag0 = MagneticForceModel(K_mag=0.0)
-    baseline = find_equilibrium("smooth", W_applied, mag0,
-                                  Phi, Zm, phi, Z, dp, dz, tex_params)
-    print(f"  X={baseline['X']:.4f}, Y={baseline['Y']:.4f}, "
-          f"ε={baseline['eps']:.4f}, h_min={baseline['h_min']*1e6:.2f}мкм")
+    H_and_force_smooth = make_H_and_force_factory(
+        Phi, Zm, phi, Z, dp, dz, textured=False)
+    H_and_force_tex = make_H_and_force_factory(
+        Phi, Zm, phi, Z, dp, dz, textured=True, tex=tex)
 
-    results = {"smooth": [], "textured": []}
-    X_prev = {"smooth": baseline["X"], "textured": baseline["X"]}
-    Y_prev = {"smooth": baseline["Y"], "textured": baseline["Y"]}
+    results = []  # list of dict
+    X_prev_s, Y_prev_s = baseline_X, baseline_Y
+    X_prev_t, Y_prev_t = baseline_X, baseline_Y
 
-    for target in MAG_SHARE_TARGETS:
+    for sm_entry in accepted:
+        target = sm_entry["unload_share_target"]
+        # Калибровка K_mag на baseline (smooth)
         if target == 0.0:
-            mag = MagneticForceModel(K_mag=0.0)
+            m_smooth = RadialUnloadForceModel(K_mag=0.0)
+            m_tex = RadialUnloadForceModel(K_mag=0.0)
         else:
-            mag = calibrate_Kmag(baseline["X"], baseline["Y"],
-                                  W_applied, target)
-        K_out = mag.K_mag
+            template = RadialUnloadForceModel(
+                n_mag=3, H_reg=0.05, H_floor=0.02)
+            m_smooth = calibrate_Kmag_from_baseline_projection(
+                template, baseline_X, baseline_Y, W_applied, target)
+            m_tex = calibrate_Kmag_from_baseline_projection(
+                template, baseline_X, baseline_Y, W_applied, target)
 
-        for case in ["smooth", "textured"]:
+        # Smooth solve (для consistency, хотя уже есть в JSON)
+        t0 = time.time()
+        rs = find_equilibrium(
+            H_and_force_smooth, m_smooth, W_applied,
+            X0=X_prev_s, Y0=Y_prev_s,
+            tol=1e-3, step_cap=0.10, eps_max=0.90)
+        dt_s = time.time() - t0
+        rs.unload_share_target = target
+
+        # Textured solve только если smooth сошёлся
+        if rs.converged and rs.rel_residual < 1e-3:
             t0 = time.time()
-            r = find_equilibrium(case, W_applied, mag, Phi, Zm, phi, Z,
-                                  dp, dz, tex_params,
-                                  X0=X_prev[case], Y0=Y_prev[case])
-            dt_r = time.time() - t0
-            X_prev[case], Y_prev[case] = r["X"], r["Y"]
-            hs = ((r["Fx_hydro"] * e_load[0] + r["Fy_hydro"] * e_load[1])
-                   / W_norm)
-            ms = ((r["Fx_mag"] * e_load[0] + r["Fy_mag"] * e_load[1])
-                   / W_norm)
-            r.update(dict(mag_share_target=target, K_mag=K_out,
-                          hydro_load_share=float(hs),
-                          mag_load_share=float(ms)))
-            results[case].append(r)
-            print(f"  [{case:>8s}] share={target*100:4.1f}%: "
-                  f"ε={r['eps']:.4f}, h_min={r['h_min']*1e6:.2f}мкм, "
-                  f"p_max={r['p_max']/1e6:.2f}МПа, res={r['rel_residual']:.1e}, "
-                  f"{dt_r:.1f}с")
+            rt = find_equilibrium(
+                H_and_force_tex, m_tex, W_applied,
+                X0=X_prev_t, Y0=Y_prev_t,
+                tol=1e-3, step_cap=0.10, eps_max=0.90)
+            dt_t = time.time() - t0
+            rt.unload_share_target = target
+            accepted_flag = (rt.converged and rt.rel_residual < 1e-3)
+            X_prev_s, Y_prev_s = rs.X, rs.Y
+            if accepted_flag:
+                X_prev_t, Y_prev_t = rt.X, rt.Y
+        else:
+            rt = None
+            accepted_flag = False
+            dt_t = 0.0
 
-    # Сравнение
-    print("\n" + "=" * 72)
-    print("СРАВНЕНИЕ textured/smooth")
-    print("=" * 72)
-    print(f"  {'share':>6} {'Δε':>8} {'h_t/h_s':>9} {'p_t/p_s':>9} "
-          f"{'cav_t-s':>9} {'fr_t/fr_s':>10}")
-    for i, target in enumerate(MAG_SHARE_TARGETS):
-        rs = results["smooth"][i]
-        rt = results["textured"][i]
-        dE = rt["eps"] - rs["eps"]
-        hr = rt["h_min"] / max(rs["h_min"], 1e-12)
-        pr = rt["p_max"] / max(rs["p_max"], 1e-12)
-        cd = rt["cav_frac"] - rs["cav_frac"]
-        fr = rt["friction"] / max(rs["friction"], 1e-12)
-        print(f"  {target*100:>5.1f}% {dE:>+8.4f} {hr:>9.4f} "
-              f"{pr:>9.4f} {cd:>+9.4f} {fr:>10.4f}")
+        ds = result_to_dict(rs, "smooth")
+        dt_d = result_to_dict(rt, "textured") if rt is not None else None
 
-    # CSV
+        hr = rt.h_min / max(rs.h_min, 1e-12) if rt else None
+        pr = rt.p_max / max(rs.p_max, 1e-12) if rt else None
+        fr_r = rt.friction / max(rs.friction, 1e-12) if rt else None
+        dcav = rt.cav_frac - rs.cav_frac if rt else None
+        deps = rt.eps - rs.eps if rt else None
+
+        print(f"  target={target*100:5.2f}%: "
+              f"smooth ε={rs.eps:.4f} (res={rs.rel_residual:.1e}), "
+              f"{'tex ε=' + f'{rt.eps:.4f}' if rt else 'tex SKIPPED'} "
+              f"({dt_s+dt_t:.1f}с) "
+              f"{'✓' if accepted_flag else '✗'}")
+        if rt:
+            print(f"    h_t/h_s={hr:.4f}, p_t/p_s={pr:.4f}, "
+                  f"fr_t/fr_s={fr_r:.4f}, Δcav={dcav:+.4f}, "
+                  f"Δε={deps:+.4f}")
+
+        results.append(dict(
+            unload_share_target=target,
+            smooth=ds,
+            textured=dt_d,
+            ratios=dict(
+                h_ratio=float(hr) if hr is not None else None,
+                p_ratio=float(pr) if pr is not None else None,
+                f_ratio=float(fr_r) if fr_r is not None else None,
+                delta_cav=float(dcav) if dcav is not None else None,
+                delta_eps=float(deps) if deps is not None else None,
+            ),
+            accepted=accepted_flag,
+        ))
+
+    # CSV: flatten
     csv_path = os.path.join(out_dir, "mag_textured_equilibrium.csv")
+    rows = []
+    for r in results:
+        base = dict(unload_share_target=r["unload_share_target"],
+                     accepted=r["accepted"])
+        if r["smooth"]:
+            for k, v in r["smooth"].items():
+                base[f"s_{k}"] = v
+        if r["textured"]:
+            for k, v in r["textured"].items():
+                base[f"t_{k}"] = v
+        for k, v in r["ratios"].items():
+            base[k] = v if v is not None else ""
+        rows.append(base)
+    fieldnames = sorted({k for row in rows for k in row.keys()})
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = list(results["smooth"][0].keys())
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
-        for case in ["smooth", "textured"]:
-            for r in results[case]:
-                w.writerow({k: (f"{v:.6e}" if isinstance(v, float) else v)
-                            for k, v in r.items()})
+        for row in rows:
+            w.writerow({k: (f"{v:.6e}" if isinstance(v, float) else v)
+                        for k, v in row.items()})
     print(f"\nCSV: {csv_path}")
 
-    # JSON
     json_path = os.path.join(out_dir, "mag_textured_summary.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({
             "config": {
                 "N_phi": args.n_phi, "N_Z": args.n_z,
-                "W_applied_N": [float(w) for w in W_applied],
-                "texture": {
-                    "zone_deg": [TEX_PHI_START, TEX_PHI_END],
-                    "a_mm": TEX_A_MM, "b_mm": TEX_B_MM,
-                    "hp_um": TEX_HP_UM, "sf": TEX_SF,
-                    "profile": TEX_PROFILE,
-                    "n_dimples": int(n_dimples),
-                },
-                "mag_share_targets": MAG_SHARE_TARGETS,
+                "W_applied_N": [float(w_) for w_ in W_applied],
+                "texture": dict(
+                    zone_deg=[TEX_PHI_START, TEX_PHI_END],
+                    a_mm=TEX_A_MM, b_mm=TEX_B_MM,
+                    hp_um=TEX_HP_UM, sf=TEX_SF, profile=TEX_PROFILE,
+                    n_dimples=int(n_dimples)),
             },
-            "smooth": [
-                {k: (v if isinstance(v, (int, float, str)) else float(v))
-                 for k, v in r.items()} for r in results["smooth"]],
-            "textured": [
-                {k: (v if isinstance(v, (int, float, str)) else float(v))
-                 for k, v in r.items()} for r in results["textured"]],
+            "pairs": results,
         }, f, indent=2, ensure_ascii=False)
     print(f"JSON: {json_path}")
 
