@@ -366,6 +366,64 @@ def test_smooth_sanity_uses_shared_cyl_ref():
 
 # ── Bonus: equilibrium useful gate AND/OR semantics ───────────────
 
+def test_E2_filters_top3_useful_by_profile_hash(tmp_path):
+    """Regression: E2 must match E1.pairs[*].profile_hash with
+    confirm.top6.candidates[*].profile_id (both are the same hash, but
+    keys differ by dataset — breaking this is a KeyError crash)."""
+    import json
+    import os
+
+    base = tmp_path / "results" / "coexp" / "foo"
+    (base / "confirm").mkdir(parents=True)
+    (base / "equilibrium").mkdir(parents=True)
+    top6 = dict(
+        schema_version=SCHEMA_VERSION, top_n=6, score_key="J_screen",
+        candidates=[dict(profile_id=f"h{i:02d}",
+                         family="two_lobe",
+                         profile_spec=dict(family="two_lobe",
+                             params={"A2": 0.05, "phi2_deg": 10.0 + i}),
+                         J_screen=0.1 - i * 0.01)
+                    for i in range(6)],
+    )
+    with open(base / "confirm" / "top6_confirmed.json", "w") as f:
+        json.dump(top6, f)
+    e1 = dict(
+        schema_version=SCHEMA_VERSION, phase="equilibrium_E1",
+        pairs=[dict(profile_hash=f"h{i:02d}",
+                    experiment_id=f"exp_{i}",
+                    profile_spec=top6["candidates"][i]["profile_spec"],
+                    smooth=None, textured=None,
+                    smooth_accepted=True, textured_accepted=True,
+                    ratios=dict(h_r=1.01, p_r=0.99, f_r=1.005, c_d=0.001),
+                    J_eq=0.5 - 0.1 * i,
+                    useful=(i in (0, 2, 4)))
+               for i in range(6)],
+        any_useful=True, n_useful=3,
+    )
+    with open(base / "equilibrium" / "equilibrium_summary.json", "w") as f:
+        json.dump(e1, f)
+
+    # Replicate E2 filter from run_coexp_equilibrium.main()
+    with open(base / "equilibrium" / "equilibrium_summary.json") as f:
+        e1_loaded = json.load(f)
+    useful_ids = {p["profile_hash"] for p in e1_loaded["pairs"]
+                  if p.get("useful")}
+    assert useful_ids == {"h00", "h02", "h04"}
+
+    sorted_e1 = sorted(
+        [p for p in e1_loaded["pairs"] if p.get("useful")],
+        key=lambda p: (p.get("J_eq") or 0.0), reverse=True)
+    top3_ids = {p["profile_hash"] for p in sorted_e1[:3]}
+    assert top3_ids == {"h00", "h02", "h04"}
+
+    # Cross-reference to top6.profile_id must succeed (no KeyError)
+    with open(base / "confirm" / "top6_confirmed.json") as f:
+        top6_loaded = json.load(f)
+    filtered = [c for c in top6_loaded["candidates"]
+                if c["profile_id"] in top3_ids]
+    assert {c["profile_id"] for c in filtered} == {"h00", "h02", "h04"}
+
+
 def test_equilibrium_useful_strict_gate():
     base = dict(h_r=1.006, p_r=0.99, f_r=1.01, c_d=0.0)
     assert equilibrium_useful(base) is True

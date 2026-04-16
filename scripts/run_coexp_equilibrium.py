@@ -86,15 +86,18 @@ def main():
             sys.exit(1)
         with open(e1_summary, "r", encoding="utf-8") as f:
             e1 = json.load(f)
-        useful_ids = {p["profile_id"] for p in e1["pairs"]
+        # E1 pair dicts use `profile_hash`; top6 candidates use
+        # `profile_id`. Обе величины это один и тот же hash (см.
+        # make_experiment_spec → profile_id = profile.hash()).
+        useful_ids = {p["profile_hash"] for p in e1["pairs"]
                       if p.get("useful")}
         if not useful_ids:
             print("E2 skipped: нет useful candidates в E1.")
             sys.exit(0)
         sorted_e1 = sorted(
             [p for p in e1["pairs"] if p.get("useful")],
-            key=lambda p: p.get("J_eq", 0.0), reverse=True)
-        top3_ids = {p["profile_id"]
+            key=lambda p: (p.get("J_eq") or 0.0), reverse=True)
+        top3_ids = {p["profile_hash"]
                      for p in sorted_e1[:EQUILIBRIUM_FINE_TOP_N]}
         candidates = [c for c in candidates
                       if c["profile_id"] in top3_ids]
