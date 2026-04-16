@@ -180,8 +180,15 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
     eps = float(np.sqrt(X**2 + Y**2))
     attitude = float(np.rad2deg(np.arctan2(Y, X)))
     e_resist = -W_applied / max(Wa_norm, 1e-20)
+    # Convention: F_hydro и F_mag в коде — силы "на bearing/housing"
+    # (compute_hydro_force = -∫P·cos dA). Force balance: F_h + F_m = W.
+    # Therefore F_h·ê_resist = (W − F_m)·(−W/|W|) = −|W| − F_m·(−W/|W|),
+    # то есть (F_h·ê_resist)/|W| = −1 + (F_m·ê_resist)/|W|.
+    # "Hydro_share" как ДОЛЯ applied load, несомая гидродинамикой:
+    #     hydro_share = −(F_h·ê_resist)/|W|
+    # тогда hydro_share + unload_share = 1 при идеальном равновесии.
     unload = float((Fx_m * e_resist[0] + Fy_m * e_resist[1]) / max(Wa_norm, 1e-20))
-    hydro_share = float((Fx_h * e_resist[0] + Fy_h * e_resist[1]) / max(Wa_norm, 1e-20))
+    hydro_share = float(-(Fx_h * e_resist[0] + Fy_h * e_resist[1]) / max(Wa_norm, 1e-20))
 
     return EquilibriumResult(
         X=float(X), Y=float(Y), eps=eps, attitude_deg=attitude,
