@@ -146,10 +146,15 @@ def solve_equilibrium_pair(
         tol_accept: float = DEFAULT_TOL_ACCEPT,
         step_cap: float = DEFAULT_STEP_CAP,
         eps_max: float = DEFAULT_EPS_MAX,
+        max_iter: int = 80,
 ) -> Dict[str, Any]:
     """Solve smooth+textured equilibrium на ОДНОМ bore profile.
 
     NR seed для обоих case — (EQUILIBRIUM_NR_SEED_X0/Y0). Магнит OFF.
+
+    max_iter forwards to find_equilibrium; diagnostic runs may raise it
+    (e.g. 200) to let NR escape high-ε regions. Pure passthrough —
+    никаких изменений NR-логики.
     """
     pair = make_H_pair_builders(
         experiment, R, L, c, sigma,
@@ -170,7 +175,7 @@ def solve_equilibrium_pair(
             H_and_force, zero_mag, W_applied,
             X0=EQUILIBRIUM_NR_SEED_X0, Y0=EQUILIBRIUM_NR_SEED_Y0,
             tol=tol_accept, step_cap=step_cap, eps_max=eps_max,
-            tol_accept=tol_accept)
+            tol_accept=tol_accept, max_iter=int(max_iter))
         return r
 
     rs = _solve(pair.smooth)
