@@ -51,16 +51,18 @@ class EquilibriumResult:
 
 def _line_search(X, Y, dX, dY, mag_model, W_applied,
                   H_and_force, current_rel_R,
-                  max_backtracks=12, eps_max=0.90):
-    """Geometric-only halving.
+                  max_backtracks=12, eps_max=0.90,
+                  armijo_c=1e-4):
+    """Backtracking line search с Armijo-условием по ‖R‖.
 
-    Принимает наибольший λ ∈ {1, 0.5, 0.25, ...}, при котором ε_new
-    < eps_max. Residual не проверяется — доверяем step_cap для
-    масштабирования шага.
+    Принимает наибольший λ ∈ {1, 0.5, 0.25, ...}, при котором:
+      1. ε_new < eps_max
+      2. rel_R_new ≤ current_rel_R · (1 − armijo_c · λ)
+         (мягкое уменьшение residual; armijo_c=1e-4 стандарт)
 
-    Returns (X_new, Y_new, rel_R, Fx_h, Fy_h, Fx_m, Fy_m,
-             h_min, p_max, cav, fr, lam) или None если eps не
-    помещается даже при лямбда=1/2^max_backtracks.
+    Returns (X_new, Y_new, rel_R_new, Fx_h, Fy_h, Fx_m, Fy_m,
+             h_min, p_max, cav, fr, lam) или None если ни один λ
+    не прошёл оба условия.
     """
     Wa_norm = float(np.linalg.norm(W_applied))
     lam = 1.0
@@ -76,8 +78,11 @@ def _line_search(X, Y, dX, dY, mag_model, W_applied,
         Rx = Fx_h + Fx_m - W_applied[0]
         Ry = Fy_h + Fy_m - W_applied[1]
         rel_R = np.sqrt(Rx**2 + Ry**2) / max(Wa_norm, 1e-20)
-        return (X_try, Y_try, rel_R, Fx_h, Fy_h, Fx_m, Fy_m,
-                h_min, p_max, cav, fr, lam)
+        # Armijo condition: residual должен уменьшаться
+        if rel_R <= current_rel_R * (1.0 - armijo_c * lam):
+            return (X_try, Y_try, rel_R, Fx_h, Fy_h, Fx_m, Fy_m,
+                    h_min, p_max, cav, fr, lam)
+        lam *= 0.5
     return None
 
 
