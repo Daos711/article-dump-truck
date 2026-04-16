@@ -51,7 +51,7 @@ OMEGA = 2 * np.pi * params.n / 60.0
 P_SCALE = 6 * ETA * OMEGA * (params.R / params.c) ** 2
 F0 = P_SCALE * params.R * params.L
 
-UNLOAD_SHARE_TARGETS = [0.0, 0.025, 0.05, 0.10, 0.20, 0.30]
+UNLOAD_SHARE_TARGETS = [0.0, 0.025, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50]
 
 # Единый acceptance tolerance. Записывается в manifest и повторно
 # используется textured compare / plot.
@@ -126,7 +126,25 @@ def main():
                              "used by smooth AND textured compare")
     parser.add_argument("--step-cap", type=float, default=STEP_CAP)
     parser.add_argument("--eps-max", type=float, default=EPS_MAX)
+    parser.add_argument("--unload-targets", type=str, default=None,
+                        help="comma-separated unload_share targets, "
+                             "e.g. '0,0.05,0.1,0.2,0.3,0.4,0.5'. Must "
+                             "start with 0.0 (needed for baseline_canonical). "
+                             "Default: built-in UNLOAD_SHARE_TARGETS")
     args = parser.parse_args()
+
+    if args.unload_targets is not None:
+        try:
+            targets = [float(x) for x in args.unload_targets.split(",") if x.strip()]
+        except ValueError as e:
+            print(f"FAIL: не могу распарсить --unload-targets: {e}")
+            sys.exit(1)
+        if not targets or abs(targets[0]) > 1e-12:
+            print("FAIL: --unload-targets должен начинаться с 0.0 "
+                  "(нужно для baseline_canonical)")
+            sys.exit(1)
+    else:
+        targets = list(UNLOAD_SHARE_TARGETS)
 
     run_id = args.run_id or make_run_id(
         args.model, args.n_phi, args.n_z, args.W_y_share)
@@ -145,7 +163,7 @@ def main():
     print(f"SMOOTH PUMP + RADIAL MAG UNLOAD (model={args.model})")
     print(f"Сетка {args.n_phi}×{args.n_z}, "
           f"W_applied=(0, {-args.W_y_share*F0:.1f}) Н, F₀={F0:.0f}Н")
-    print(f"unload_share targets: {UNLOAD_SHARE_TARGETS}")
+    print(f"unload_share targets: {targets}")
     print(f"tol_accept={args.tol_accept}, step_cap={args.step_cap}, "
           f"eps_max={args.eps_max}")
     print("=" * 72)
@@ -184,7 +202,7 @@ def main():
 
     print("\nContinuation...")
     cont = run_continuation(
-        UNLOAD_SHARE_TARGETS, base_raw.X, base_raw.Y, W_applied,
+        targets, base_raw.X, base_raw.Y, W_applied,
         template, H_and_force,
         tol=args.tol_accept,
         step_cap=args.step_cap, eps_max=args.eps_max,
@@ -289,7 +307,7 @@ def main():
             "tol_accept": float(args.tol_accept),
             "step_cap": float(args.step_cap),
             "eps_max": float(args.eps_max),
-            "targets": [float(t) for t in UNLOAD_SHARE_TARGETS],
+            "targets": [float(t) for t in targets],
         },
         "baseline_raw": result_to_dict(base_raw),
         "baseline_canonical": result_to_dict(base_canonical),
