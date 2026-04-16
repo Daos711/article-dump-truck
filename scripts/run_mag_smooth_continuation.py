@@ -278,7 +278,8 @@ def main():
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "model": args.model,
-        "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+        "created_utc": datetime.datetime.now(
+            datetime.timezone.utc).isoformat(),
         "config": {
             "N_phi": int(args.n_phi),
             "N_Z": int(args.n_z),
