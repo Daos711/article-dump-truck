@@ -88,8 +88,8 @@ def _line_search(X, Y, dX, dY, mag_model, W_applied,
 
 def find_equilibrium(H_and_force, mag_model, W_applied,
                       X0=0.0, Y0=-0.4,
-                      max_iter=50, tol=1e-4,
-                      step_cap=0.05, eps_max=0.90):
+                      max_iter=80, tol=1e-4,
+                      step_cap=0.10, eps_max=0.90):
     """Newton-Raphson 2D с line search.
 
     Parameters
@@ -106,7 +106,9 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
     """
     Wa_norm = float(np.linalg.norm(W_applied))
     X, Y = float(X0), float(Y0)
-    dXY = 1e-5
+    # FD step: PS solver tol=1e-6, поэтому dXY слишком малый даёт
+    # noise ~tol/dXY. Используем 1e-3 для стабильного Jacobian.
+    dXY = 1e-3
 
     # Init evaluation
     Fx_h, Fy_h, h_min, p_max, cav_frac, friction, P, theta = H_and_force(X, Y)
@@ -177,7 +179,7 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
                       mag_model_template, H_and_force,
                       X0_seed=None, Y0_seed=None,
                       min_substep=0.01, tol=1e-3,
-                      step_cap=0.05, eps_max=0.90,
+                      step_cap=0.10, eps_max=0.90,
                       verbose=True):
     """Continuation по списку unload_share_target.
 

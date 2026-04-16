@@ -221,7 +221,7 @@ def main():
         rs = find_equilibrium(
             H_and_force_smooth, m_smooth, W_applied,
             X0=X_prev_s, Y0=Y_prev_s,
-            tol=1e-3, step_cap=0.05, eps_max=0.90)
+            tol=1e-3, step_cap=0.10, eps_max=0.90)
         dt_s = time.time() - t0
         rs.unload_share_target = target
 
@@ -231,7 +231,7 @@ def main():
             rt = find_equilibrium(
                 H_and_force_tex, m_tex, W_applied,
                 X0=X_prev_t, Y0=Y_prev_t,
-                tol=1e-3, step_cap=0.05, eps_max=0.90)
+                tol=1e-3, step_cap=0.10, eps_max=0.90)
             dt_t = time.time() - t0
             rt.unload_share_target = target
             accepted_flag = (rt.converged and rt.rel_residual < 1e-3)

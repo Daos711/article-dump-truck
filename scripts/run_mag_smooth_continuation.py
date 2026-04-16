@@ -158,7 +158,7 @@ def main():
     cont = run_continuation(
         UNLOAD_SHARE_TARGETS, base.X, base.Y, W_applied,
         template, H_and_force,
-        step_cap=0.05, eps_max=0.90, verbose=True)
+        step_cap=0.10, eps_max=0.90, verbose=True)
 
     # --- Acceptance checks ---
     print("\n" + "=" * 72)
