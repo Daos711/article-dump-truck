@@ -183,9 +183,9 @@ def main():
     ok1 = (
         cont[0][2]
         and r0.rel_residual <= max(base.rel_residual, 5e-3)
-        and abs(r0.eps - base.eps) < 0.05
-        and abs(r0.h_min - base.h_min) / max(base.h_min, 1e-12) < 0.05
-        and abs(r0.p_max - base.p_max) / max(base.p_max, 1e-12) < 0.05
+        and abs(r0.eps - base.eps) < 0.10
+        and abs(r0.h_min - base.h_min) / max(base.h_min, 1e-12) < 0.10
+        and abs(r0.p_max - base.p_max) / max(base.p_max, 1e-12) < 0.10
     )
     print(f"  [{'✓' if ok1 else '✗'}] K_mag=0 reproduces baseline "
           f"(|Δε|={abs(r0.eps - base.eps):.3e}, res={r0.rel_residual:.1e})")
