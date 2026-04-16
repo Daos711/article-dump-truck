@@ -195,14 +195,12 @@ def main():
     ok2 = all(r.unload_share_actual > 0 for t, r in accepted if t > 0)
     print(f"  [{'✓' if ok2 else '✗'}] unload_share_actual > 0 на accepted")
 
-    # ε монотонно не возрастает — ЭТО ФИЗ. РЕЗУЛЬТАТ (не баг).
-    # Если ε растёт с unload — радиальная разгрузка толкает вал по
-    # normal direction, и hydrodynamic attitude shift увеличивает
-    # total offset. Это один из допустимых answers ТЗ v3.
+    # ε монотонно не возрастает — обязательное поведение после
+    # bug v3 fix (F_mag sign в residual).
     eps_seq = [r.eps for t, r in accepted]
     ok3 = all(eps_seq[i+1] <= eps_seq[i] + 1e-3
               for i in range(len(eps_seq) - 1))
-    print(f"  [{'✓ ε decreasing' if ok3 else '✗ ε increasing (see note)'}] "
+    print(f"  [{'✓' if ok3 else '✗'}] ε монотонно не возрастает: "
           f"{[f'{e:.4f}' for e in eps_seq]}")
 
     # rel_residual < BASELINE_TOL (relaxed from 1e-3 due to FD noise)

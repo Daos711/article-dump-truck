@@ -75,8 +75,9 @@ def _line_search(X, Y, dX, dY, mag_model, W_applied,
             continue
         Fx_h, Fy_h, h_min, p_max, cav, fr, P, theta = H_and_force(X_try, Y_try)
         Fx_m, Fy_m = mag_model.force(X_try, Y_try)
-        Rx = Fx_h + Fx_m - W_applied[0]
-        Ry = Fy_h + Fy_m - W_applied[1]
+        # F_mag with minus sign (force-to-centre convention)
+        Rx = Fx_h - Fx_m - W_applied[0]
+        Ry = Fy_h - Fy_m - W_applied[1]
         rel_R = np.sqrt(Rx**2 + Ry**2) / max(Wa_norm, 1e-20)
         # Armijo condition: residual должен уменьшаться
         if rel_R <= current_rel_R * (1.0 - armijo_c * lam):
@@ -113,8 +114,11 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
     # Init evaluation
     Fx_h, Fy_h, h_min, p_max, cav_frac, friction, P, theta = H_and_force(X, Y)
     Fx_m, Fy_m = mag_model.force(X, Y)
-    Rx = Fx_h + Fx_m - W_applied[0]
-    Ry = Fy_h + Fy_m - W_applied[1]
+    # Convention: F_hydro в коде — "load supported by film" (one sign),
+    # F_mag в коде — физическая сила на цапфу (force-to-centre).
+    # Балансирование в одной системе: F_mag входит со знаком минус.
+    Rx = Fx_h - Fx_m - W_applied[0]
+    Ry = Fy_h - Fy_m - W_applied[1]
     rel_R = np.sqrt(Rx**2 + Ry**2) / max(Wa_norm, 1e-20)
     n_it = 0
     converged = False
@@ -137,8 +141,9 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
             Fxm_p, Fym_p = mag_model.force(X + dX_, Y + dY_)
             Fxn, Fyn, _, _, _, _, _, _ = H_and_force(X - dX_, Y - dY_)
             Fxm_n, Fym_n = mag_model.force(X - dX_, Y - dY_)
-            J[0, col] = ((Fxp + Fxm_p) - (Fxn + Fxm_n)) / (2.0 * dXY)
-            J[1, col] = ((Fyp + Fym_p) - (Fyn + Fym_n)) / (2.0 * dXY)
+            # F_mag with minus sign (see convention above)
+            J[0, col] = ((Fxp - Fxm_p) - (Fxn - Fxm_n)) / (2.0 * dXY)
+            J[1, col] = ((Fyp - Fym_p) - (Fyn - Fym_n)) / (2.0 * dXY)
 
         det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
         if abs(det) < 1e-30:
@@ -180,13 +185,19 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
     eps = float(np.sqrt(X**2 + Y**2))
     attitude = float(np.rad2deg(np.arctan2(Y, X)))
     e_resist = -W_applied / max(Wa_norm, 1e-20)
-    # Convention: F_hydro и F_mag в коде — силы "на bearing/housing"
-    # (compute_hydro_force = -∫P·cos dA). Force balance: F_h + F_m = W.
-    # Therefore F_h·ê_resist = (W − F_m)·(−W/|W|) = −|W| − F_m·(−W/|W|),
-    # то есть (F_h·ê_resist)/|W| = −1 + (F_m·ê_resist)/|W|.
-    # "Hydro_share" как ДОЛЯ applied load, несомая гидродинамикой:
-    #     hydro_share = −(F_h·ê_resist)/|W|
-    # тогда hydro_share + unload_share = 1 при идеальном равновесии.
+    # Force balance (bug v3 fix): F_hydro − F_mag = W_applied, where
+    # F_hydro is "load supported by film" (same-direction as W_applied),
+    # and F_mag is physical force on journal (force-to-centre).
+    #
+    # hydro_share = ДОЛЯ applied load, несомая плёнкой:
+    #     hydro_share = (F_h · (-ê_resist)) / |W| = (F_h · W/|W|) / |W|
+    # Но ê_resist = -W/|W|, поэтому hydro_share = -(F_h · ê_resist)/|W|.
+    # С учётом F_hydro в "load supported" convention (направлен ПО W)
+    # hydro_share ≈ +1 при baseline.
+    #
+    # unload_share = ДОЛЯ applied load, несомая магнитом:
+    # F_mag направлен ПРОТИВ W (разгрузка), так (F_m · ê_resist)/|W| > 0
+    # при baseline ε>0.
     unload = float((Fx_m * e_resist[0] + Fy_m * e_resist[1]) / max(Wa_norm, 1e-20))
     hydro_share = float(-(Fx_h * e_resist[0] + Fy_h * e_resist[1]) / max(Wa_norm, 1e-20))
 
