@@ -111,7 +111,10 @@ def main():
     bref_list = args.bref if args.bref is not None else BREF_SWEEP
 
     # ── Validate Stage A manifest ────────────────────────────────
-    manifest_A_path = os.path.join(args.stageA,
+    from cases.gu_loaded_side.schema import resolve_stage_dir
+    stageA_dir = resolve_stage_dir(args.stageA)
+    stageB_dir = resolve_stage_dir(args.stageB)
+    manifest_A_path = os.path.join(stageA_dir,
                                    "working_geometry_manifest.json")
     with open(manifest_A_path, encoding="utf-8") as f:
         manifest_A = json.load(f)
@@ -123,7 +126,7 @@ def main():
     loadcases = manifest_A["loadcases"]
 
     # ── Validate Stage B manifest ────────────────────────────────
-    manifest_B_path = os.path.join(args.stageB, "partial_manifest.json")
+    manifest_B_path = os.path.join(stageB_dir, "partial_manifest.json")
     with open(manifest_B_path, encoding="utf-8") as f:
         manifest_B = json.load(f)
     if manifest_B.get("schema_version") != SCHEMA:
@@ -132,7 +135,7 @@ def main():
         sys.exit(1)
 
     # ── Read best partial patterns ───────────────────────────────
-    best_path = os.path.join(args.stageB, "partial_best_by_loadcase.json")
+    best_path = os.path.join(stageB_dir, "partial_best_by_loadcase.json")
     with open(best_path, encoding="utf-8") as f:
         best_by_lc = json.load(f)
 

@@ -173,7 +173,11 @@ def main():
     bref_list = args.bref if args.bref is not None else BREF_SWEEP
 
     # ── Validate Stage A manifest ────────────────────────────────
-    manifest_A_path = os.path.join(args.stageA,
+    from cases.gu_loaded_side.schema import resolve_stage_dir
+    stageA_dir = resolve_stage_dir(args.stageA)
+    stageB_dir = resolve_stage_dir(args.stageB)
+    stageC_dir = resolve_stage_dir(args.stageC)
+    manifest_A_path = os.path.join(stageA_dir,
                                    "working_geometry_manifest.json")
     with open(manifest_A_path, encoding="utf-8") as f:
         manifest_A = json.load(f)
@@ -185,7 +189,7 @@ def main():
     loadcases = manifest_A["loadcases"]
 
     # ── Read anchor CSV (conv_nomag from Stage A) ────────────────
-    anchor_csv = os.path.join(args.stageA, "anchor_cases.csv")
+    anchor_csv = os.path.join(stageA_dir, "anchor_cases.csv")
     anchors_by_lc: Dict[str, Dict[str, Any]] = {}
     with open(anchor_csv, encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -195,7 +199,7 @@ def main():
             }
 
     # ── Validate Stage B manifest ────────────────────────────────
-    manifest_B_path = os.path.join(args.stageB, "partial_manifest.json")
+    manifest_B_path = os.path.join(stageB_dir, "partial_manifest.json")
     with open(manifest_B_path, encoding="utf-8") as f:
         manifest_B = json.load(f)
     if manifest_B.get("schema_version") != SCHEMA:
@@ -203,12 +207,12 @@ def main():
               f"(expected {SCHEMA}, got {manifest_B.get('schema_version')})")
         sys.exit(1)
 
-    best_path = os.path.join(args.stageB, "partial_best_by_loadcase.json")
+    best_path = os.path.join(stageB_dir, "partial_best_by_loadcase.json")
     with open(best_path, encoding="utf-8") as f:
         best_by_lc = json.load(f)
 
     # ── Validate Stage C manifest ────────────────────────────────
-    manifest_C_path = os.path.join(args.stageC,
+    manifest_C_path = os.path.join(stageC_dir,
                                    "sector_magnet_manifest.json")
     with open(manifest_C_path, encoding="utf-8") as f:
         manifest_C = json.load(f)
@@ -218,7 +222,7 @@ def main():
         sys.exit(1)
 
     # ── Read Stage C results for conv_mag lookup ─────────────────
-    stageC_csv = os.path.join(args.stageC, "sector_magnet_results.csv")
+    stageC_csv = os.path.join(stageC_dir, "sector_magnet_results.csv")
     stageC_rows: Dict[str, Dict[float, Dict[str, Any]]] = {}
     with open(stageC_csv, encoding="utf-8") as f:
         for row in csv.DictReader(f):

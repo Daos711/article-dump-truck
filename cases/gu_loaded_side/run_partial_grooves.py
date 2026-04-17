@@ -147,7 +147,9 @@ def main():
     args = parser.parse_args()
 
     # ── Validate Stage A manifest ─────────────────────────────────
-    manifest_A_path = os.path.join(args.stageA, "working_geometry_manifest.json")
+    from cases.gu_loaded_side.schema import resolve_stage_dir
+    stageA_dir = resolve_stage_dir(args.stageA)
+    manifest_A_path = os.path.join(stageA_dir, "working_geometry_manifest.json")
     with open(manifest_A_path, encoding="utf-8") as f:
         manifest_A = json.load(f)
     if manifest_A.get("schema_version") != SCHEMA:
@@ -158,7 +160,7 @@ def main():
     loadcases = manifest_A["loadcases"]
 
     # ── Read anchor CSV for feasibility thresholds ────────────────
-    anchor_csv = os.path.join(args.stageA, "anchor_cases.csv")
+    anchor_csv = os.path.join(stageA_dir, "anchor_cases.csv")
     anchors_by_lc: Dict[str, Dict[str, Any]] = {}
     with open(anchor_csv, encoding="utf-8") as f:
         for row in csv.DictReader(f):
