@@ -60,3 +60,16 @@ def working_geometry_dict() -> Dict[str, Any]:
 def groove_geometry_dict() -> Dict[str, Any]:
     return dict(w_g_mm=w_g * 1e3, L_g_mm=L_g * 1e3,
                 d_g_um=d_g * 1e6, beta_deg=beta_deg, N_g=N_g)
+
+
+# ── PS warmup (§5.3) ──────────────────────────────────────────────
+HS_WARMUP_ITER = 200_000
+HS_WARMUP_TOL = 1e-5
+
+
+def ps_solve(ps_fn, H, d_phi, d_Z, R_val, L_val):
+    """Wrapper: call PS solver with strict HS warmup params."""
+    return ps_fn(H, d_phi, d_Z, R_val, L_val,
+                 tol=1e-6, max_iter=10_000_000,
+                 hs_warmup_iter=HS_WARMUP_ITER,
+                 hs_warmup_tol=HS_WARMUP_TOL)
