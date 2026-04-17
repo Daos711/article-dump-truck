@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 
-SCHEMA = "gu_loaded_side_v1"
+SCHEMA = "gu_loaded_side_v1_1"
 
 
 def resolve_stage_dir(path: str) -> str:
@@ -17,7 +17,7 @@ def resolve_stage_dir(path: str) -> str:
     return path
 
 TOL_HARD = 5e-3
-TOL_SOFT = 5e-2
+TOL_SOFT = 2e-2
 
 
 def classify_status(rel_residual: float, converged: bool) -> str:

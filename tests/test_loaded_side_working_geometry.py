@@ -34,6 +34,6 @@ def test_anchor_loadcases_consistent():
         "LOADCASE_NAMES / EPS_REF length mismatch")
 
 
-def test_schema_is_gu_loaded_side_v1():
-    """Schema constant must be 'gu_loaded_side_v1'."""
-    assert SCHEMA == "gu_loaded_side_v1", f"SCHEMA={SCHEMA!r}"
+def test_schema_is_gu_loaded_side_v1_1():
+    """Schema constant must be 'gu_loaded_side_v1_1'."""
+    assert SCHEMA == "gu_loaded_side_v1_1", f"SCHEMA={SCHEMA!r}"

@@ -36,11 +36,11 @@ EPS_REF = [0.2, 0.5, 0.8]
 LOADCASE_NAMES = ["L20", "L50", "L80"]
 
 # ── Solver ──────────────────────────────────────────────────────
-GRID_CONFIRM = (1200, 300)   # scaled for L/D=0.40: N_Z = 300*(0.40/0.30)=400
+GRID_CONFIRM = (1200, 400)
 GRID_COARSE = (800, 268)
 
-MAX_ITER_NR = 120
-STEP_CAP = 0.10
+MAX_ITER_NR = 400
+STEP_CAP = 0.05
 EPS_MAX = 0.90
 
 # ── B_ref sweep (Stages C/D) ───────────────────────────────────

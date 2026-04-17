@@ -76,17 +76,22 @@ class EmbeddedGrooveSectorMagnetModel:
         ) ** self.n_mag
 
     def force(self, X: float, Y: float) -> Tuple[float, float]:
-        """Per-magnet vector sum.
+        """Per-magnet attractive vector sum.
 
-        Each magnet at phi_i pushes in u_i = (-cos phi_i, -sin phi_i).
+        Each magnet at phi_i attracts the journal TOWARD that wall:
+            u_i = (+cos phi_i, +sin phi_i)
+
+        For unloaded-side magnets this pulls the journal away from the
+        loaded wall → unloading effect. For loaded-side magnets this
+        pulls INTO the load → adverse (expected, diagnostic only).
         """
         X, Y = float(X), float(Y)
         Fx, Fy = 0.0, 0.0
         for phi_i in self.phi_centers:
             g_i = self._local_gap(phi_i, X, Y)
             F_i = self._force_one(g_i)
-            Fx += F_i * (-math.cos(phi_i))
-            Fy += F_i * (-math.sin(phi_i))
+            Fx += F_i * math.cos(phi_i)
+            Fy += F_i * math.sin(phi_i)
         return Fx, Fy
 
     def force_breakdown(self, X: float, Y: float) -> List[Dict[str, float]]:
@@ -99,8 +104,8 @@ class EmbeddedGrooveSectorMagnetModel:
                 phi_deg=float(math.degrees(phi_i)),
                 g_um=float(g_i * 1e6),
                 F_N=float(F_i),
-                Fx=F_i * (-math.cos(phi_i)),
-                Fy=F_i * (-math.sin(phi_i)),
+                Fx=F_i * math.cos(phi_i),
+                Fy=F_i * math.sin(phi_i),
             ))
         return out
 
@@ -142,11 +147,14 @@ def sanity_checks_sector_model(verbose: bool = False) -> Tuple[bool, List[str]]:
     msgs = []
     ok = True
 
-    # Use 3-cell loaded-side subset centered at phi=pi (bottom)
+    # Use 3-cell UNLOADED-side subset. For Y<0 anchor the loaded side
+    # is at phi≈pi/2 (where H is min); unloaded is at phi≈3pi/2.
+    cell_span = 2 * math.pi / 10
+    phi_unloaded = 3 * math.pi / 2  # opposite of loaded side
     centers = np.array([
-        math.pi - 2 * math.pi / 10,
-        math.pi,
-        math.pi + 2 * math.pi / 10,
+        phi_unloaded - cell_span,
+        phi_unloaded,
+        phi_unloaded + cell_span,
     ])
 
     # 1. B=0 → zero
@@ -167,19 +175,21 @@ def sanity_checks_sector_model(verbose: bool = False) -> Tuple[bool, List[str]]:
                 f"{[f'{f:.3f}' for f in Fs]}")
     ok = ok and c2
 
-    # 3. Directional check for loaded-side subset at anchor (0, -0.5)
-    # With magnets near phi=pi (close to min-gap for Y<0), force pushes
-    # in +X direction (away from that wall in XY space). This may or may
-    # not align with e_resist depending on load direction. For a pure
-    # loaded-side subset the per-magnet vector sum is NOT guaranteed to
-    # produce W·e_resist > 0 (Earnshaw constraint). We report the sign
-    # as INFO, not as a blocking test.
+    # 3. Unloaded-side attractive magnets should pull journal TOWARD
+    # unloaded wall (phi≈3pi/2 for Y<0 anchor). With attractive model
+    # u_i = (cos phi_i, sin phi_i), magnets near 3pi/2 → Fy < 0.
+    # For load in -Y → e_resist = (0, +1). But the unloaded-side pull
+    # is in -Y too. This actually reduces the needed hydro support:
+    # the equilibrium equation is F_h + F_mag = W_applied. If F_mag
+    # pulls in -Y (same as W_applied), then F_h needs to compensate
+    # LESS → lower eps → unloading effect.
+    # Check: Fy_mag < 0 for unloaded subset at Y<0 anchor (expected).
     m3 = make_sector_magnet_model(centers, 40e-6, 50e-6, B_ref_T=0.5)
     Fx3, Fy3 = m3.force(0.0, -0.5)
-    Fmag = math.sqrt(Fx3 ** 2 + Fy3 ** 2)
-    msgs.append(f"  [i] loaded-side force direction: "
-                f"Fx={Fx3:.4f}, Fy={Fy3:.4f}, |F|={Fmag:.4f} "
-                f"(INFO: sign depends on subset vs load geometry)")
+    c3 = Fy3 < 0
+    msgs.append(f"  [{'✓' if c3 else '✗'}] unloaded-side pull: "
+                f"Fy={Fy3:.4f} < 0 (pulls toward unloaded wall)")
+    ok = ok and c3
 
     # 4. vector sum ≠ radial surrogate for asymmetric subset
     from models.groove_magnet_force import make_groove_magnet_model
@@ -198,9 +208,43 @@ def sanity_checks_sector_model(verbose: bool = False) -> Tuple[bool, List[str]]:
     return ok, msgs
 
 
+def build_active_subset(all_phi_centers: np.ndarray,
+                         phi_center_deg: float,
+                         N_active: int) -> np.ndarray:
+    """Select N_active contiguous cells nearest to phi_center_deg.
+
+    Returns array of phi values (rad) for the active subset.
+    """
+    N_g = len(all_phi_centers)
+    phi_c = math.radians(float(phi_center_deg))
+    dists = np.abs(np.mod(all_phi_centers - phi_c + math.pi,
+                          2 * math.pi) - math.pi)
+    center_idx = int(np.argmin(dists))
+    half = N_active // 2
+    indices = [(center_idx + k) % N_g
+               for k in range(-half, N_active - half)]
+    return all_phi_centers[indices]
+
+
+def get_placement_center_deg(phi_loaded_deg: float,
+                              mode: str) -> float:
+    """Return magnet center angle for given placement mode.
+
+    * 'unloaded' → phi_loaded + 180°
+    * 'loaded'   → phi_loaded (diagnostic only)
+    """
+    if mode == "unloaded":
+        return (float(phi_loaded_deg) + 180.0) % 360.0
+    if mode == "loaded":
+        return float(phi_loaded_deg)
+    raise ValueError(f"unknown placement mode: {mode!r}")
+
+
 __all__ = [
     "EmbeddedGrooveSectorMagnetModel",
     "compute_Fref_from_Bref",
     "make_sector_magnet_model",
+    "build_active_subset",
+    "get_placement_center_deg",
     "sanity_checks_sector_model",
 ]

@@ -35,13 +35,13 @@ def test_classify_status_thresholds():
     assert classify_status(4e-3, converged=True) == "hard_converged", (
         "4e-3 with converged=True should be hard_converged")
 
-    # 3e-2 is between TOL_HARD and TOL_SOFT (5e-2) -> soft_converged
-    assert classify_status(3e-2, converged=True) == "soft_converged", (
-        "3e-2 with converged=True should be soft_converged")
+    # 1.5e-2 is between TOL_HARD (5e-3) and TOL_SOFT (2e-2) -> soft_converged
+    assert classify_status(1.5e-2, converged=True) == "soft_converged", (
+        "1.5e-2 with converged=True should be soft_converged")
 
-    # 0.1 > TOL_SOFT -> failed (even though converged flag is True)
-    assert classify_status(0.1, converged=True) == "failed", (
-        "0.1 with converged=True should be failed (exceeds TOL_SOFT)")
+    # 3e-2 > TOL_SOFT (2e-2) -> failed (even though converged flag is True)
+    assert classify_status(3e-2, converged=True) == "failed", (
+        "3e-2 with converged=True should be failed (exceeds TOL_SOFT)")
 
     # Not converged at all -> failed regardless of residual
     assert classify_status(1e-4, converged=False) == "failed", (
