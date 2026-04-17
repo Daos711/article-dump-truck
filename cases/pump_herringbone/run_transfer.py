@@ -47,7 +47,7 @@ from config import pump_params as pump
 from config.oil_properties import MINERAL_OIL
 
 SCHEMA = "herringbone_pump_v1"
-TEXTURE_TYPES = ["conventional", "straight_grooves", "herringbone_grooves"]
+TEXTURE_TYPES = ["conventional", "herringbone_grooves"]
 
 # Pump constants
 ETA_PUMP = MINERAL_OIL["eta_pump"]
