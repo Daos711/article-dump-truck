@@ -216,6 +216,52 @@ def transfer_groove_params(source_ratios: Dict[str, float],
 __all__ = [
     "create_H_with_straight_grooves",
     "create_H_with_herringbone_grooves",
+    "get_herringbone_cell_centers",
+    "create_H_with_herringbone_grooves_subset",
     "gu_groove_params_nondim",
     "transfer_groove_params",
 ]
+
+
+# ─── Cell center helper + subset builder ───────────────────────────
+
+def get_herringbone_cell_centers(N_g: int) -> np.ndarray:
+    """Angular centers of groove cells (rad). Shape (N_g,)."""
+    cell_span = 2.0 * math.pi / int(N_g)
+    return np.array([cell_span * (k + 0.5) for k in range(int(N_g))])
+
+
+def create_H_with_herringbone_grooves_subset(
+        H0: np.ndarray,
+        depth_nondim: float,
+        Phi: np.ndarray, Z: np.ndarray,
+        N_g: int,
+        w_g_nondim: float,
+        L_g_nondim: float,
+        beta_deg: float,
+        active_cells: list,
+) -> np.ndarray:
+    """Like create_H_with_herringbone_grooves but only activates cells
+    whose indices are in `active_cells`.
+
+    active_cells: list of int indices in [0, N_g). Wrap-around is the
+    caller's responsibility (pass already-wrapped indices).
+    """
+    H = np.array(H0, dtype=float)
+    beta = math.radians(float(beta_deg))
+    cell_span = 2.0 * math.pi / N_g
+    L_arm = L_g_nondim / 2.0
+
+    for k in active_cells:
+        k = int(k) % int(N_g)
+        phi_c = cell_span * (k + 0.5)
+        dp = _wrap_phi_distance(Phi, phi_c)
+        Z_c_left = -L_arm / 2.0
+        mask_left = _parallelogram_mask(
+            dp, Z, 0.0, Z_c_left, L_arm, w_g_nondim, +beta)
+        Z_c_right = +L_arm / 2.0
+        mask_right = _parallelogram_mask(
+            dp, Z, 0.0, Z_c_right, L_arm, w_g_nondim, -beta)
+        combined = mask_left | mask_right
+        H[combined] += depth_nondim
+    return H
