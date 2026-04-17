@@ -107,7 +107,6 @@ def main():
         ax.boxplot([by_family[k] for k in labels], labels=labels)
         ax.axhline(0.0, color="gray", ls=":")
         ax.set_ylabel("J_screen")
-        ax.set_title(f"J_screen per family (run {sm['run_id']})")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "screening_J_per_family.png"),
@@ -128,7 +127,6 @@ def main():
         ax.set_xticks(range(len(Js)))
         ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=8)
         ax.set_ylabel("J_screen")
-        ax.set_title(f"Top-12 candidates (run {sm['run_id']})")
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "top12_J_screen.png"), dpi=150)
@@ -150,7 +148,6 @@ def main():
             ax.set_ylabel("J_screen")
             ax.legend()
             ax.grid(True, alpha=0.3)
-            ax.set_title("Confirm: coarse vs fine grid")
             fig.tight_layout()
             fig.savefig(os.path.join(out_dir, "confirm_coarse_vs_fine.png"),
                          dpi=150)
@@ -184,7 +181,6 @@ def main():
         ax.set_ylabel("ratio (textured / smooth)")
         ax.legend()
         ax.grid(True, alpha=0.3, axis="y")
-        ax.set_title(f"Equilibrium ratios (Wy_share={eq['Wy_share']})")
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, "equilibrium_ratios.png"),
                      dpi=150)

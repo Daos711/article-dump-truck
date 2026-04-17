@@ -54,7 +54,6 @@ def main():
         ax.plot(eps_arr, cof_arr, lw=2, markersize=7, **st)
     ax.set_xlabel("Eccentricity ratio ε")
     ax.set_ylabel("COF (Couette-only)")
-    ax.set_title(f"Gu 2020 reproduction — {args.grid} grid")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
