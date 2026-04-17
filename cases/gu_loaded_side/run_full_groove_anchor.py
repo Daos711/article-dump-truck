@@ -228,10 +228,20 @@ def main():
         print(f"Loadcase: {lc_name}  W={Wa_norm:.1f}N")
         print(f"{'='*60}")
 
+        # Warm-start: use eps_source from loadcase as initial guess.
+        # Stage A anchors are fixed-ε conventional cases; start NR
+        # at that ε in the load direction.
+        eps_source = float(lc.get("eps_source", 0.4))
+        Wa_dir = W_applied / max(Wa_norm, 1e-20)
+        X0 = -eps_source * float(Wa_dir[0])
+        Y0 = -eps_source * float(Wa_dir[1])
+        print(f"  NR seed: X0={X0:.4f}, Y0={Y0:.4f} "
+              f"(eps0={math.sqrt(X0**2+Y0**2):.4f})")
+
         t0 = time.time()
         d = solve_groove_equilibrium(
             W_applied, Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
-            groove_params)
+            groove_params, X0=X0, Y0=Y0)
         dt = time.time() - t0
         d["loadcase"] = lc_name
         d["config"] = "groove_nomag"
