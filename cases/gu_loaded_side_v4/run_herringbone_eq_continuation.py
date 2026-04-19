@@ -408,12 +408,6 @@ def main():
         gate = "HB_ACCEPTED_STRONG" if strong else (
             "HB_ACCEPTED_WEAK" if weak else "HB_FIXED_ONLY_NO_EQ")
         print(f"\n  Gate: {gate}  (status={target_row['status']})")
-
-        weak = dCOF <= -3 and dh >= -2
-        strong = dCOF <= -5 and dh >= 0
-        gate = "HB_ACCEPTED_STRONG" if strong else (
-            "HB_ACCEPTED_WEAK" if weak else "HB_FIXED_ONLY_NO_EQ")
-        print(f"  Gate: {gate}")
     elif not target_row:
         gate = "HB_FIXED_ONLY_NO_EQ"
         print(f"\nTarget not reached — chain broken before target")
