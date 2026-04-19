@@ -63,11 +63,20 @@ def build_straight_ramped_relief(
 def build_half_herringbone_ramped_relief(
         Phi, Z, depth_nondim, N_branch_per_side, w_branch_nondim,
         belt_half_nondim, beta_deg=20.0, ramp_frac=0.15,
-        taper_ratio=1.0, apex_radius_frac=0.5):
+        taper_ratio=1.0, apex_radius_frac=0.5,
+        chirality="pump_to_belt"):
+    """Angled branches with chirality control.
+
+    chirality:
+      pump_to_belt — left arm angled to push flow toward Z=0 (standard)
+      pump_to_edge — reversed angle, flow pushed toward ends
+    """
     relief = np.zeros_like(Phi, dtype=float)
     if depth_nondim <= 0 or N_branch_per_side <= 0:
         return relief
     beta = math.radians(float(beta_deg))
+    if chirality == "pump_to_edge":
+        beta = -beta
     cell_span = 2.0 * math.pi / N_branch_per_side
     for k in range(N_branch_per_side):
         phi_c = cell_span * (k + 0.5)
@@ -202,6 +211,7 @@ def build_relief(
         w_branch_nondim, belt_half_nondim,
         beta_deg=20.0, ramp_frac=0.15, taper_ratio=1.0,
         apex_radius_frac=0.5, curvature_k=0.15,
+        chirality="pump_to_belt",
         coverage_mode="full_360",
         protected_lo_deg=105.0, protected_hi_deg=175.0,
         phi_loaded_deg=140.0, adaptive_width_deg=50.0):
@@ -213,7 +223,7 @@ def build_relief(
         relief = build_half_herringbone_ramped_relief(
             Phi, Z, depth_nondim, N_branch_per_side, w_branch_nondim,
             belt_half_nondim, beta_deg, ramp_frac, taper_ratio,
-            apex_radius_frac)
+            apex_radius_frac, chirality)
     elif variant == "arc_ramped":
         relief = build_arc_ramped_relief(
             Phi, Z, depth_nondim, N_branch_per_side, w_branch_nondim,

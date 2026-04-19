@@ -28,9 +28,20 @@ def make_grid(Np, Nz):
     Phi, Zm = np.meshgrid(phi, Z)
     return phi, Z, Phi, Zm, phi[1]-phi[0], Z[1]-Z[0]
 
+_quiet_mode = False
+_ww_count = 0
+
 def _ps_call(H, dp, dz, phi_bc, ps_tol=1e-5, ps_max_iter=300_000):
-    return _ps_fn(H, dp, dz, R, L, tol=ps_tol, max_iter=ps_max_iter,
-                   phi_bc=phi_bc)
+    global _ww_count
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        result = _ps_fn(H, dp, dz, R, L, tol=ps_tol, max_iter=ps_max_iter,
+                         phi_bc=phi_bc)
+    for w in caught:
+        if "warmup" in str(w.message).lower():
+            _ww_count += 1
+    return result
 
 def eval_fixed(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
                ps_tol=1e-5, ps_max_iter=300_000):
@@ -69,11 +80,15 @@ def main():
     pa.add_argument("--belt-list", type=float, nargs="+", default=[0.15])
     pa.add_argument("--taper-list", type=float, nargs="+", default=[1.0,0.6])
     pa.add_argument("--curvature-k-list", type=float, nargs="+", default=[0.15])
+    pa.add_argument("--beta-list", type=float, nargs="+", default=[20])
+    pa.add_argument("--chirality-list", nargs="+", default=["pump_to_belt"])
     pa.add_argument("--coverage-modes", nargs="+", default=["protect_loaded_union","full_360"])
     pa.add_argument("--feed-mode", default="groove")
     pa.add_argument("--eps-list", type=float, nargs="+", default=[0.5,0.8])
     pa.add_argument("--attitude-scan-deg", type=float, nargs="+", default=[-8,0,8])
     pa.add_argument("--grid", default="400x120")
+    pa.add_argument("--quiet", action="store_true",
+                    help="suppress HS warmup warnings from stdout")
     pa.add_argument("--out", required=True)
     args = pa.parse_args()
 
@@ -90,10 +105,16 @@ def main():
             W=v["applied_load_N"],
             phi_loaded=v.get("phi_loaded_deg", 140))
 
+    global _quiet_mode, _ww_count
+    _quiet_mode = args.quiet
+    _ww_count = 0
+
     print(f"Stage G4.0: fixed-ε probe")
     print(f"Grid: {Np}x{Nz}, feed={args.feed_mode}")
     print(f"Variants: {args.variants}, N: {args.N_branch_list}")
-    print(f"d_g: {args.dg_list} μm, attitude scan: {args.attitude_scan_deg}°")
+    print(f"d_g: {args.dg_list} μm, beta: {args.beta_list}°")
+    print(f"chirality: {args.chirality_list}")
+    print(f"attitude scan: {args.attitude_scan_deg}°")
 
     smooth_cache: Dict[Tuple, Dict] = {}
     rows: List[Dict] = []
@@ -130,68 +151,74 @@ def main():
                         for dg in args.dg_list:
                             taper_list = args.taper_list
                             curv_list = args.curvature_k_list if var == "arc_ramped" else [0.0]
+                            beta_list = args.beta_list if "herringbone" in var else [0.0]
+                            chir_list = args.chirality_list if "herringbone" in var else ["pump_to_belt"]
                             for taper in taper_list:
                                 for curv in curv_list:
-                                    for belt in args.belt_list:
-                                        relief = build_relief(
-                                            Phi, Zm, variant=var,
-                                            depth_nondim=dg*1e-6/C_CLEARANCE,
-                                            N_branch_per_side=Nb,
-                                            w_branch_nondim=w_g/R,
-                                            belt_half_nondim=belt,
-                                            curvature_k=curv,
-                                            ramp_frac=0.15,
-                                            taper_ratio=taper,
-                                            coverage_mode=cov,
-                                            protected_lo_deg=PROTECTED_LO_DEG,
-                                            protected_hi_deg=PROTECTED_HI_DEG)
-                                        t0 = time.time()
-                                        dv = eval_fixed(
-                                            X0, Y0, Phi, Zm, p1, z1,
-                                            dp, dz, relief, args.feed_mode)
-                                        dt = time.time() - t0
+                                    for beta in beta_list:
+                                        for chir in chir_list:
+                                            for belt in args.belt_list:
+                                                relief = build_relief(
+                                                    Phi, Zm, variant=var,
+                                                    depth_nondim=dg*1e-6/C_CLEARANCE,
+                                                    N_branch_per_side=Nb,
+                                                    w_branch_nondim=w_g/R,
+                                                    belt_half_nondim=belt,
+                                                    beta_deg=beta,
+                                                    curvature_k=curv,
+                                                    chirality=chir,
+                                                    ramp_frac=0.15,
+                                                    taper_ratio=taper,
+                                                    coverage_mode=cov,
+                                                    protected_lo_deg=PROTECTED_LO_DEG,
+                                                    protected_hi_deg=PROTECTED_HI_DEG)
+                                                t0 = time.time()
+                                                dv = eval_fixed(
+                                                    X0, Y0, Phi, Zm, p1, z1,
+                                                    dp, dz, relief, args.feed_mode)
+                                                dt = time.time() - t0
 
-                                        dCOF = (dv["COF"]-ds["COF"])/max(ds["COF"],1e-20)*100
-                                        Ws = np.array([ds["Fx"], ds["Fy"]])
-                                        Wt = np.array([dv["Fx"], dv["Fy"]])
-                                        Ws_n = max(float(np.linalg.norm(Ws)), 1e-20)
-                                        dot_proj = float(np.dot(Wt, Ws)) / Ws_n
-                                        gain_par = (dot_proj / Ws_n - 1) * 100
-                                        cross = abs(float(Wt[0]*Ws[1] - Wt[1]*Ws[0]))
-                                        dot_abs = abs(float(np.dot(Wt, Ws)))
-                                        side_ratio = cross / max(dot_abs, 1e-20)
-                                        dp_pct = (dv["p_max"]-ds["p_max"])/max(ds["p_max"],1e-20)*100
-                                        dg_hm = (dg*1e-6)/max(dv["h_min"],1e-12)
-                                        dh_pct = (dv["h_min"]-ds["h_min"])/max(ds["h_min"],1e-20)*100
+                                                dCOF = (dv["COF"]-ds["COF"])/max(ds["COF"],1e-20)*100
+                                                Ws = np.array([ds["Fx"], ds["Fy"]])
+                                                Wt = np.array([dv["Fx"], dv["Fy"]])
+                                                Ws_n = max(float(np.linalg.norm(Ws)), 1e-20)
+                                                dot_proj = float(np.dot(Wt, Ws)) / Ws_n
+                                                gain_par = (dot_proj / Ws_n - 1) * 100
+                                                cross = abs(float(Wt[0]*Ws[1] - Wt[1]*Ws[0]))
+                                                dot_abs = abs(float(np.dot(Wt, Ws)))
+                                                side_ratio = cross / max(dot_abs, 1e-20)
+                                                dp_pct = (dv["p_max"]-ds["p_max"])/max(ds["p_max"],1e-20)*100
+                                                dg_hm = (dg*1e-6)/max(dv["h_min"],1e-12)
+                                                dh_pct = (dv["h_min"]-ds["h_min"])/max(ds["h_min"],1e-20)*100
 
-                                        row = dict(
-                                            variant=var, N_branch=Nb, d_g_um=dg,
-                                            belt=belt, taper_ratio=taper,
-                                            curvature_k=curv, coverage_mode=cov,
-                                            eps_ref=eps, attitude_offset_deg=att_offset,
-                                            dCOF_fixed_pct=dCOF,
-                                            load_gain_parallel_pct=gain_par,
-                                            side_force_ratio=side_ratio,
-                                            dp_max_pct=dp_pct,
-                                            dh_pct=dh_pct,
-                                            dg_over_hmin=dg_hm,
-                                            h_min_um=dv["h_min"]*1e6,
-                                            W_tex=dv["W"],
-                                            W_smooth=ds["W"],
-                                            COF_tex=dv["COF"],
-                                            COF_smooth=ds["COF"],
-                                            elapsed_sec=dt)
-                                        rows.append(row)
+                                                row = dict(
+                                                    variant=var, N_branch=Nb, d_g_um=dg,
+                                                    belt=belt, taper_ratio=taper,
+                                                    curvature_k=curv, beta_deg=beta,
+                                                    chirality=chir, coverage_mode=cov,
+                                                    eps_ref=eps, attitude_offset_deg=att_offset,
+                                                    dCOF_fixed_pct=dCOF,
+                                                    load_gain_parallel_pct=gain_par,
+                                                    side_force_ratio=side_ratio,
+                                                    dp_max_pct=dp_pct,
+                                                    dh_pct=dh_pct,
+                                                    dg_over_hmin=dg_hm,
+                                                    h_min_um=dv["h_min"]*1e6,
+                                                    W_tex=dv["W"],
+                                                    W_smooth=ds["W"],
+                                                    COF_tex=dv["COF"],
+                                                    COF_smooth=ds["COF"],
+                                                    elapsed_sec=dt)
+                                                rows.append(row)
 
-                                        tag = f"{var[:5]}_N{Nb}_dg{dg}_t{taper}_k{curv}"
-                                        print(f"    {tag:35s} cov={cov[:8]:8s} "
-                                              f"eps={eps} att={att_offset:+.0f}° "
-                                              f"ΔCOF={dCOF:+.1f}% "
-                                              f"gain_W={gain_par:+.1f}% "
-                                              f"side={side_ratio:.3f} "
-                                              f"Δp={dp_pct:+.0f}% "
-                                              f"dg/h={dg_hm:.2f} "
-                                              f"{dt:.1f}s")
+                                                tag = f"{var[:5]}_N{Nb}_dg{dg}_t{taper}_b{beta}_ch{chir[:4]}"
+                                                print(f"    {tag:45s} cov={cov[:8]:8s} "
+                                                      f"att={att_offset:+.0f}° "
+                                                      f"ΔCOF={dCOF:+.1f}% "
+                                                      f"gain_W={gain_par:+.1f}% "
+                                                      f"side={side_ratio:.3f} "
+                                                      f"dg/h={dg_hm:.2f} "
+                                                      f"{dt:.1f}s")
 
     total = time.time() - t0g
 
