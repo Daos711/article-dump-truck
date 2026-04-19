@@ -191,6 +191,8 @@ def main():
     pa.add_argument("--feed-mode", default="groove")
     pa.add_argument("--loadcases", nargs="+", default=["L50"])
     pa.add_argument("--grid", default="800x240")
+    pa.add_argument("--smooth-nr", action="store_true",
+                    help="also solve smooth NR equilibrium for eq-vs-eq comparison")
     pa.add_argument("--out", required=True)
     args = pa.parse_args()
 
@@ -328,7 +330,36 @@ def main():
 
     total = time.time() - t_global
 
-    # Honest comparison: eval smooth at target equilibrium position
+    # ── Smooth NR equilibrium (if requested) ────────────────────────
+    smooth_eq_row = None
+    if args.smooth_nr and args.loadcases:
+        lc0 = mA["loadcases"].get(args.loadcases[0])
+        if lc0:
+            Wa_s = np.array(lc0["applied_load_N"], dtype=float)
+            Wn_s = float(np.linalg.norm(Wa_s))
+            Wd_s = Wa_s / max(Wn_s, 1e-20)
+            eps_s = float(lc0["eps_source"])
+            X0s = -eps_s * float(Wd_s[0])
+            Y0s = -eps_s * float(Wd_s[1])
+            print(f"\n{'='*60}")
+            print(f"Smooth NR equilibrium (feed={args.feed_mode})")
+            t0 = time.time()
+            d_s, _ = solve_equilibrium_nr(
+                Wa_s, Phi, Zm, p1, z1, dp, dz,
+                np.zeros_like(Phi), args.feed_mode,
+                X0s, Y0s, g_init_0=None)
+            dt_s = time.time() - t0
+            print(f"  eps={d_s['eps']:.4f} COF={d_s['COF']:.6f} "
+                  f"h={d_s['h_min']*1e6:.1f}μm "
+                  f"res={d_s['rel_residual']:.1e} "
+                  f"[{d_s['status']}] {dt_s:.0f}s")
+            smooth_eq_row = dict(
+                eps=d_s["eps"], COF=d_s["COF"],
+                h_min_um=d_s["h_min"] * 1e6,
+                status=d_s["status"],
+                rel_residual=d_s["rel_residual"])
+
+    # ── Headline comparison ─────────────────────────────────────────
     target_row = None
     for r in reversed(all_rows):
         if (r.get("beta_deg") == args.target_beta
@@ -338,23 +369,45 @@ def main():
             break
 
     if target_row:
-        # Eval smooth bearing at target's (X, Y) for fair COF comparison
+        # Same-position comparison (always available)
         Xt, Yt = target_row["X"], target_row["Y"]
         m_sm, _, _ = eval_point(
             Xt, Yt, Phi, Zm, p1, z1, dp, dz,
             np.zeros_like(Phi), args.feed_mode)
         Wn_h = float(np.linalg.norm(
             np.array(mA["loadcases"][args.loadcases[0]]["applied_load_N"])))
-        COF_smooth_at_target = m_sm["friction"] / max(Wn_h, 1e-20)
-        h_smooth_at_target = m_sm["h_min"] * 1e6
+        COF_smooth_pos = m_sm["friction"] / max(Wn_h, 1e-20)
+        h_smooth_pos = m_sm["h_min"] * 1e6
 
-        dCOF = (target_row["COF"] - COF_smooth_at_target) / max(COF_smooth_at_target, 1e-20) * 100
-        dh = (target_row["h_min_um"] - h_smooth_at_target) / max(h_smooth_at_target, 1e-20) * 100
+        dCOF_pos = (target_row["COF"] - COF_smooth_pos) / max(COF_smooth_pos, 1e-20) * 100
+        dh_pos = (target_row["h_min_um"] - h_smooth_pos) / max(h_smooth_pos, 1e-20) * 100
         print(f"\n{'='*60}")
-        print(f"Headline: target vs smooth AT SAME (X,Y)")
-        print(f"  smooth COF @ target pos = {COF_smooth_at_target:.6f}")
-        print(f"  veined COF @ target pos = {target_row['COF']:.6f}")
-        print(f"  ΔCOF = {dCOF:+.1f}%")
+        print(f"Headline A: target vs smooth AT SAME (X,Y)")
+        print(f"  smooth COF = {COF_smooth_pos:.6f}")
+        print(f"  veined COF = {target_row['COF']:.6f}")
+        print(f"  ΔCOF = {dCOF_pos:+.1f}%")
+        print(f"  smooth h = {h_smooth_pos:.1f}μm  veined h = {target_row['h_min_um']:.1f}μm")
+        print(f"  Δh = {dh_pos:+.1f}%  dg/h = {target_row['dg_over_hmin']:.2f}")
+
+        # Eq-vs-eq comparison (if smooth NR available)
+        dCOF_eq = dCOF_pos  # fallback
+        dh_eq = dh_pos
+        if smooth_eq_row and smooth_eq_row["status"] not in ("failed",):
+            dCOF_eq = (target_row["COF"] - smooth_eq_row["COF"]) / max(smooth_eq_row["COF"], 1e-20) * 100
+            dh_eq = (target_row["h_min_um"] - smooth_eq_row["h_min_um"]) / max(smooth_eq_row["h_min_um"], 1e-20) * 100
+            print(f"\nHeadline B: eq-vs-eq (both NR-converged)")
+            print(f"  smooth_eq COF = {smooth_eq_row['COF']:.6f} (eps={smooth_eq_row['eps']:.4f})")
+            print(f"  veined_eq COF = {target_row['COF']:.6f} (eps={target_row['eps']:.4f})")
+            print(f"  ΔCOF_eq = {dCOF_eq:+.1f}%")
+            print(f"  Δh_eq = {dh_eq:+.1f}%")
+        elif smooth_eq_row:
+            print(f"\n  (smooth NR failed: res={smooth_eq_row['rel_residual']:.1e} — using same-position comparison)")
+
+        weak = dCOF_eq <= -3 and dh_eq >= -2
+        strong = dCOF_eq <= -5 and dh_eq >= 0
+        gate = "HB_ACCEPTED_STRONG" if strong else (
+            "HB_ACCEPTED_WEAK" if weak else "HB_FIXED_ONLY_NO_EQ")
+        print(f"\n  Gate: {gate}  (status={target_row['status']})")
         print(f"  smooth h_min = {h_smooth_at_target:.1f}μm")
         print(f"  veined h_min = {target_row['h_min_um']:.1f}μm")
         print(f"  Δh_min = {dh:+.1f}%")
