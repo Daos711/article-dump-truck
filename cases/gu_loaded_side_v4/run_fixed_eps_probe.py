@@ -211,7 +211,8 @@ def main():
                                                     elapsed_sec=dt)
                                                 rows.append(row)
 
-                                                tag = f"{var[:5]}_N{Nb}_dg{dg}_t{taper}_b{beta}_ch{chir[:4]}"
+                                                chir_short = "edge" if chir == "pump_to_edge" else "belt"
+                                                tag = f"{var[:5]}_N{Nb}_dg{dg}_t{taper}_b{beta}_ch_{chir_short}"
                                                 print(f"    {tag:45s} cov={cov[:8]:8s} "
                                                       f"att={att_offset:+.0f}° "
                                                       f"ΔCOF={dCOF:+.1f}% "
