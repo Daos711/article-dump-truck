@@ -241,32 +241,23 @@ def main():
                     status="skipped_chain_broken"))
                 continue
 
-            # Step 0 (smooth): use Stage A anchor directly
+            # Step 0 (smooth): solve NR equilibrium for honest baseline
             if beta_step == 0 and dg_step == 0:
                 t0 = time.time()
-                # Solve smooth once to get g_init for warm-start chain
-                m0, P0, th0 = eval_point(
-                    X_prev, Y_prev, Phi, Zm, p1, z1, dp, dz,
-                    np.zeros_like(Phi), args.feed_mode)
-                g_prev = pack_g_init(P0, th0)
-                Wn_check = float(np.linalg.norm(Wa))
-                rel_R_0 = math.sqrt(
-                    (m0["Fx"] - Wa[0])**2 + (m0["Fy"] - Wa[1])**2
-                ) / max(Wn_check, 1e-20)
+                d, g_new = solve_equilibrium_nr(
+                    Wa, Phi, Zm, p1, z1, dp, dz,
+                    np.zeros_like(Phi), args.feed_mode,
+                    X_prev, Y_prev, g_init_0=None)
                 dt = time.time() - t0
-                d = dict(X=X_prev, Y=Y_prev,
-                         eps=math.sqrt(X_prev**2 + Y_prev**2),
-                         h_min=m0["h_min"], p_max=m0["p_max"],
-                         cav_frac=m0["cav_frac"], friction=m0["friction"],
-                         COF=m0["friction"] / max(Wn_check, 1e-20),
-                         rel_residual=rel_R_0,
-                         status="anchor")
-                g_new = g_prev
+                g_prev = g_new
+                X_prev, Y_prev = d["X"], d["Y"]
+                d["status"] = "anchor_" + d["status"]
                 dg_hm = 0.0
                 print(f"  [ 0] beta= 0 dg= 0 → eps={d['eps']:.4f} "
                       f"COF={d['COF']:.6f} "
                       f"h={d['h_min']*1e6:.1f}μm "
-                      f"res={d['rel_residual']:.1e} [anchor] {dt:.0f}s")
+                      f"res={d['rel_residual']:.1e} "
+                      f"[{d['status']}] {dt:.0f}s")
                 row = dict(loadcase=lc_name, step=0,
                            beta_deg=0, d_g_um=0,
                            X=d["X"], Y=d["Y"], eps=d["eps"],
@@ -275,7 +266,7 @@ def main():
                            COF=d["COF"], dg_over_hmin=0,
                            cav_frac=d["cav_frac"],
                            rel_residual=d["rel_residual"],
-                           status="anchor", elapsed_sec=dt)
+                           status=d["status"], elapsed_sec=dt)
                 all_rows.append(row)
                 continue
 
