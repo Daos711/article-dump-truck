@@ -241,23 +241,26 @@ def main():
                     status="skipped_chain_broken"))
                 continue
 
-            # Step 0 (smooth): solve NR equilibrium for honest baseline
+            # Step 0 (smooth): get g_init from anchor position, don't
+            # re-solve (groove BC smooth NR diverges). Honest comparison
+            # done at end: eval smooth at target (X,Y).
             if beta_step == 0 and dg_step == 0:
                 t0 = time.time()
-                d, g_new = solve_equilibrium_nr(
-                    Wa, Phi, Zm, p1, z1, dp, dz,
-                    np.zeros_like(Phi), args.feed_mode,
-                    X_prev, Y_prev, g_init_0=None)
+                m0, P0, th0 = eval_point(
+                    X_prev, Y_prev, Phi, Zm, p1, z1, dp, dz,
+                    np.zeros_like(Phi), args.feed_mode)
+                g_prev = pack_g_init(P0, th0)
                 dt = time.time() - t0
-                g_prev = g_new
-                X_prev, Y_prev = d["X"], d["Y"]
-                d["status"] = "anchor_" + d["status"]
-                dg_hm = 0.0
+                Wn_c = float(np.linalg.norm(Wa))
+                d = dict(X=X_prev, Y=Y_prev,
+                         eps=math.sqrt(X_prev**2 + Y_prev**2),
+                         h_min=m0["h_min"], p_max=m0["p_max"],
+                         cav_frac=m0["cav_frac"], friction=m0["friction"],
+                         COF=m0["friction"] / max(Wn_c, 1e-20),
+                         rel_residual=0, status="anchor_seed")
                 print(f"  [ 0] beta= 0 dg= 0 → eps={d['eps']:.4f} "
-                      f"COF={d['COF']:.6f} "
-                      f"h={d['h_min']*1e6:.1f}μm "
-                      f"res={d['rel_residual']:.1e} "
-                      f"[{d['status']}] {dt:.0f}s")
+                      f"COF={d['COF']:.6f} h={d['h_min']*1e6:.1f}μm "
+                      f"[anchor_seed→g_init] {dt:.0f}s")
                 row = dict(loadcase=lc_name, step=0,
                            beta_deg=0, d_g_um=0,
                            X=d["X"], Y=d["Y"], eps=d["eps"],
@@ -265,8 +268,8 @@ def main():
                            p_max_MPa=d["p_max"]/1e6,
                            COF=d["COF"], dg_over_hmin=0,
                            cav_frac=d["cav_frac"],
-                           rel_residual=d["rel_residual"],
-                           status=d["status"], elapsed_sec=dt)
+                           rel_residual=0,
+                           status="anchor_seed", elapsed_sec=dt)
                 all_rows.append(row)
                 continue
 
@@ -325,13 +328,7 @@ def main():
 
     total = time.time() - t_global
 
-    # Compare final vs smooth anchor
-    smooth_anchor = None
-    for r in all_rows:
-        if r.get("beta_deg") == 0 and r.get("d_g_um") == 0 and r.get("status") != "skipped_chain_broken":
-            smooth_anchor = r
-            break
-
+    # Honest comparison: eval smooth at target equilibrium position
     target_row = None
     for r in reversed(all_rows):
         if (r.get("beta_deg") == args.target_beta
@@ -340,12 +337,26 @@ def main():
             target_row = r
             break
 
-    if smooth_anchor and target_row:
-        dCOF = (target_row["COF"] - smooth_anchor["COF"]) / max(smooth_anchor["COF"], 1e-20) * 100
-        dh = (target_row["h_min_um"] - smooth_anchor["h_min_um"]) / max(smooth_anchor["h_min_um"], 1e-20) * 100
+    if target_row:
+        # Eval smooth bearing at target's (X, Y) for fair COF comparison
+        Xt, Yt = target_row["X"], target_row["Y"]
+        m_sm, _, _ = eval_point(
+            Xt, Yt, Phi, Zm, p1, z1, dp, dz,
+            np.zeros_like(Phi), args.feed_mode)
+        Wn_h = float(np.linalg.norm(
+            np.array(mA["loadcases"][args.loadcases[0]]["applied_load_N"])))
+        COF_smooth_at_target = m_sm["friction"] / max(Wn_h, 1e-20)
+        h_smooth_at_target = m_sm["h_min"] * 1e6
+
+        dCOF = (target_row["COF"] - COF_smooth_at_target) / max(COF_smooth_at_target, 1e-20) * 100
+        dh = (target_row["h_min_um"] - h_smooth_at_target) / max(h_smooth_at_target, 1e-20) * 100
         print(f"\n{'='*60}")
-        print(f"Headline: target vs smooth anchor")
+        print(f"Headline: target vs smooth AT SAME (X,Y)")
+        print(f"  smooth COF @ target pos = {COF_smooth_at_target:.6f}")
+        print(f"  veined COF @ target pos = {target_row['COF']:.6f}")
         print(f"  ΔCOF = {dCOF:+.1f}%")
+        print(f"  smooth h_min = {h_smooth_at_target:.1f}μm")
+        print(f"  veined h_min = {target_row['h_min_um']:.1f}μm")
         print(f"  Δh_min = {dh:+.1f}%")
         print(f"  dg/hmin = {target_row['dg_over_hmin']:.2f}")
         print(f"  status = {target_row['status']}")
