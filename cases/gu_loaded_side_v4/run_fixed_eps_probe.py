@@ -19,7 +19,7 @@ from cases.gu_loaded_side_v4.schema import (
     SCHEMA, resolve_stage_dir, PROTECTED_LO_DEG, PROTECTED_HI_DEG,
 )
 from cases.gu_loaded_side_v4.common import (
-    D, R, L, c, n_rpm, eta, sigma, w_g,
+    D, R, L, c as C_CLEARANCE, n_rpm, eta, sigma, w_g,
 )
 
 def make_grid(Np, Nz):
@@ -34,10 +34,10 @@ def _ps_call(H, dp, dz, phi_bc, ps_tol=1e-5, ps_max_iter=300_000):
 
 def eval_fixed(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
                ps_tol=1e-5, ps_max_iter=300_000):
-    om = 2*math.pi*n_rpm/60; ps = 6*eta*om*(R/c)**2
+    om = 2*math.pi*n_rpm/60; ps = 6*eta*om*(R/C_CLEARANCE)**2
     H0 = 1.0 + float(X)*np.cos(Phi) + float(Y)*np.sin(Phi)
     if sigma > 0:
-        H0 = np.sqrt(H0**2 + (sigma/c)**2)
+        H0 = np.sqrt(H0**2 + (sigma/C_CLEARANCE)**2)
     H = H0 + relief
     P, theta, _, _ = _ps_call(H, dp, dz, phi_bc, ps_tol, ps_max_iter)
     Pd = P * ps
@@ -45,7 +45,7 @@ def eval_fixed(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
                         z1, axis=0)*R*L/2
     Fy = -np.trapezoid(np.trapezoid(Pd*np.sin(Phi), p1, axis=1),
                         z1, axis=0)*R*L/2
-    hd = H * c
+    hd = H * C_CLEARANCE
     hm = float(np.min(hd))
     pm = float(np.max(Pd))
     cv = float(np.mean(theta < 1-1e-6))
@@ -135,7 +135,7 @@ def main():
                                     for belt in args.belt_list:
                                         relief = build_relief(
                                             Phi, Zm, variant=var,
-                                            depth_nondim=dg*1e-6/c,
+                                            depth_nondim=dg*1e-6/C_CLEARANCE,
                                             N_branch_per_side=Nb,
                                             w_branch_nondim=w_g/R,
                                             belt_half_nondim=belt,
