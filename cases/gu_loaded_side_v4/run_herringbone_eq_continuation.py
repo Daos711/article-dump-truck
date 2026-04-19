@@ -85,60 +85,70 @@ def eval_point(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
                 cav_frac=cv, friction=fr), P, theta
 
 
-def solve_equilibrium_trf(W_applied, Phi, Zm, p1, z1, dp, dz,
-                           relief, phi_bc, X0, Y0, g_init_0=None):
-    """Trust-region equilibrium solver with g_init warm-start."""
+def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
+                          relief, phi_bc, X0, Y0, g_init_0=None):
+    """Backtracking NR (proven in v3/v4) with g_init warm-start."""
     Wa = np.asarray(W_applied, dtype=float)
     Wn = float(np.linalg.norm(Wa))
-    last_g = [g_init_0]
-    last_P = [None]
-    last_theta = [None]
+    dXY = 1e-4
+    X, Y = float(X0), float(Y0)
+    g_cur = g_init_0
 
-    def residual_fn(xy):
-        X, Y = float(xy[0]), float(xy[1])
-        m, P, theta = eval_point(
-            X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
-            g_init=last_g[0])
-        last_P[0] = P
-        last_theta[0] = theta
-        last_g[0] = pack_g_init(P, theta)
-        Rx = (m["Fx"] - Wa[0]) / max(Wn, 1e-20)
-        Ry = (m["Fy"] - Wa[1]) / max(Wn, 1e-20)
-        return np.array([Rx, Ry])
+    m, P, theta = eval_point(X, Y, Phi, Zm, p1, z1, dp, dz,
+                              relief, phi_bc, g_init=g_cur)
+    g_cur = pack_g_init(P, theta)
+    rel_R = math.sqrt((m["Fx"] - Wa[0])**2 + (m["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
+    Fx_h, Fy_h = m["Fx"], m["Fy"]
+    h_min, p_max, cav, fr = m["h_min"], m["p_max"], m["cav_frac"], m["friction"]
 
-    try:
-        result = least_squares(
-            residual_fn, x0=[float(X0), float(Y0)],
-            method="trf",
-            bounds=([-(EPS_MAX - 0.01), -(EPS_MAX - 0.01)],
-                    [EPS_MAX - 0.01, EPS_MAX - 0.01]),
-            diff_step=[0.002, 0.002],
-            max_nfev=200,
-            ftol=TOL_HARD, xtol=1e-6, gtol=1e-6)
-        X_sol, Y_sol = float(result.x[0]), float(result.x[1])
-        rel_R = float(np.linalg.norm(result.fun))
-    except Exception as e:
-        print(f"    [TRF] exception: {e}")
-        X_sol, Y_sol = float(X0), float(Y0)
-        rel_R = 1.0
+    for it in range(MAX_ITER_NR):
+        if rel_R < TOL_HARD:
+            break
+        J = np.zeros((2, 2))
+        for col, (dX_, dY_) in enumerate([(dXY, 0.0), (0.0, dXY)]):
+            mp, _, _ = eval_point(X + dX_, Y + dY_, Phi, Zm, p1, z1,
+                                   dp, dz, relief, phi_bc, g_init=g_cur)
+            mn, _, _ = eval_point(X - dX_, Y - dY_, Phi, Zm, p1, z1,
+                                   dp, dz, relief, phi_bc, g_init=g_cur)
+            J[0, col] = (mp["Fx"] - mn["Fx"]) / (2 * dXY)
+            J[1, col] = (mp["Fy"] - mn["Fy"]) / (2 * dXY)
+        Rx = Fx_h - Wa[0]
+        Ry = Fy_h - Wa[1]
+        det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+        if abs(det) < 1e-30:
+            break
+        ddX = -(J[1, 1] * Rx - J[0, 1] * Ry) / det
+        ddY = -(-J[1, 0] * Rx + J[0, 0] * Ry) / det
+        cap = STEP_CAP / max(abs(ddX), abs(ddY), 1e-20)
+        if cap < 1:
+            ddX *= cap
+            ddY *= cap
+        ok = False
+        for alpha in [1.0, 0.5, 0.25, 0.125]:
+            Xt = X + alpha * ddX
+            Yt = Y + alpha * ddY
+            if math.sqrt(Xt**2 + Yt**2) >= EPS_MAX:
+                continue
+            mt, Pt, tht = eval_point(Xt, Yt, Phi, Zm, p1, z1,
+                                      dp, dz, relief, phi_bc, g_init=g_cur)
+            rt = math.sqrt((mt["Fx"] - Wa[0])**2 + (mt["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
+            if rt < rel_R:
+                X, Y = Xt, Yt
+                Fx_h, Fy_h = mt["Fx"], mt["Fy"]
+                h_min, p_max, cav, fr = mt["h_min"], mt["p_max"], mt["cav_frac"], mt["friction"]
+                rel_R = rt
+                g_cur = pack_g_init(Pt, tht)
+                ok = True
+                break
+        if not ok:
+            break
 
-    m_final, P_final, theta_final = eval_point(
-        X_sol, Y_sol, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
-        g_init=last_g[0])
-    rel_R_final = math.sqrt(
-        (m_final["Fx"] - Wa[0]) ** 2 +
-        (m_final["Fy"] - Wa[1]) ** 2) / max(Wn, 1e-20)
-
-    eps = math.sqrt(X_sol ** 2 + Y_sol ** 2)
-    COF = m_final["friction"] / max(Wn, 1e-20)
-    status = classify_status(rel_R_final, rel_R_final <= 0.10)
-
-    return dict(
-        X=X_sol, Y=Y_sol, eps=eps,
-        h_min=m_final["h_min"], p_max=m_final["p_max"],
-        cav_frac=m_final["cav_frac"], friction=m_final["friction"],
-        COF=COF, rel_residual=rel_R_final, status=status,
-    ), pack_g_init(P_final, theta_final)
+    eps = math.sqrt(X**2 + Y**2)
+    COF = fr / max(Wn, 1e-20)
+    status = classify_status(rel_R, rel_R <= 0.10)
+    return dict(X=X, Y=Y, eps=eps, h_min=h_min, p_max=p_max,
+                cav_frac=cav, friction=fr, COF=COF,
+                rel_residual=rel_R, status=status), g_cur
 
 
 def build_continuation_path(target_beta, target_dg):
@@ -231,6 +241,44 @@ def main():
                     status="skipped_chain_broken"))
                 continue
 
+            # Step 0 (smooth): use Stage A anchor directly
+            if beta_step == 0 and dg_step == 0:
+                t0 = time.time()
+                # Solve smooth once to get g_init for warm-start chain
+                m0, P0, th0 = eval_point(
+                    X_prev, Y_prev, Phi, Zm, p1, z1, dp, dz,
+                    np.zeros_like(Phi), args.feed_mode)
+                g_prev = pack_g_init(P0, th0)
+                Wn_check = float(np.linalg.norm(Wa))
+                rel_R_0 = math.sqrt(
+                    (m0["Fx"] - Wa[0])**2 + (m0["Fy"] - Wa[1])**2
+                ) / max(Wn_check, 1e-20)
+                dt = time.time() - t0
+                d = dict(X=X_prev, Y=Y_prev,
+                         eps=math.sqrt(X_prev**2 + Y_prev**2),
+                         h_min=m0["h_min"], p_max=m0["p_max"],
+                         cav_frac=m0["cav_frac"], friction=m0["friction"],
+                         COF=m0["friction"] / max(Wn_check, 1e-20),
+                         rel_residual=rel_R_0,
+                         status="anchor")
+                g_new = g_prev
+                dg_hm = 0.0
+                print(f"  [ 0] beta= 0 dg= 0 → eps={d['eps']:.4f} "
+                      f"COF={d['COF']:.6f} "
+                      f"h={d['h_min']*1e6:.1f}μm "
+                      f"res={d['rel_residual']:.1e} [anchor] {dt:.0f}s")
+                row = dict(loadcase=lc_name, step=0,
+                           beta_deg=0, d_g_um=0,
+                           X=d["X"], Y=d["Y"], eps=d["eps"],
+                           h_min_um=d["h_min"]*1e6,
+                           p_max_MPa=d["p_max"]/1e6,
+                           COF=d["COF"], dg_over_hmin=0,
+                           cav_frac=d["cav_frac"],
+                           rel_residual=d["rel_residual"],
+                           status="anchor", elapsed_sec=dt)
+                all_rows.append(row)
+                continue
+
             relief = build_relief(
                 Phi, Zm, variant="half_herringbone_ramped",
                 depth_nondim=dg_step * 1e-6 / C_CLEARANCE,
@@ -246,7 +294,7 @@ def main():
                 protected_hi_deg=PROTECTED_HI_DEG)
 
             t0 = time.time()
-            d, g_new = solve_equilibrium_trf(
+            d, g_new = solve_equilibrium_nr(
                 Wa, Phi, Zm, p1, z1, dp, dz,
                 relief, args.feed_mode,
                 X_prev, Y_prev, g_init_0=g_prev)
