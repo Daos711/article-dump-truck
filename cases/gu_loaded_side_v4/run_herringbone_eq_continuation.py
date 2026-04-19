@@ -408,11 +408,6 @@ def main():
         gate = "HB_ACCEPTED_STRONG" if strong else (
             "HB_ACCEPTED_WEAK" if weak else "HB_FIXED_ONLY_NO_EQ")
         print(f"\n  Gate: {gate}  (status={target_row['status']})")
-        print(f"  smooth h_min = {h_smooth_at_target:.1f}μm")
-        print(f"  veined h_min = {target_row['h_min_um']:.1f}μm")
-        print(f"  Δh_min = {dh:+.1f}%")
-        print(f"  dg/hmin = {target_row['dg_over_hmin']:.2f}")
-        print(f"  status = {target_row['status']}")
 
         weak = dCOF <= -3 and dh >= -2
         strong = dCOF <= -5 and dh >= 0
