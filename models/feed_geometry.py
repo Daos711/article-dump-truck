@@ -140,4 +140,44 @@ __all__ = [
     "create_H_with_central_feed_branches",
     "feed_window_metadata",
     "feed_geometry_params",
+    "build_feed_mask",
+    "p_supply_to_g_bc",
 ]
+
+
+# ─── Stage H: explicit supply pressure ────────────────────────────
+
+def build_feed_mask(
+        Phi: np.ndarray, Z: np.ndarray,
+        phi_feed_deg: float = 300.0,
+        phi_feed_half_deg: float = 5.0,
+        z_belt_half: float = 0.15,
+) -> np.ndarray:
+    """Build bool Dirichlet mask for central feed window.
+
+    The feed window is a rectangle in (phi, Z) inside the central belt.
+    Wrap-safe: works correctly for windows crossing phi=0/360°.
+
+    Returns contiguous bool array, same shape as Phi.
+    """
+    phi_c = math.radians(float(phi_feed_deg) % 360.0)
+    half = math.radians(float(phi_feed_half_deg))
+    dphi = Phi - phi_c
+    dphi = dphi - 2.0 * math.pi * np.round(dphi / (2.0 * math.pi))
+    mask_phi = np.abs(dphi) <= half
+    mask_z = np.abs(Z) <= float(z_belt_half)
+    mask = mask_phi & mask_z
+    return np.ascontiguousarray(mask)
+
+
+def p_supply_to_g_bc(
+        p_supply_Pa: float,
+        mu: float, omega: float, R: float, c: float,
+) -> float:
+    """Convert dimensional supply pressure to nondimensional g_bc.
+
+    g_bc = p_supply_Pa / p_scale
+    p_scale = 6 * mu * omega * (R/c)^2
+    """
+    p_scale = 6.0 * float(mu) * float(omega) * (float(R) / float(c)) ** 2
+    return float(p_supply_Pa) / p_scale

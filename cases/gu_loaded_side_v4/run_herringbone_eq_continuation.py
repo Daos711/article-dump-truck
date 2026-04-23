@@ -43,26 +43,31 @@ def pack_g_init(P, theta, eps=1e-14):
     return np.ascontiguousarray(g, dtype=np.float64)
 
 
-def _ps_call(H, dp, dz, phi_bc, g_init=None):
+def _ps_call(H, dp, dz, phi_bc, g_init=None,
+             dirichlet_mask=None, g_bc=None):
     kw = dict(tol=1e-6, max_iter=3_000_000,
               hs_warmup_iter=200_000, hs_warmup_tol=1e-5,
               phi_bc=phi_bc)
     if g_init is not None:
         kw["g_init"] = g_init
+    if dirichlet_mask is not None and g_bc is not None:
+        kw["dirichlet_mask"] = dirichlet_mask
+        kw["g_bc"] = g_bc
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
         return _ps_fn(H, dp, dz, R, L, **kw)
 
 
 def eval_point(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
-               g_init=None):
+               g_init=None, dirichlet_mask=None, g_bc=None):
     """Full eval: H build → PS solve → force integration.
     Returns (metrics_dict, P, theta) for warm-start chain."""
     H0 = 1.0 + float(X) * np.cos(Phi) + float(Y) * np.sin(Phi)
     if sigma > 0:
         H0 = np.sqrt(H0 ** 2 + (sigma / C_CLEARANCE) ** 2)
     H = H0 + relief
-    P, theta, _, _ = _ps_call(H, dp, dz, phi_bc, g_init)
+    P, theta, _, _ = _ps_call(H, dp, dz, phi_bc, g_init,
+                               dirichlet_mask, g_bc)
     Pd = P * P_SCALE
     Fx = -np.trapezoid(
         np.trapezoid(Pd * np.cos(Phi), p1, axis=1),
@@ -86,8 +91,9 @@ def eval_point(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
 
 
 def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
-                          relief, phi_bc, X0, Y0, g_init_0=None):
-    """Backtracking NR (proven in v3/v4) with g_init warm-start."""
+                          relief, phi_bc, X0, Y0, g_init_0=None,
+                          dirichlet_mask=None, g_bc=None):
+    """Backtracking NR with g_init warm-start + optional Dirichlet BC."""
     Wa = np.asarray(W_applied, dtype=float)
     Wn = float(np.linalg.norm(Wa))
     dXY = 1e-4
@@ -95,7 +101,8 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
     g_cur = g_init_0
 
     m, P, theta = eval_point(X, Y, Phi, Zm, p1, z1, dp, dz,
-                              relief, phi_bc, g_init=g_cur)
+                              relief, phi_bc, g_init=g_cur,
+                              dirichlet_mask=dirichlet_mask, g_bc=g_bc)
     g_cur = pack_g_init(P, theta)
     rel_R = math.sqrt((m["Fx"] - Wa[0])**2 + (m["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
     Fx_h, Fy_h = m["Fx"], m["Fy"]
@@ -107,9 +114,11 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
         J = np.zeros((2, 2))
         for col, (dX_, dY_) in enumerate([(dXY, 0.0), (0.0, dXY)]):
             mp, _, _ = eval_point(X + dX_, Y + dY_, Phi, Zm, p1, z1,
-                                   dp, dz, relief, phi_bc, g_init=g_cur)
+                                   dp, dz, relief, phi_bc, g_init=g_cur,
+                                   dirichlet_mask=dirichlet_mask, g_bc=g_bc)
             mn, _, _ = eval_point(X - dX_, Y - dY_, Phi, Zm, p1, z1,
-                                   dp, dz, relief, phi_bc, g_init=g_cur)
+                                   dp, dz, relief, phi_bc, g_init=g_cur,
+                                   dirichlet_mask=dirichlet_mask, g_bc=g_bc)
             J[0, col] = (mp["Fx"] - mn["Fx"]) / (2 * dXY)
             J[1, col] = (mp["Fy"] - mn["Fy"]) / (2 * dXY)
         Rx = Fx_h - Wa[0]
@@ -130,7 +139,8 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
             if math.sqrt(Xt**2 + Yt**2) >= EPS_MAX:
                 continue
             mt, Pt, tht = eval_point(Xt, Yt, Phi, Zm, p1, z1,
-                                      dp, dz, relief, phi_bc, g_init=g_cur)
+                                      dp, dz, relief, phi_bc, g_init=g_cur,
+                                      dirichlet_mask=dirichlet_mask, g_bc=g_bc)
             rt = math.sqrt((mt["Fx"] - Wa[0])**2 + (mt["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
             if rt < rel_R:
                 X, Y = Xt, Yt
