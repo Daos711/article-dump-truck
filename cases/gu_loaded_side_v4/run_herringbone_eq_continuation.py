@@ -66,7 +66,7 @@ def eval_point(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
     if sigma > 0:
         H0 = np.sqrt(H0 ** 2 + (sigma / C_CLEARANCE) ** 2)
     H = H0 + relief
-    P, theta, _, _ = _ps_call(H, dp, dz, phi_bc, g_init,
+    P, theta, ps_res, ps_it = _ps_call(H, dp, dz, phi_bc, g_init,
                                dirichlet_mask, g_bc)
     Pd = P * P_SCALE
     Fx = -np.trapezoid(
@@ -86,24 +86,33 @@ def eval_point(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
     fr = float(np.trapezoid(
         np.trapezoid(np.abs(ta), p1, axis=1),
         z1, axis=0) * R * L / 2.0)
+    ps_iters_val = int(ps_it) if ps_it is not None else 0
+    ps_res_val = float(ps_res) if ps_res is not None else 0.0
     return dict(Fx=float(Fx), Fy=float(Fy), h_min=hm, p_max=pm,
-                cav_frac=cv, friction=fr), P, theta
+                cav_frac=cv, friction=fr,
+                ps_iters=ps_iters_val, ps_residual=ps_res_val), P, theta
 
 
 def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
                           relief, phi_bc, X0, Y0, g_init_0=None,
                           dirichlet_mask=None, g_bc=None):
-    """Backtracking NR with g_init warm-start + optional Dirichlet BC."""
+    """Backtracking NR with g_init warm-start + optional Dirichlet BC.
+    Returns (result_dict, g_init_out)."""
     Wa = np.asarray(W_applied, dtype=float)
     Wn = float(np.linalg.norm(Wa))
     dXY = 1e-4
     X, Y = float(X0), float(Y0)
     g_cur = g_init_0
+    nr_iters = 0
+    ps_iters_total = 0
+    ps_calls_total = 0
 
     m, P, theta = eval_point(X, Y, Phi, Zm, p1, z1, dp, dz,
                               relief, phi_bc, g_init=g_cur,
                               dirichlet_mask=dirichlet_mask, g_bc=g_bc)
     g_cur = pack_g_init(P, theta)
+    ps_iters_total += m.get("ps_iters", 0)
+    ps_calls_total += 1
     rel_R = math.sqrt((m["Fx"] - Wa[0])**2 + (m["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
     Fx_h, Fy_h = m["Fx"], m["Fy"]
     h_min, p_max, cav, fr = m["h_min"], m["p_max"], m["cav_frac"], m["friction"]
@@ -116,9 +125,11 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
             mp, _, _ = eval_point(X + dX_, Y + dY_, Phi, Zm, p1, z1,
                                    dp, dz, relief, phi_bc, g_init=g_cur,
                                    dirichlet_mask=dirichlet_mask, g_bc=g_bc)
+            ps_iters_total += mp.get("ps_iters", 0); ps_calls_total += 1
             mn, _, _ = eval_point(X - dX_, Y - dY_, Phi, Zm, p1, z1,
                                    dp, dz, relief, phi_bc, g_init=g_cur,
                                    dirichlet_mask=dirichlet_mask, g_bc=g_bc)
+            ps_iters_total += mn.get("ps_iters", 0); ps_calls_total += 1
             J[0, col] = (mp["Fx"] - mn["Fx"]) / (2 * dXY)
             J[1, col] = (mp["Fy"] - mn["Fy"]) / (2 * dXY)
         Rx = Fx_h - Wa[0]
@@ -141,6 +152,7 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
             mt, Pt, tht = eval_point(Xt, Yt, Phi, Zm, p1, z1,
                                       dp, dz, relief, phi_bc, g_init=g_cur,
                                       dirichlet_mask=dirichlet_mask, g_bc=g_bc)
+            ps_iters_total += mt.get("ps_iters", 0); ps_calls_total += 1
             rt = math.sqrt((mt["Fx"] - Wa[0])**2 + (mt["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
             if rt < rel_R:
                 X, Y = Xt, Yt
@@ -149,6 +161,7 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
                 rel_R = rt
                 g_cur = pack_g_init(Pt, tht)
                 ok = True
+                nr_iters += 1
                 break
         if not ok:
             break
@@ -156,9 +169,17 @@ def solve_equilibrium_nr(W_applied, Phi, Zm, p1, z1, dp, dz,
     eps = math.sqrt(X**2 + Y**2)
     COF = fr / max(Wn, 1e-20)
     status = classify_status(rel_R, rel_R <= 0.10)
+    # Last accepted eval's solver diag
+    ps_iters_last = m.get("ps_iters", 0)
+    ps_residual_last = m.get("ps_residual", 0.0)
     return dict(X=X, Y=Y, eps=eps, h_min=h_min, p_max=p_max,
                 cav_frac=cav, friction=fr, COF=COF,
-                rel_residual=rel_R, status=status), g_cur
+                rel_residual=rel_R, status=status,
+                nr_iters=nr_iters,
+                ps_iters_last=ps_iters_last,
+                ps_iters_total=ps_iters_total,
+                ps_residual_last=ps_residual_last,
+                ps_calls_total=ps_calls_total), g_cur
 
 
 def build_continuation_path(target_beta, target_dg):

@@ -12,7 +12,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 import numpy as np
 
-from models.feed_geometry import build_feed_mask, p_supply_to_g_bc
+from models.feed_geometry import build_feed_mask_variant, p_supply_to_g_bc
 from cases.gu_loaded_side_v4.geometry_builders import build_relief
 from cases.gu_loaded_side_v4.schema import SCHEMA, resolve_stage_dir
 from cases.gu_loaded_side_v4.common import (
@@ -38,8 +38,11 @@ def main():
     pa.add_argument("--phi-bc", default="periodic",
                     choices=["periodic", "groove"])
     pa.add_argument("--p-supply-bar", type=float, nargs="+",
-                    default=[0, 0.5, 2, 5])
-    pa.add_argument("--phi-feed-deg", type=float, default=300)
+                    default=[0, 2])
+    pa.add_argument("--feed-variant", default="point_unloaded",
+                    choices=["belt_wide", "point_unloaded", "point_loaded"])
+    pa.add_argument("--phi-feed-deg", type=float, default=None,
+                    help="explicit override for feed center (default: from loadcase)")
     pa.add_argument("--phi-feed-half-deg", type=float, default=5)
     pa.add_argument("--z-belt-half", type=float, default=0.15)
     pa.add_argument("--loadcases", nargs="+", default=["L50"])
@@ -55,18 +58,15 @@ def main():
     with open(os.path.join(stA, "working_geometry_manifest.json")) as f:
         mA = json.load(f)
 
-    # Build feed mask (once — same for all p_supply > 0)
-    feed_mask = build_feed_mask(
-        Phi, Zm,
-        phi_feed_deg=args.phi_feed_deg,
-        phi_feed_half_deg=args.phi_feed_half_deg,
-        z_belt_half=args.z_belt_half)
-    n_masked = int(np.sum(feed_mask))
-    print(f"Stage H: supply pressure sweep")
+    # Feed mask built per-loadcase (phi_loaded differs)
+    # Precompute phi_loaded per loadcase from Stage A
+    lc_phi_loaded = {}
+    for lc_name, lc in mA.get("loadcases", {}).items():
+        lc_phi_loaded[lc_name] = float(lc.get("phi_loaded_deg", 140))
+
+    print(f"Stage H: supply pressure equilibrium sweep")
     print(f"Grid: {Np}x{Nz}, phi_bc={args.phi_bc}")
-    print(f"Feed window: phi={args.phi_feed_deg}°±{args.phi_feed_half_deg}°, "
-          f"|Z|<={args.z_belt_half}")
-    print(f"Feed mask: {n_masked} cells ({n_masked/(Np*Nz)*100:.1f}%)")
+    print(f"Feed variant: {args.feed_variant}")
     print(f"p_supply: {args.p_supply_bar} bar")
     print(f"Texture: beta={args.target_beta}° dg={args.target_dg}μm "
           f"N={args.N_branch} taper={args.taper}")
@@ -101,32 +101,53 @@ def main():
         X_seed = -eps_ref * float(Wd[0])
         Y_seed = -eps_ref * float(Wd[1])
 
+        phi_loaded = lc_phi_loaded.get(lc_name, 140.0)
         print(f"\n{'='*60}")
-        print(f"Loadcase: {lc_name}  W={Wn:.1f}N  eps_ref={eps_ref}")
+        print(f"Loadcase: {lc_name}  W={Wn:.1f}N  eps_ref={eps_ref}  "
+              f"phi_loaded={phi_loaded:.1f}°")
 
-        for p_bar in args.p_supply_bar:
-            p_Pa = float(p_bar) * 1e5
-            if p_bar > 0:
-                g_bc_val = p_supply_to_g_bc(p_Pa, eta, OMEGA, R, C_CLEARANCE)
-                d_mask = feed_mask
-                d_gbc = g_bc_val
-            else:
-                d_mask = None
-                d_gbc = None
-                g_bc_val = 0.0
+        # Build feed mask once per loadcase
+        feed_mask_lc = None
+        feed_meta_lc = {}
+        if any(p > 0 for p in args.p_supply_bar):
+            feed_mask_lc, feed_meta_lc = build_feed_mask_variant(
+                Phi, Zm, args.feed_variant,
+                phi_loaded_deg=phi_loaded,
+                phi_feed_deg=args.phi_feed_deg,
+                phi_feed_half_deg=args.phi_feed_half_deg,
+                z_belt_half=args.z_belt_half)
+            print(f"  Feed: {args.feed_variant}, "
+                  f"{feed_meta_lc.get('n_cells',0)} cells "
+                  f"({feed_meta_lc.get('frac',0)*100:.1f}%)")
 
-            print(f"\n  p_supply = {p_bar} bar "
-                  f"(g_bc = {g_bc_val:.6f})")
+        p_list = sorted(args.p_supply_bar)
+        for geo_tag, relief in [("smooth", smooth_relief),
+                                 ("textured", tex_relief)]:
+            X_prev, Y_prev = X_seed, Y_seed
+            g_prev = None
+            for p_bar in p_list:
+                p_Pa = float(p_bar) * 1e5
+                if p_bar > 0:
+                    g_bc_val = p_supply_to_g_bc(p_Pa, eta, OMEGA, R, C_CLEARANCE)
+                    d_mask = feed_mask_lc
+                    d_gbc = g_bc_val
+                else:
+                    d_mask = None
+                    d_gbc = None
+                    g_bc_val = 0.0
 
-            for geo_tag, relief in [("smooth", smooth_relief),
-                                     ("textured", tex_relief)]:
                 t0 = time.time()
                 d, g_out = solve_equilibrium_nr(
                     Wa, Phi, Zm, p1, z1, dp, dz,
-                    relief, args.phi_bc, X_seed, Y_seed,
-                    g_init_0=None,
+                    relief, args.phi_bc, X_prev, Y_prev,
+                    g_init_0=g_prev,
                     dirichlet_mask=d_mask, g_bc=d_gbc)
                 dt = time.time() - t0
+
+                # Warm-start chain: carry (X, Y, g_init) to next p_supply
+                if d["status"] not in ("failed",):
+                    X_prev, Y_prev = d["X"], d["Y"]
+                    g_prev = g_out
 
                 dg_hm = (args.target_dg * 1e-6 / max(d["h_min"], 1e-12)
                           if geo_tag == "textured" else 0.0)
@@ -134,10 +155,10 @@ def main():
                 row = dict(
                     loadcase=lc_name,
                     geometry=geo_tag,
+                    feed_variant=args.feed_variant,
                     phi_bc=args.phi_bc,
                     p_supply_bar=p_bar,
                     g_bc=g_bc_val,
-                    phi_feed_deg=args.phi_feed_deg,
                     phi_feed_half_deg=args.phi_feed_half_deg,
                     z_belt_half=args.z_belt_half,
                     eps=d["eps"],
@@ -149,11 +170,18 @@ def main():
                     dg_over_hmin=dg_hm,
                     status=d["status"],
                     nr_rel_residual=d["rel_residual"],
+                    nr_iters=d.get("nr_iters", 0),
+                    ps_iters_last=d.get("ps_iters_last", 0),
+                    ps_iters_total=d.get("ps_iters_total", 0),
+                    ps_residual_last=d.get("ps_residual_last", 0),
+                    ps_calls_total=d.get("ps_calls_total", 0),
                     elapsed_sec=dt)
                 rows.append(row)
 
-                print(f"    {geo_tag:>10s}: eps={d['eps']:.4f} "
+                print(f"    {geo_tag:>10s} p={p_bar}bar: eps={d['eps']:.4f} "
                       f"COF={d['COF']:.6f} h={d['h_min']*1e6:.1f}μm "
+                      f"nr={d.get('nr_iters',0)} "
+                      f"ps_tot={d.get('ps_iters_total',0)} "
                       f"res={d['rel_residual']:.1e} "
                       f"[{d['status']}] {dt:.0f}s")
 
