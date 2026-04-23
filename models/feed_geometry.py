@@ -141,6 +141,7 @@ __all__ = [
     "feed_window_metadata",
     "feed_geometry_params",
     "build_feed_mask",
+    "build_feed_mask_variant",
     "p_supply_to_g_bc",
 ]
 
@@ -181,3 +182,56 @@ def p_supply_to_g_bc(
     """
     p_scale = 6.0 * float(mu) * float(omega) * (float(R) / float(c)) ** 2
     return float(p_supply_Pa) / p_scale
+
+
+def build_feed_mask_variant(
+        Phi: np.ndarray, Z: np.ndarray,
+        variant: str,
+        *,
+        phi_loaded_deg: float = None,
+        phi_feed_deg: float = None,
+        phi_feed_half_deg: float = 5.0,
+        z_belt_half: float = 0.15,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Build feed mask by variant name.
+
+    Variants:
+      belt_wide       — full axial belt |Z|<=z_belt_half, all φ
+      point_loaded    — rectangular window at phi_loaded
+      point_unloaded  — rectangular window at phi_loaded + 180°
+
+    Returns (mask, meta_dict).
+    Raises ValueError if mask is empty.
+    """
+    meta = dict(variant=variant, z_belt_half=z_belt_half)
+
+    if variant == "belt_wide":
+        mask = np.abs(Z) <= float(z_belt_half)
+        meta["phi_center_deg"] = None
+        meta["phi_half_deg"] = None
+    elif variant in ("point_loaded", "point_unloaded"):
+        if phi_feed_deg is not None:
+            phi_c = float(phi_feed_deg)
+        elif phi_loaded_deg is not None:
+            if variant == "point_loaded":
+                phi_c = float(phi_loaded_deg)
+            else:
+                phi_c = (float(phi_loaded_deg) + 180.0) % 360.0
+        else:
+            raise ValueError(
+                f"variant={variant!r} requires phi_loaded_deg or "
+                f"phi_feed_deg")
+        mask = build_feed_mask(Phi, Z, phi_c, phi_feed_half_deg,
+                                z_belt_half)
+        meta["phi_center_deg"] = phi_c
+        meta["phi_half_deg"] = phi_feed_half_deg
+    else:
+        raise ValueError(f"unknown feed variant: {variant!r}")
+
+    mask = np.ascontiguousarray(mask)
+    if not np.any(mask):
+        raise ValueError(
+            f"feed mask is empty for variant={variant!r} on this grid")
+    meta["n_cells"] = int(np.sum(mask))
+    meta["frac"] = float(np.mean(mask))
+    return mask, meta
