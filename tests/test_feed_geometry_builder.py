@@ -68,3 +68,69 @@ def test_feed_window_outside_pressure_peak():
     meta = feed_window_metadata(phi_feed_deg=300.0)
     assert meta["phi_feed_deg"] == 300.0
     assert 290.0 < meta["phi_feed_lo_deg"] < 310.0
+
+
+# ─── Stage H feed mask tests ──────────────────────────────────────
+
+from models.feed_geometry import (
+    build_feed_mask, build_feed_mask_variant, p_supply_to_g_bc,
+)
+
+
+def test_belt_wide_nonempty():
+    Phi, Zm = _grid()
+    mask, meta = build_feed_mask_variant(Phi, Zm, "belt_wide",
+                                          z_belt_half=0.15)
+    assert np.sum(mask) > 0
+    assert meta["variant"] == "belt_wide"
+
+
+def test_belt_wide_inside_belt():
+    Phi, Zm = _grid()
+    mask, _ = build_feed_mask_variant(Phi, Zm, "belt_wide",
+                                       z_belt_half=0.15)
+    assert np.all(np.abs(Zm[mask]) <= 0.15 + 1e-10)
+
+
+def test_point_unloaded_inside_belt():
+    Phi, Zm = _grid()
+    mask, meta = build_feed_mask_variant(
+        Phi, Zm, "point_unloaded",
+        phi_loaded_deg=143.4, phi_feed_half_deg=5, z_belt_half=0.15)
+    assert np.sum(mask) > 0
+    assert np.all(np.abs(Zm[mask]) <= 0.15 + 1e-10)
+
+
+def test_point_loaded_center():
+    Phi, Zm = _grid()
+    _, meta = build_feed_mask_variant(
+        Phi, Zm, "point_loaded",
+        phi_loaded_deg=143.4, phi_feed_half_deg=5, z_belt_half=0.15)
+    assert abs(meta["phi_center_deg"] - 143.4) < 0.1
+
+
+def test_wrap_around():
+    Phi, Zm = _grid()
+    mask, _ = build_feed_mask_variant(
+        Phi, Zm, "point_unloaded",
+        phi_loaded_deg=178.0, phi_feed_half_deg=5, z_belt_half=0.15)
+    assert np.sum(mask) > 0
+
+
+def test_empty_mask_raises():
+    Phi, Zm = _grid(N_phi=10, N_Z=5)
+    with pytest.raises(ValueError, match="empty"):
+        build_feed_mask_variant(
+            Phi, Zm, "point_loaded",
+            phi_loaded_deg=143.4, phi_feed_half_deg=0.001,
+            z_belt_half=0.001)
+
+
+def test_p_supply_to_g_bc_value():
+    g = p_supply_to_g_bc(2e5, 0.018, 2*math.pi*2000/60, 0.027, 40e-6)
+    assert abs(g - 0.0194) < 0.001
+
+
+def test_p_supply_zero():
+    g = p_supply_to_g_bc(0.0, 0.018, 2*math.pi*2000/60, 0.027, 40e-6)
+    assert g == 0.0
