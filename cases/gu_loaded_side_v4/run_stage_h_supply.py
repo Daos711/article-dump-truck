@@ -254,7 +254,7 @@ def main():
         feed_window=dict(phi_feed_deg=args.phi_feed_deg,
                           phi_feed_half_deg=args.phi_feed_half_deg,
                           z_belt_half=args.z_belt_half),
-        n_masked_cells=n_masked,
+        n_masked_cells=feed_meta_lc.get("n_cells", 0),
         grid=dict(N_phi=Np, N_Z=Nz),
         texture=dict(beta=args.target_beta, dg=args.target_dg,
                       N=args.N_branch, taper=args.taper,
