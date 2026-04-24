@@ -214,6 +214,7 @@ def main():
     for geo_tag, relief in [("smooth", smooth_relief), ("textured", tex_relief)]:
         X_prev, Y_prev = 0.0, -0.4
         g_prev = None
+        W_prev = 0.0
         print(f"\n{'='*60}")
         print(f"  {geo_tag.upper()}")
 
@@ -221,6 +222,13 @@ def main():
             Wx, Wy = get_load_at_angle(cycle, phi_deg)
             Wa = np.array([Wx, Wy], dtype=float)
             Wn = float(np.linalg.norm(Wa))
+
+            # Smart seed: reset if load jumps >50%
+            load_jump = abs(Wn - W_prev) / max(W_prev, 100.0)
+            if load_jump > 0.5 or i == 0:
+                eps_seed = min(0.85, 0.4 * (Wn / 1000.0) ** 0.25)
+                X_prev, Y_prev = 0.0, -eps_seed
+                g_prev = None
 
             t0 = time.time()
             d, g_out = solve_eq(
@@ -232,6 +240,7 @@ def main():
             if d["status"] != "failed":
                 X_prev, Y_prev = d["X"], d["Y"]
                 g_prev = g_out
+            W_prev = Wn
 
             row = dict(
                 geometry=geo_tag,
@@ -268,9 +277,11 @@ def main():
         print(f"\n  {geo_tag} quasi-static ratio max: {max_Rsq:.4f} "
               f"({'OK' if max_Rsq < 0.5 else 'WARN'})")
 
-    # Summary metrics
+    # Summary metrics — full + matched
     print(f"\n{'='*60}")
-    print(f"Summary:")
+    print(f"Summary (full — subsets may differ):")
+    dphi_cycle = 720.0 / args.n_points
+    dt_step = dphi_cycle / (360.0 * n_rpm / 60.0)
     for geo_tag in ["smooth", "textured"]:
         geo_rows = [r for r in all_rows if r["geometry"] == geo_tag
                      and r["status"] != "failed"]
@@ -281,14 +292,35 @@ def main():
         hmin_arr = [r["h_min_um"] for r in geo_rows]
         pmax_arr = [r["p_max_MPa"] for r in geo_rows]
         eps_arr = [r["eps"] for r in geo_rows]
-        dphi = 720.0 / len(geo_rows)
-        dt_step = dphi / (360.0 * n_rpm / 60.0)
         Ef = sum(p * dt_step for p in Ploss_arr)
         Pmean = sum(Ploss_arr) / len(Ploss_arr)
-        n_acc = sum(1 for r in geo_rows if r["status"] in ("hard_converged","soft_converged"))
+        n_total = sum(1 for r in all_rows if r["geometry"] == geo_tag)
         print(f"  {geo_tag}: Ef={Ef:.3f}J Pmean={Pmean:.1f}W "
               f"hmin_min={min(hmin_arr):.1f}μm pmax_max={max(pmax_arr):.1f}MPa "
-              f"eps_max={max(eps_arr):.4f} acc={n_acc}/{len(geo_rows)}")
+              f"eps_max={max(eps_arr):.4f} acc={len(geo_rows)}/{n_total}")
+
+    # Matched comparison — only angles where BOTH converged
+    sm_by_phi = {r["phi_crank_deg"]: r for r in all_rows
+                  if r["geometry"] == "smooth" and r["status"] != "failed"}
+    tx_by_phi = {r["phi_crank_deg"]: r for r in all_rows
+                  if r["geometry"] == "textured" and r["status"] != "failed"}
+    matched_phis = sorted(set(sm_by_phi.keys()) & set(tx_by_phi.keys()))
+    frac_matched = len(matched_phis) / max(args.n_points, 1)
+    print(f"\nMatched comparison ({len(matched_phis)}/{args.n_points} = "
+          f"{frac_matched*100:.0f}% of cycle):")
+    if matched_phis:
+        sm_Ploss = [sm_by_phi[p]["Ploss_W"] for p in matched_phis]
+        tx_Ploss = [tx_by_phi[p]["Ploss_W"] for p in matched_phis]
+        Ef_sm = sum(p * dt_step for p in sm_Ploss)
+        Ef_tx = sum(p * dt_step for p in tx_Ploss)
+        Pm_sm = sum(sm_Ploss) / len(sm_Ploss)
+        Pm_tx = sum(tx_Ploss) / len(tx_Ploss)
+        dPm = (Pm_tx - Pm_sm) / max(Pm_sm, 1e-20) * 100
+        print(f"  smooth_matched: Pmean={Pm_sm:.1f}W Ef={Ef_sm:.3f}J")
+        print(f"  textured_matched: Pmean={Pm_tx:.1f}W Ef={Ef_tx:.3f}J")
+        print(f"  ΔPmean = {dPm:+.1f}%")
+    else:
+        print(f"  no matched angles — cannot compare")
 
     # CSV
     cp = os.path.join(args.out, "cycle_history.csv")
