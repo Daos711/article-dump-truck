@@ -161,105 +161,234 @@ def test_solver_result_sane_rejects_huge_P():
     assert not _solver_result_is_sane(1.0, P)
 
 
-# ─── 3. Cold-retry contract via _solve_and_check (synthetic solver) ──
+# ─── 3. Retry-omega gate contract via _solve_and_check (synthetic) ──
 
-def test_solve_and_check_retries_on_first_failure_with_cold_start():
-    """When the first attempt with warm P_init triggers SOR-warning,
-    the wrapper must retry with P_init=None and return the second
-    result. Counter records the retry tag so the script can log it.
+def _fake_solver_factory(*, fail_unless_omega=None,
+                            recovery_omega=None,
+                            always_fail=False):
+    """Build a synthetic ``solve_and_compute`` substitute.
+
+    * ``always_fail=True``: every call emits the SOR-non-convergence
+      warning and returns NaN.
+    * ``recovery_omega``: when ``closure_kw["omega"]`` matches this
+      value, succeed; otherwise emit the SOR warning.
+    * ``fail_unless_omega``: succeed only when omega is provided AND
+      equals ``fail_unless_omega``.
     """
     import warnings as _warnings
-    import models.diesel_quasistatic as dq
-
-    # Build a fake solve_and_compute that fails on the first call (only
-    # if P_init is given) and succeeds on the cold restart.
     call_log = []
 
-    def fake_solve(H, d_phi, d_Z, R, L, eta, n, c,
-                   phi_1D, Z_1D, Phi_mesh, **kw):
+    def fake(H, d_phi, d_Z, R, L, eta, n, c,
+             phi_1D, Z_1D, Phi_mesh, **kw):
         p_init = kw.get("P_init")
-        call_log.append(p_init is not None)
-        if p_init is not None:
+        ckw = kw.get("closure_kw") or {}
+        omega = ckw.get("omega")
+        max_iter = ckw.get("max_iter")
+        call_log.append(dict(p_init_is_none=(p_init is None),
+                              omega=omega, max_iter=max_iter))
+        succeed = False
+        if always_fail:
+            succeed = False
+        elif recovery_omega is not None:
+            succeed = (omega is not None and
+                        abs(float(omega) - float(recovery_omega)) < 1e-9)
+        elif fail_unless_omega is not None:
+            succeed = (omega is not None and
+                        abs(float(omega) - float(fail_unless_omega))
+                        < 1e-9)
+        if not succeed:
             _warnings.warn(
                 "SOR не сошёлся: delta=2.0e-04, n_iter=50000",
                 UserWarning)
-            P = np.full(H.shape, np.nan)
-            return (P, float("nan"), float("nan"), float("nan"),
+            return (np.full(H.shape, np.nan),
+                    float("nan"), float("nan"), float("nan"),
                     float("nan"), float("nan"), float("nan"),
                     0, None, 0.0)
-        # Cold start: clean finite result.
-        P = np.full(H.shape, 1.0e6)
-        return (P, 1.0e4, 0.01, 1.0e-5, 30e-6, 1.0e7, 50.0,
+        return (np.full(H.shape, 1.0e6),
+                1.0e4, 0.01, 1.0e-5, 30e-6, 1.0e7, 50.0,
                 100, None, 0.0)
-
-    H = np.ones((4, 4))
-    monkey_target = dq.solve_and_compute
-    try:
-        dq.solve_and_compute = fake_solve
-        warm = np.full((4, 4), 5.0e5)
-        out = dq._solve_and_check(
-            H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
-            np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
-            P_init=warm,
-            allow_cold_retry=True,
-        )
-    finally:
-        dq.solve_and_compute = monkey_target
-    assert call_log == [True, False], call_log
-    P_out, F_out = out[0], out[1]
-    ok = out[7]; reason = out[8]
-    assert ok is True
-    assert F_out == pytest.approx(1.0e4)
-    assert reason in ("retried_cold_start", "retried_with_kw")
-    # The cold-start result must NOT be NaN — never propagate the
-    # poisoned warm-start pressure forward.
-    assert np.all(np.isfinite(P_out))
+    return fake, call_log
 
 
-def test_solve_and_check_no_retry_when_disabled_or_cold_start():
-    """allow_cold_retry=False, OR P_init already None, must NOT retry."""
-    import warnings as _warnings
+def _patched_solve_and_compute(monkey_fn):
     import models.diesel_quasistatic as dq
+    target = dq.solve_and_compute
 
-    call_log = []
+    class _Patcher:
+        def __enter__(self_inner):
+            dq.solve_and_compute = monkey_fn
+            return dq
 
-    def fake_solve(H, d_phi, d_Z, R, L, eta, n, c,
-                   phi_1D, Z_1D, Phi_mesh, **kw):
-        call_log.append(kw.get("P_init") is not None)
-        _warnings.warn(
-            "SOR не сошёлся: delta=2.0e-04, n_iter=50000",
-            UserWarning)
-        return (np.full(H.shape, np.nan), float("nan"), float("nan"),
-                float("nan"), float("nan"), float("nan"),
-                float("nan"), 0, None, 0.0)
+        def __exit__(self_inner, *a):
+            dq.solve_and_compute = target
 
+    return _Patcher()
+
+
+def test_solve_and_check_forwards_closure_kw_to_solver():
+    """The whole purpose of Stage Texture Stability 2: closure_kw must
+    actually reach solve_and_compute. Without this the omega override
+    is decorative."""
+    from models.diesel_quasistatic import _solve_and_check, SolverRetryConfig
+    fake, log = _fake_solver_factory(recovery_omega=1.70)
     H = np.ones((4, 4))
-    monkey_target = dq.solve_and_compute
-    try:
-        dq.solve_and_compute = fake_solve
-        warm = np.full((4, 4), 5.0e5)
-        # allow_cold_retry=False
-        out = dq._solve_and_check(
+    with _patched_solve_and_compute(fake):
+        out = _solve_and_check(
+            H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
+            np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
+            P_init=np.full((4, 4), 5.0e5),
+            retry_config=SolverRetryConfig(
+                enabled=True, textured_only=True,
+                omega_values=(1.70, 1.55),
+                max_iter_retry=99_000,
+            ),
+        )
+    # Primary sees no omega; retry sees omega=1.70.
+    assert log[0]["omega"] is None
+    assert log[1]["omega"] == pytest.approx(1.70)
+    assert log[1]["max_iter"] == 99_000
+    assert out[7] is True
+    assert out[8] == "ok_retry_omega_1p700"
+
+
+def test_retry_iterates_omega_in_order_and_stops_on_success():
+    """When omega=1.70 fails but omega=1.55 succeeds, the wrapper must
+    issue both retries and return the omega=1.55 result."""
+    from models.diesel_quasistatic import _solve_and_check, SolverRetryConfig
+    fake, log = _fake_solver_factory(recovery_omega=1.55)
+    H = np.ones((4, 4))
+    with _patched_solve_and_compute(fake):
+        out = _solve_and_check(
+            H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
+            np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
+            P_init=np.full((4, 4), 5.0e5),
+            retry_config=SolverRetryConfig(
+                omega_values=(1.70, 1.55), max_iter_retry=100_000),
+        )
+    # Three calls: primary, retry omega=1.70, retry omega=1.55.
+    assert len(log) == 3
+    assert log[1]["omega"] == pytest.approx(1.70)
+    assert log[2]["omega"] == pytest.approx(1.55)
+    assert out[7] is True
+    assert out[8] == "ok_retry_omega_1p550"
+
+
+def test_retry_exhaustion_documents_every_attempt_in_reason():
+    """All omega retries fail → reason concatenates the chain so the
+    runner can mark the angle 'solver_failed_after_retry'."""
+    from models.diesel_quasistatic import (
+        _parse_retry_outcome, _solve_and_check, SolverRetryConfig)
+    fake, log = _fake_solver_factory(always_fail=True)
+    H = np.ones((4, 4))
+    with _patched_solve_and_compute(fake):
+        out = _solve_and_check(
+            H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
+            np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
+            P_init=np.full((4, 4), 5.0e5),
+            retry_config=SolverRetryConfig(omega_values=(1.70, 1.55)),
+        )
+    assert len(log) == 3
+    assert out[7] is False
+    reason = out[8]
+    assert reason.startswith("primary:")
+    assert "retry_omega_1p700" in reason
+    assert "retry_omega_1p550" in reason
+    parsed = _parse_retry_outcome(reason)
+    assert parsed["exhausted"] is True
+    assert parsed["retry_recovered"] is False
+
+
+def test_retry_uses_cold_start_by_default():
+    """SolverRetryConfig.cold_start=True ⇒ retry calls pass P_init=None
+    even if the primary used a warm pressure."""
+    from models.diesel_quasistatic import _solve_and_check, SolverRetryConfig
+    fake, log = _fake_solver_factory(recovery_omega=1.70)
+    H = np.ones((4, 4))
+    warm = np.full((4, 4), 5.0e5)
+    with _patched_solve_and_compute(fake):
+        _solve_and_check(
             H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
             np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
             P_init=warm,
-            allow_cold_retry=False,
+            retry_config=SolverRetryConfig(
+                omega_values=(1.70,), cold_start=True),
         )
-        assert call_log == [True]
-        assert out[7] is False
+    assert log[0]["p_init_is_none"] is False
+    assert log[1]["p_init_is_none"] is True
 
-        call_log.clear()
-        # P_init=None already cold; no retry possible
-        out2 = dq._solve_and_check(
+
+def test_retry_disabled_when_no_retry_config():
+    """retry_config=None ⇒ no retry attempted, even on failure."""
+    from models.diesel_quasistatic import _solve_and_check
+    fake, log = _fake_solver_factory(always_fail=True)
+    H = np.ones((4, 4))
+    with _patched_solve_and_compute(fake):
+        out = _solve_and_check(
             H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
             np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
-            P_init=None,
-            allow_cold_retry=True,
+            P_init=np.full((4, 4), 5.0e5),
+            retry_config=None,
         )
-        assert call_log == [False]
-        assert out2[7] is False
-    finally:
-        dq.solve_and_compute = monkey_target
+    assert len(log) == 1
+    assert out[7] is False
+    assert out[8] == "SOR_did_not_converge"
+
+
+def test_retry_disabled_for_smooth_when_textured_only():
+    """SolverRetryConfig.applicable(textured=False) is False when
+    textured_only=True. No retry must be attempted for smooth configs.
+    """
+    from models.diesel_quasistatic import (
+        SolverRetryConfig, build_load_table)
+    cfg = SolverRetryConfig(
+        enabled=True, textured_only=True,
+        omega_values=(1.70, 1.55))
+    assert cfg.applicable(textured=False) is False
+    assert cfg.applicable(textured=True) is True
+
+    cfg2 = SolverRetryConfig(
+        enabled=True, textured_only=False,
+        omega_values=(1.70,))
+    assert cfg2.applicable(textured=False) is True
+
+
+def test_retry_failed_pressure_never_propagates_via_warm_start():
+    """A failed primary returns NaN pressure via the result tuple, but
+    the wrapper itself must never reuse that NaN as P_init for the
+    retry — the retry must see either P_init=None (cold_start=True)
+    or the original warm pressure (cold_start=False), never the
+    poisoned NaN."""
+    from models.diesel_quasistatic import _solve_and_check, SolverRetryConfig
+    fake, log = _fake_solver_factory(recovery_omega=1.55)
+    H = np.ones((4, 4))
+    warm = np.full((4, 4), 5.0e5)
+    with _patched_solve_and_compute(fake):
+        _solve_and_check(
+            H, 0.1, 0.1, 0.05, 0.04, 0.01, 1000.0, 5e-5,
+            np.arange(4), np.linspace(-1, 1, 4), np.zeros((4, 4)),
+            P_init=warm,
+            retry_config=SolverRetryConfig(
+                omega_values=(1.70, 1.55), cold_start=True),
+        )
+    # Three calls: primary uses warm; retries use cold-start.
+    assert log[0]["p_init_is_none"] is False
+    assert log[1]["p_init_is_none"] is True
+    assert log[2]["p_init_is_none"] is True
+
+
+def test_parse_retry_outcome_classifies_known_reason_strings():
+    from models.diesel_quasistatic import _parse_retry_outcome
+    assert _parse_retry_outcome("ok") == dict(
+        primary_ok=True, retry_recovered=False,
+        retry_omega=None, exhausted=False)
+    rec = _parse_retry_outcome("ok_retry_omega_1p700")
+    assert rec["retry_recovered"] is True
+    assert rec["retry_omega"] == pytest.approx(1.700)
+    rec = _parse_retry_outcome(
+        "primary:SOR_did_not_converge;"
+        "retry_omega_1p700:SOR_did_not_converge")
+    assert rec["exhausted"] is True
+    assert rec["retry_recovered"] is False
 
 
 # ─── 4. W_table NaN-tolerant interpolation ─────────────────────────

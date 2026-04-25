@@ -44,6 +44,7 @@ from models.diesel_quasistatic import (
     CONFIG_KEYS, CONFIGS, run_diesel_analysis,
 )
 from models.thermal_coupling import ThermalConfig
+from models.diesel_quasistatic import SolverRetryConfig
 from config import diesel_params as params
 
 
@@ -238,6 +239,21 @@ def _write_summary(run_dir, results, thermal, configs, *,
         lines.append(
             f"    W_table: n_failed={n_wfail}, "
             f"cold_retry_recovered={n_retry}, monotone={wmono}")
+        # Retry counters (Stage Texture Stability 2).
+        inner_rec = int(results.get("inner_retry_recovered",
+                                        np.zeros(1))[ic])
+        inner_exh = int(results.get("inner_retry_exhausted",
+                                        np.zeros(1))[ic])
+        omega_hits = (results.get("omega_hits_per_config",
+                                     [{}] * (ic + 1))[ic])
+        omega_lines = ", ".join(
+            f"{tag}={n}" for tag, n in sorted(omega_hits.items())
+        ) or "(none)"
+        lines.append(
+            f"    retry: W_table_recovered={n_retry}, "
+            f"inner_recovered={inner_rec}, "
+            f"inner_exhausted={inner_exh}")
+        lines.append(f"    retry omega hits: {omega_lines}")
         lines.append("")
 
     # Paired comparison block (Section 1 of the patch).
@@ -336,6 +352,14 @@ def _save_data(run_dir, results, thermal, grid):
                                          float("nan")),
         texture_profile_used=results.get("texture_profile_used",
                                             "sqrt"),
+        inner_retry_recovered=results.get("inner_retry_recovered",
+                                             np.zeros(0,
+                                                       dtype=np.int32)),
+        inner_retry_exhausted=results.get("inner_retry_exhausted",
+                                             np.zeros(0,
+                                                       dtype=np.int32)),
+        W_table_retry_recovered=results.get(
+            "W_table_retry_recovered", np.zeros(0, dtype=np.int32)),
         thermal_mode=thermal.mode,
         gamma=thermal.gamma_mix,
         T_in_C=thermal.T_in_C,
@@ -351,6 +375,8 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
     eps_max_hydro = getattr(args, "eps_max_hydro", None)
     texture_h_p_m = getattr(args, "texture_h_p_m_resolved", None)
     texture_profile = getattr(args, "texture_profile", "current")
+    retry_cfg = getattr(args, "retry_config", None)
+    retry_source = getattr(args, "retry_source", "")
     extra_tag_parts = []
     if texture_h_p_m is not None:
         extra_tag_parts.append(f"texdepth{int(round(texture_h_p_m*1e6))}um")
@@ -358,6 +384,8 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
         extra_tag_parts.append(f"profile_{texture_profile}")
     if getattr(args, "F_max_debug", False):
         extra_tag_parts.append("Fmaxdebug")
+    if retry_cfg is not None and retry_cfg.enabled:
+        extra_tag_parts.append("retry_omega_gate")
     extra_tag = "_".join(extra_tag_parts)
     run_dir = _make_run_dir(out_base, thermal.gamma_mix,
                               extra_tag=extra_tag)
@@ -374,6 +402,8 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
         print(f"  texture depth override: {texture_h_p_m*1e6:.1f} um")
     if texture_profile not in ("current", "sqrt"):
         print(f"  texture profile override: {texture_profile}")
+    if retry_source:
+        print(f"  retry policy: {retry_source}")
     print("=" * 60)
 
     phi = np.linspace(0.0, 720.0, int(args.n_crank), endpoint=False)
@@ -389,6 +419,7 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
         eps_max_hydro=eps_max_hydro,
         texture_h_p_m=texture_h_p_m,
         texture_profile=texture_profile,
+        retry_config=retry_cfg,
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -430,9 +461,52 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
                      "Peak pressure",
                      cfg_for_plot, run_dir)
     _plot_load_status(phi, results["load_status"], cfg_for_plot, run_dir)
+    _plot_retry_status(results, cfg_for_plot, run_dir)
 
     print(f"  done in {dt:.1f}s")
     return run_dir
+
+
+def _plot_retry_status(results, configs, run_dir):
+    """Aggregated retry counters per config: stacked bar of
+    W_table_retry / inner_retry / exhausted per omega.
+    """
+    n_cfg = len(configs)
+    if n_cfg == 0:
+        return
+    Wt = np.asarray(results.get("W_table_retry_recovered",
+                                   np.zeros(n_cfg)))
+    Ir = np.asarray(results.get("inner_retry_recovered",
+                                   np.zeros(n_cfg)))
+    Ie = np.asarray(results.get("inner_retry_exhausted",
+                                   np.zeros(n_cfg)))
+    omega_hits_list = results.get("omega_hits_per_config",
+                                     [{}] * n_cfg)
+    fig, ax = plt.subplots(figsize=(10, 4 + 0.4 * n_cfg))
+    ys = np.arange(n_cfg)
+    ax.barh(ys - 0.20, Wt, height=0.18, color="#4477aa",
+            label="W_table retry recovered")
+    ax.barh(ys + 0.00, Ir, height=0.18, color="#117733",
+            label="inner retry recovered")
+    ax.barh(ys + 0.20, Ie, height=0.18, color="#cc6677",
+            label="inner exhausted (failed after retry)")
+    for i, hits in enumerate(omega_hits_list):
+        if not hits:
+            continue
+        text = ", ".join(f"{tag}: {n}" for tag, n
+                         in sorted(hits.items()))
+        ax.annotate(text, (max(0.0, max(Wt[i], Ir[i], Ie[i]) + 0.1),
+                              i + 0.4),
+                    fontsize=8, color="#333")
+    ax.set_yticks(ys)
+    ax.set_yticklabels([cfg["label"] for cfg in configs], fontsize=8)
+    ax.set_xlabel("count of crank-angle solves", fontsize=11)
+    ax.set_title("Retry policy outcomes per config", fontsize=12)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, "retry_status_vs_phi.png"), dpi=150)
+    plt.close(fig)
 
 
 def _plot_load_status(phi, load_status, configs, run_dir):
@@ -518,6 +592,20 @@ def main(argv=None):
                     help="Texture profile shape. 'current' / 'sqrt' uses "
                          "the historical ellipsoidal profile; "
                          "'smoothcap' uses the (1-r^2)^2 cap shape.")
+    # Stage Texture Stability 2 — lower-omega retry knobs.
+    pa.add_argument("--retry-omega", dest="retry_omega",
+                    default="1.70,1.55",
+                    help="Comma-separated SOR omega values for the "
+                         "conservative retry sequence on textured "
+                         "failures. Defaults to '1.70,1.55'.")
+    pa.add_argument("--retry-max-iter", dest="retry_max_iter",
+                    type=int, default=100_000,
+                    help="max_iter passed via closure_kw on each "
+                         "retry attempt. Default 100000.")
+    pa.add_argument("--no-texture-retry", dest="no_texture_retry",
+                    action="store_true",
+                    help="Disable the textured-only conservative SOR "
+                         "retry. Use to confirm a baseline behaviour.")
     args = pa.parse_args(argv)
 
     # Resolve F_max precedence: explicit --F-max > --F-max-debug > default;
@@ -540,6 +628,31 @@ def main(argv=None):
         F_max_source += f" * scale={scale}"
     args.F_max_resolved = F_max_resolved
     args.F_max_source = F_max_source
+
+    # Build retry policy from CLI.
+    if args.no_texture_retry:
+        retry_cfg = SolverRetryConfig.disabled()
+        retry_source = "disabled via --no-texture-retry"
+    else:
+        try:
+            omegas = tuple(float(x) for x in
+                            args.retry_omega.split(",") if x.strip())
+        except Exception as exc:
+            raise SystemExit(
+                f"--retry-omega must be a comma-separated list of "
+                f"floats; got {args.retry_omega!r}: {exc}")
+        retry_cfg = SolverRetryConfig(
+            enabled=True,
+            textured_only=True,
+            omega_values=omegas,
+            max_iter_retry=int(args.retry_max_iter),
+            cold_start=True,
+        )
+        retry_source = (f"textured-only, omegas={list(omegas)}, "
+                         f"max_iter_retry={args.retry_max_iter}, "
+                         f"cold_start=True")
+    args.retry_config = retry_cfg
+    args.retry_source = retry_source
 
     configs = _select_configs(_parse_csv(args.configs))
 

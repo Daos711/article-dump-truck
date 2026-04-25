@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -40,6 +41,88 @@ _P_SANITY_LIMIT_Pa = 1.0e10    # 10 GPa — 1 order of magnitude above
                                 #         peak hydrodynamic pressure
 _SOR_WARN_FRAGMENT = "SOR не сошёлся"  # exact warning emitted by
                                           # bearing_model on non-conv.
+
+
+@dataclass(frozen=True)
+class SolverRetryConfig:
+    """Stage Texture Stability 2 — retry policy for textured SOR
+    failures.
+
+    Pipeline-side helper. Encodes a sequence of conservative SOR
+    omega values to try after a primary solve fails. Each retry uses
+    a cold start (``P_init=None``) by default so a poisoned warm
+    pressure cannot bias the retry. Smooth configs do not trigger
+    retries unless ``textured_only`` is False.
+
+    Iteration order: primary (no override) → omega_values[0] →
+    omega_values[1] → ... — first one to satisfy the sanity threshold
+    wins.
+    """
+    enabled: bool = True
+    textured_only: bool = True
+    omega_values: Tuple[float, ...] = (1.70, 1.55)
+    max_iter_retry: int = 100_000
+    cold_start: bool = True
+
+    @classmethod
+    def disabled(cls) -> "SolverRetryConfig":
+        return cls(enabled=False)
+
+    def applicable(self, textured: bool) -> bool:
+        if not self.enabled:
+            return False
+        if self.textured_only and not textured:
+            return False
+        return bool(self.omega_values)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(
+            enabled=self.enabled,
+            textured_only=self.textured_only,
+            omega_values=list(self.omega_values),
+            max_iter_retry=self.max_iter_retry,
+            cold_start=self.cold_start,
+        )
+
+
+def _omega_tag(omega: float) -> str:
+    """``omega=1.70`` → ``omega_1p700`` (used for reason annotations
+    and counter keys)."""
+    return f"omega_{omega:.3f}".replace(".", "p")
+
+
+# Reason prefix constants surfaced through ``_solve_and_check``.
+_REASON_OK = "ok"
+_REASON_RETRY_OK_PREFIX = "ok_retry_"           # + omega tag
+_REASON_PRIMARY_FAIL_PREFIX = "primary:"        # + diagnostic
+_REASON_RETRY_FAIL_PREFIX = "retry_"            # + omega tag + ":" + diag
+
+
+def _parse_retry_outcome(reason: str) -> Dict[str, Any]:
+    """Bucket a reason string into the counters tracked by the runner.
+
+    Returns a dict with keys:
+        primary_ok        bool
+        retry_recovered   bool
+        retry_omega       Optional[float]   omega that saved this solve
+        exhausted         bool              all attempts failed
+    """
+    out = dict(primary_ok=False, retry_recovered=False,
+                retry_omega=None, exhausted=False)
+    if reason == _REASON_OK:
+        out["primary_ok"] = True
+    elif reason.startswith(_REASON_RETRY_OK_PREFIX):
+        out["retry_recovered"] = True
+        # ok_retry_omega_1p700 -> 1.700
+        try:
+            tag = reason[len(_REASON_RETRY_OK_PREFIX):]
+            num = tag.replace("omega_", "").replace("p", ".")
+            out["retry_omega"] = float(num)
+        except Exception:
+            out["retry_omega"] = None
+    elif reason.startswith(_REASON_PRIMARY_FAIL_PREFIX):
+        out["exhausted"] = True
+    return out
 
 from models.bearing_model import (
     setup_grid, setup_texture, make_H, solve_and_compute,
@@ -123,27 +206,33 @@ def _solve_and_check(
     H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
     phi_1D, Z_1D, Phi_mesh, *, P_init=None,
     closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
-    closure_kw_retry: Optional[Dict[str, Any]] = None,
-    allow_cold_retry: bool = True,
+    closure_kw: Optional[Dict[str, Any]] = None,
+    retry_config: Optional[SolverRetryConfig] = None,
 ):
     """Wrap solve_and_compute with SOR-warning capture + sanity check.
 
-    Returns ``(P, F, mu, Q, h_min, p_max, F_tr, ok, reason)`` where ``ok``
-    is False when the SOR warned non-convergence OR the sanity check
-    rejected the magnitudes. On failure callers should reset their
-    ``P_init`` warm-start to ``None`` and mark the angle as
-    ``solver_failed``.
+    Returns ``(P, F, mu, Q, h_min, p_max, F_tr, ok, reason)``.
 
-    Stage Texture Stability Diesel: if the first attempt fails AND
-    ``allow_cold_retry`` is True AND ``P_init`` was non-None (i.e. we
-    were warm-starting), one cold-start retry is attempted with
-    ``P_init=None``. If ``closure_kw_retry`` is supplied it is forwarded
-    to ``solve_and_compute(closure_kw=...)`` on the retry only — the
-    intent is to plug in a more conservative SOR omega when the solver
-    API exposes one. ``reason`` carries ``retried_cold_start`` /
-    ``retried_with_kw`` annotations so the script can log retry usage.
+    Primary attempt uses ``P_init`` and ``closure_kw`` as supplied. If
+    that fails (SOR non-convergence captured via warning OR magnitudes
+    fail the sanity threshold) AND ``retry_config`` is enabled, the
+    helper iterates through ``retry_config.omega_values`` issuing one
+    cold-start retry per omega with
+    ``closure_kw = {"omega": omega, "max_iter": max_iter_retry}`` (each
+    retry is a separate call into ``solve_and_compute`` so a poisoned
+    warm pressure is never reused).
+
+    Reason annotations (Section 3 of Stage Texture Stability 2):
+
+      * ``"ok"`` — primary attempt succeeded.
+      * ``"ok_retry_omega_<X>"`` — the first retry that satisfied the
+        sanity threshold; ``<X>`` is the omega encoded as ``1p700``.
+      * ``"primary:<reason>;retry_omega_<X>:<reason>;..."`` — every
+        attempt failed; reason chain documents what was tried.
+
+    The pipeline runner parses these via ``_parse_retry_outcome``.
     """
-    def _attempt(*, p_init, closure_kw=None):
+    def _attempt(*, p_init, closure_kw_local):
         sor_diverged = False
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -152,10 +241,14 @@ def _solve_and_check(
                     H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
                     phi_1D, Z_1D, Phi_mesh, P_init=p_init,
                     closure=closure, cavitation=cavitation,
-                    closure_kw=closure_kw,
+                    closure_kw=closure_kw_local,
                 )
             except TypeError:
-                # Older solver builds may not accept closure_kw=None.
+                # Older solver builds may not accept closure_kw=...; if
+                # closure_kw_local was non-None this counts as a
+                # configuration failure (we can't request an omega the
+                # solver doesn't expose). Fall back to a no-kw call so
+                # primary still runs; retry is only meaningful with kw.
                 P, F, mu_v, Qv, hm, pm, F_tr, _, _, _ = solve_and_compute(
                     H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
                     phi_1D, Z_1D, Phi_mesh, P_init=p_init,
@@ -180,34 +273,39 @@ def _solve_and_check(
                     float("nan"), float("nan"), float("nan"), False,
                     f"non_physical:F={F_repr},{P_repr}")
         return (P, float(F), float(mu_v), float(Qv), float(hm),
-                float(pm), float(F_tr), True, "ok")
+                float(pm), float(F_tr), True, _REASON_OK)
 
-    res = _attempt(p_init=P_init, closure_kw=None)
+    res = _attempt(p_init=P_init, closure_kw_local=closure_kw)
     if res[7]:
         return res
+    primary_reason = res[8]
 
-    # Stage Texture Stability Diesel — conservative retry. Only retry if
-    # the first attempt was warm-started (cold start can't get worse by
-    # restarting cold). Never reuse pressure from the failed solve.
-    first_reason = res[8]
-    if not allow_cold_retry or P_init is None:
+    # No retry configured → return primary failure as-is.
+    if retry_config is None or not retry_config.enabled \
+            or not retry_config.omega_values:
         return res
 
-    res2 = _attempt(p_init=None, closure_kw=closure_kw_retry)
-    if res2[7]:
-        # Annotate the success so callers can count retries.
-        annotated = list(res2)
-        tag = "retried_cold_start"
-        if closure_kw_retry:
-            tag = "retried_with_kw"
-        annotated[8] = tag
-        return tuple(annotated)
-    # Both attempts failed. Combine reasons in the diagnostic string.
-    annotated = list(res2)
-    annotated[8] = (
-        f"first:{first_reason};retry_cold:{res2[8]}"
-    )
-    return tuple(annotated)
+    # Stage Texture Stability 2 — sequential lower-omega retries.
+    # Each omega gets its own cold-start (or warm if cold_start=False).
+    # First one to succeed wins; on success we annotate the reason
+    # so the runner can count which omega did the saving.
+    p_init_retry = None if retry_config.cold_start else P_init
+    fail_chain = [f"primary:{primary_reason}"]
+    for omega in retry_config.omega_values:
+        retry_kw = {"omega": float(omega),
+                    "max_iter": int(retry_config.max_iter_retry)}
+        res_r = _attempt(p_init=p_init_retry, closure_kw_local=retry_kw)
+        if res_r[7]:
+            tag = f"{_REASON_RETRY_OK_PREFIX}{_omega_tag(omega)}"
+            return (*res_r[:8], tag)
+        fail_chain.append(
+            f"{_REASON_RETRY_FAIL_PREFIX}{_omega_tag(omega)}:{res_r[8]}"
+        )
+
+    # All attempts exhausted — combine reasons.
+    out = list(res)  # keep last NaN payload
+    out[8] = ";".join(fail_chain)
+    return tuple(out)
 
 
 def _eps_max_hydro(override: Optional[float] = None) -> float:
@@ -229,7 +327,8 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
                      closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
                      eps_max_hydro: Optional[float] = None,
                      params_view=None,
-                     profile: str = "sqrt"):
+                     profile: str = "sqrt",
+                     retry_config: Optional[SolverRetryConfig] = None):
     """Построить таблицу W(ε) для быстрой интерполяции.
 
     Reference viscosity is ``oil["eta_diesel"]``. THD path uses this same
@@ -264,8 +363,17 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     if params_view is None:
         params_view = params
 
+    # Retry policy applies only when caller supplied one; default in
+    # this module is "no retry" so smooth runs are bit-identical with
+    # the legacy isothermal path.
+    rc = retry_config
+    if rc is not None and not rc.applicable(textured):
+        rc = None
+
     n_failed = 0
     n_retried = 0
+    omega_hits: Dict[str, int] = {}
+    n_exhausted = 0
     for i, eps in enumerate(eps_table):
         H = make_H(eps, Phi_mesh, Z_mesh, params_view,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c,
@@ -274,10 +382,19 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
             closure=closure, cavitation=cavitation,
-            allow_cold_retry=textured,  # retry only for textured
+            retry_config=rc,
         )
-        if reason in ("retried_cold_start", "retried_with_kw"):
+        outcome = _parse_retry_outcome(reason)
+        if outcome["retry_recovered"]:
             n_retried += 1
+            tag = _omega_tag(outcome["retry_omega"])
+            omega_hits[tag] = omega_hits.get(tag, 0) + 1
+            print(f"    [retry] W_table eps={eps:.3f} primary "
+                  f"SOR_did_not_converge -> retry "
+                  f"omega={outcome['retry_omega']:.2f} "
+                  f"cold_start recovered")
+        if outcome["exhausted"]:
+            n_exhausted += 1
         if not ok:
             print(f"    [warn] W_table eps={eps:.3f} rejected: {reason}; "
                   f"resetting P_init")
@@ -310,6 +427,8 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     return eps_table, W_table, dict(
         n_failed=int(n_failed),
         n_retried_cold=int(n_retried),
+        n_exhausted=int(n_exhausted),
+        omega_hits=dict(omega_hits),
         monotone=monotone,
     )
 
@@ -321,7 +440,9 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
                           eta=None,
                           eps_max_hydro: Optional[float] = None,
                           params_view=None,
-                          profile: str = "sqrt"):
+                          profile: str = "sqrt",
+                          retry_config: Optional[SolverRetryConfig] = None,
+                          retry_counter: Optional[Dict[str, Any]] = None):
     """Найти ε для заданной нагрузки: локализация по таблице + 5 шагов бисекции.
 
     ``eta`` overrides the per-oil isothermal viscosity (Section 4 of the
@@ -384,6 +505,21 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
 
     eps_mid = 0.5 * (eps_lo + eps_hi)
     F_hyd = mu = Qv = h_min = p_max = F_tr = 0.0
+    rc = retry_config
+    if rc is not None and not rc.applicable(textured):
+        rc = None
+
+    def _bump(key, by=1):
+        if retry_counter is None:
+            return
+        retry_counter[key] = retry_counter.get(key, 0) + by
+
+    def _bump_omega(omega):
+        if retry_counter is None or omega is None:
+            return
+        hits = retry_counter.setdefault("omega_hits", {})
+        tag = _omega_tag(omega)
+        hits[tag] = hits.get(tag, 0) + 1
 
     for _ in range(5):
         eps_mid = 0.5 * (eps_lo + eps_hi)
@@ -398,9 +534,18 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
                 params.n, params.c,
                 phi_1D, Z_1D, Phi_mesh,
                 closure=closure, cavitation=cavitation,
-                allow_cold_retry=textured,
+                retry_config=rc,
             )
         )
+        outcome = _parse_retry_outcome(reason)
+        if outcome["retry_recovered"]:
+            _bump("retry_recovered")
+            _bump_omega(outcome["retry_omega"])
+            print(f"    [retry] inner solve eps={eps_mid:.3f} primary "
+                  f"SOR_did_not_converge -> retry "
+                  f"omega={outcome['retry_omega']:.2f} recovered")
+        if outcome["exhausted"]:
+            _bump("exhausted")
         if not ok:
             print(f"    [warn] inner solve eps={eps_mid:.3f} rejected: "
                   f"{reason}")
@@ -434,6 +579,8 @@ def _angle_thd_step(
     eps_max_hydro: Optional[float] = None,
     params_view=None,
     profile: str = "sqrt",
+    retry_config: Optional[SolverRetryConfig] = None,
+    retry_counter: Optional[Dict[str, Any]] = None,
 ):
     """Per-angle THD outer loop. Returns dict with all per-angle scalars.
 
@@ -479,6 +626,8 @@ def _angle_thd_step(
                 eps_max_hydro=eps_max_hydro,
                 params_view=params_view,
                 profile=profile,
+                retry_config=retry_config,
+                retry_counter=retry_counter,
             )
         )
         if status in ("wtable_failed", "solver_failed"):
@@ -572,7 +721,8 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                           F_max: Optional[float] = None,
                           eps_max_hydro: Optional[float] = None,
                           texture_h_p_m: Optional[float] = None,
-                          texture_profile: Optional[str] = None):
+                          texture_profile: Optional[str] = None,
+                          retry_config: Optional[SolverRetryConfig] = None):
     """Выполнить квазистационарный расчёт ДВС для всех конфигураций.
 
     Parameters
@@ -672,8 +822,18 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
     n_solver_failed_arr = np.zeros(n_cfg, dtype=np.int32)
     load_coverable_arr = np.full(n_cfg, n_phi, dtype=np.int32)
     solver_success_on_coverable = np.full(n_cfg, np.nan)
+    # Stage Texture Stability 2 — retry counters per config.
+    inner_retry_recovered_arr = np.zeros(n_cfg, dtype=np.int32)
+    inner_retry_exhausted_arr = np.zeros(n_cfg, dtype=np.int32)
+    omega_hits_per_cfg: List[Dict[str, int]] = [
+        dict() for _ in range(n_cfg)
+    ]
 
     U = _omega_rad_s() * params.R
+
+    # Default retry policy: enabled, textured-only, omegas (1.70, 1.55).
+    if retry_config is None:
+        retry_config = SolverRetryConfig()
 
     for ic, cfg in enumerate(cfg_list):
         print(f"  [{ic+1}/{n_cfg}] {cfg['label']}...")
@@ -688,10 +848,18 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
             eps_max_hydro=eps_top,
             params_view=params_view,
             profile=profile,
+            retry_config=retry_config,
         )
         W_table_n_failed[ic] = int(wtable_info.get("n_failed", 0))
         W_table_n_retried_cold[ic] = int(wtable_info.get("n_retried_cold", 0))
         W_table_monotone[ic] = bool(wtable_info.get("monotone", True))
+        # Accumulate per-omega hits from the W_table loop into the
+        # per-config aggregator (the inner-loop counter will bump the
+        # same dict).
+        for tag, n in (wtable_info.get("omega_hits") or {}).items():
+            omega_hits_per_cfg[ic][tag] = (
+                omega_hits_per_cfg[ic].get(tag, 0) + int(n)
+            )
         finite_mask = np.isfinite(W_table)
         n_finite = int(finite_mask.sum())
         if n_finite >= 1:
@@ -730,6 +898,10 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
         # Шаг 2: по каждому углу.
         n_below = n_above = n_solver_failed = 0
         n_energy_unconverged = 0
+        # Counter dict mutated in-place by find_epsilon_for_load /
+        # _angle_thd_step; aggregates inner-bisection retry events
+        # across all crank angles for this config.
+        inner_retry_counter: Dict[str, Any] = {}
         for ip, phi_k in enumerate(phi_crank):
             F_target = F_ext[ip]
             if is_off:
@@ -743,6 +915,8 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                         eps_max_hydro=eps_top,
                         params_view=params_view,
                         profile=profile,
+                        retry_config=retry_config,
+                        retry_counter=inner_retry_counter,
                     )
                 )
                 eta_eff = float(cfg["oil"]["eta_diesel"])
@@ -772,6 +946,8 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                     eps_max_hydro=eps_top,
                     params_view=params_view,
                     profile=profile,
+                    retry_config=retry_config,
+                    retry_counter=inner_retry_counter,
                 )
                 eps_mid = rec["eps"]; F_hyd = rec["F_hyd"]; mu = rec["mu"]
                 Qv = rec["Q"]; h_min = rec["h_min"]; p_max = rec["p_max"]
@@ -832,6 +1008,14 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
         n_above_arr[ic] = n_above
         n_below_arr[ic] = n_below
         n_solver_failed_arr[ic] = n_solver_failed
+        inner_retry_recovered_arr[ic] = int(
+            inner_retry_counter.get("retry_recovered", 0))
+        inner_retry_exhausted_arr[ic] = int(
+            inner_retry_counter.get("exhausted", 0))
+        for tag, n in (inner_retry_counter.get("omega_hits") or {}).items():
+            omega_hits_per_cfg[ic][tag] = (
+                omega_hits_per_cfg[ic].get(tag, 0) + int(n)
+            )
         succ_pct = (
             f"{solver_success_on_coverable[ic]*100:.0f}%"
             if load_coverable > 0 else "n/a"
@@ -903,6 +1087,11 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
         "load_coverable_count": load_coverable_arr,
         "solver_success_on_coverable": solver_success_on_coverable,
         "paired_comparison": paired,
+        "inner_retry_recovered": inner_retry_recovered_arr,
+        "inner_retry_exhausted": inner_retry_exhausted_arr,
+        "W_table_retry_recovered": W_table_n_retried_cold,
+        "omega_hits_per_config": omega_hits_per_cfg,
+        "retry_config": retry_config.to_dict(),
         "thermal_config": thermal.to_dict(),
     }
 
