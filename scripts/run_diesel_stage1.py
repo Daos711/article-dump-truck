@@ -37,6 +37,10 @@ from models.diesel_stage1_cycle import (
     get_placement_from_reference,
     quasistatic_ratio,
 )
+from models.continuation_runner import (
+    ContinuationConfig,
+    run_continuation_cycle,
+)
 
 OMEGA = 2 * math.pi * n_rpm / 60.0
 P_SCALE = 6.0 * ETA_COLD * OMEGA * (R / c) ** 2
@@ -153,6 +157,138 @@ def solve_eq(Wa, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
                 rel_residual=rR,status=st,nr_iters=nr_it), g_c
 
 
+def _run_independent_nr(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
+                         smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa):
+    all_rows: List[Dict] = []
+    for geo_tag, relief in [("smooth", smooth_relief), ("textured", tex_relief)]:
+        X_prev, Y_prev = 0.0, -0.4
+        g_prev = None
+        W_prev = 0.0
+        print(f"\n{'='*60}")
+        print(f"  {geo_tag.upper()}")
+
+        for i, phi_deg in enumerate(phi_arr):
+            Wx, Wy = get_load_at_angle(cycle, phi_deg)
+            Wa = np.array([Wx, Wy], dtype=float)
+            Wn = float(np.linalg.norm(Wa))
+
+            load_jump = abs(Wn - W_prev) / max(W_prev, 100.0)
+            if load_jump > 0.5 or i == 0:
+                eps_seed = min(0.85, 0.4 * (Wn / 1000.0) ** 0.25)
+                X_prev, Y_prev = 0.0, -eps_seed
+                g_prev = None
+
+            t0 = time.time()
+            d, g_out = solve_eq(
+                Wa, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
+                X_prev, Y_prev, g_prev, feed_mask,
+                g_bc_val if p_Pa > 0 else None)
+            dt = time.time() - t0
+
+            if d["status"] != "failed":
+                X_prev, Y_prev = d["X"], d["Y"]
+                g_prev = g_out
+            W_prev = Wn
+
+            row = dict(
+                geometry=geo_tag,
+                phi_crank_deg=float(phi_deg),
+                Wx_N=Wx, Wy_N=Wy, W_N=Wn,
+                eps=d["eps"], attitude_deg=d["attitude_deg"],
+                h_min_um=d["h_min"]*1e6,
+                p_max_MPa=d["p_max"]/1e6,
+                Ploss_W=d["Ploss"],
+                Qout_m3s=d["Qout"],
+                friction=d["friction"],
+                cav_frac=d["cav_frac"],
+                status=d["status"],
+                rel_residual=d["rel_residual"],
+                nr_iters=d["nr_iters"],
+                elapsed_sec=dt)
+            all_rows.append(row)
+
+            st = "✓" if d["status"] in ("hard_converged","soft_converged") else "✗"
+            print(f"  [{st}] φ={phi_deg:6.1f}° W={Wn:7.0f}N "
+                  f"ε={d['eps']:.4f} h={d['h_min']*1e6:.1f}μm "
+                  f"P={d['Ploss']:.1f}W "
+                  f"res={d['rel_residual']:.1e} [{d['status'][:4]}] {dt:.0f}s")
+    return all_rows
+
+
+def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
+                       smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa,
+                       load_fn):
+    all_rows: List[Dict] = []
+    phi_list = phi_arr.tolist()
+
+    # Find best anchor: lowest-load angle for easiest initial convergence
+    loads = [np.linalg.norm(get_load_at_angle(cycle, p)) for p in phi_list]
+    idx_min_load = int(np.argmin(loads))
+    phi_anchor = phi_list[idx_min_load]
+    print(f"  Anchor angle: φ={phi_anchor:.1f}° (min load = {loads[idx_min_load]:.0f}N)")
+
+    cfg = ContinuationConfig(
+        corrector_max_iter=10,
+        corrector_tol=TOL_HARD,
+        corrector_soft_tol=TOL_SOFT,
+        step_cap=STEP_CAP,
+        eps_max=EPS_MAX,
+        max_subdiv_depth=4,
+        min_dphi_deg=1.5)
+
+    for geo_tag, relief in [("smooth", smooth_relief), ("textured", tex_relief)]:
+        print(f"\n{'='*60}")
+        print(f"  {geo_tag.upper()} (continuation_phi)")
+
+        d_mask = feed_mask
+        g_bc = g_bc_val if p_Pa > 0 else None
+
+        def _eval_factory(rel=relief, dm=d_mask, gb=g_bc):
+            def _eval(X, Y, g_init):
+                return eval_pt(X, Y, Phi, Zm, p1, z1, dp, dz,
+                               rel, phi_bc, g_init, dm, gb)
+            return _eval
+
+        t0 = time.time()
+        nodes = run_continuation_cycle(
+            phi_list, load_fn, _eval_factory, cfg,
+            phi_anchor_deg=phi_anchor)
+        dt_total = time.time() - t0
+
+        for nd in nodes:
+            Wx, Wy = load_fn(nd.phi_deg)
+            Wn = math.sqrt(Wx**2 + Wy**2)
+            row = dict(
+                geometry=geo_tag,
+                phi_crank_deg=nd.phi_deg,
+                Wx_N=Wx, Wy_N=Wy, W_N=Wn,
+                eps=nd.eps, attitude_deg=nd.attitude_deg,
+                h_min_um=nd.h_min*1e6,
+                p_max_MPa=nd.p_max/1e6,
+                Ploss_W=nd.Ploss,
+                Qout_m3s=nd.Qout,
+                friction=nd.friction,
+                cav_frac=nd.cav_frac,
+                status=nd.status,
+                rel_residual=nd.rel_residual,
+                nr_iters=nd.nr_iters,
+                elapsed_sec=dt_total / max(len(nodes), 1))
+            all_rows.append(row)
+
+            st = "✓" if nd.status in ("hard_converged","soft_converged") else "✗"
+            print(f"  [{st}] φ={nd.phi_deg:6.1f}° W={Wn:7.0f}N "
+                  f"ε={nd.eps:.4f} h={nd.h_min*1e6:.1f}μm "
+                  f"P={nd.Ploss:.1f}W "
+                  f"res={nd.rel_residual:.1e} [{nd.status[:4]}] "
+                  f"pred={nd.predictor_type} d={nd.subdiv_depth}")
+
+        n_acc = sum(1 for nd in nodes if nd.status != "failed")
+        print(f"  {geo_tag}: {n_acc}/{len(nodes)} converged "
+              f"({n_acc/max(len(nodes),1)*100:.0f}%) in {dt_total:.0f}s")
+
+    return all_rows
+
+
 def main():
     pa = argparse.ArgumentParser(description="Stage I-A: cold quasi-static diesel cycle")
     pa.add_argument("--n-points", type=int, default=CYCLE_N_COARSE)
@@ -160,6 +296,8 @@ def main():
     pa.add_argument("--phi-bc", default="periodic")
     pa.add_argument("--p-supply-bar", type=float, default=P_SUPPLY_PA/1e5)
     pa.add_argument("--out", required=True)
+    pa.add_argument("--mode", default="independent_nr",
+                    choices=["independent_nr", "continuation_phi"])
     args = pa.parse_args()
 
     Np,Nz=(int(x) for x in args.grid.split("x"))
@@ -204,66 +342,25 @@ def main():
     phi_arr = np.array(cycle["phi_crank_deg"])
 
     print(f"Stage I-A: cold quasi-static diesel cycle")
-    print(f"Grid: {Np}x{Nz}, {args.n_points} crank angles")
+    print(f"Grid: {Np}x{Nz}, {args.n_points} crank angles, mode={args.mode}")
     print(f"Placement: phi_loaded={phi_loaded:.1f}° phi_unloaded={phi_unloaded:.1f}°")
     print(f"p_supply: {args.p_supply_bar} bar")
 
     all_rows: List[Dict] = []
     t_global = time.time()
 
-    for geo_tag, relief in [("smooth", smooth_relief), ("textured", tex_relief)]:
-        X_prev, Y_prev = 0.0, -0.4
-        g_prev = None
-        W_prev = 0.0
-        print(f"\n{'='*60}")
-        print(f"  {geo_tag.upper()}")
+    def _load_fn(phi_deg):
+        return get_load_at_angle(cycle, phi_deg)
 
-        for i, phi_deg in enumerate(phi_arr):
-            Wx, Wy = get_load_at_angle(cycle, phi_deg)
-            Wa = np.array([Wx, Wy], dtype=float)
-            Wn = float(np.linalg.norm(Wa))
-
-            # Smart seed: reset if load jumps >50%
-            load_jump = abs(Wn - W_prev) / max(W_prev, 100.0)
-            if load_jump > 0.5 or i == 0:
-                eps_seed = min(0.85, 0.4 * (Wn / 1000.0) ** 0.25)
-                X_prev, Y_prev = 0.0, -eps_seed
-                g_prev = None
-
-            t0 = time.time()
-            d, g_out = solve_eq(
-                Wa, Phi, Zm, p1, z1, dp, dz, relief, args.phi_bc,
-                X_prev, Y_prev, g_prev, feed_mask,
-                g_bc_val if p_Pa > 0 else None)
-            dt = time.time() - t0
-
-            if d["status"] != "failed":
-                X_prev, Y_prev = d["X"], d["Y"]
-                g_prev = g_out
-            W_prev = Wn
-
-            row = dict(
-                geometry=geo_tag,
-                phi_crank_deg=float(phi_deg),
-                Wx_N=Wx, Wy_N=Wy, W_N=Wn,
-                eps=d["eps"], attitude_deg=d["attitude_deg"],
-                h_min_um=d["h_min"]*1e6,
-                p_max_MPa=d["p_max"]/1e6,
-                Ploss_W=d["Ploss"],
-                Qout_m3s=d["Qout"],
-                friction=d["friction"],
-                cav_frac=d["cav_frac"],
-                status=d["status"],
-                rel_residual=d["rel_residual"],
-                nr_iters=d["nr_iters"],
-                elapsed_sec=dt)
-            all_rows.append(row)
-
-            st = "✓" if d["status"] in ("hard_converged","soft_converged") else "✗"
-            print(f"  [{st}] φ={phi_deg:6.1f}° W={Wn:7.0f}N "
-                  f"ε={d['eps']:.4f} h={d['h_min']*1e6:.1f}μm "
-                  f"P={d['Ploss']:.1f}W "
-                  f"res={d['rel_residual']:.1e} [{d['status'][:4]}] {dt:.0f}s")
+    if args.mode == "continuation_phi":
+        all_rows = _run_continuation(
+            phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, args.phi_bc,
+            smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa,
+            _load_fn)
+    else:
+        all_rows = _run_independent_nr(
+            phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, args.phi_bc,
+            smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa)
 
     total = time.time() - t_global
 
@@ -353,6 +450,7 @@ def main():
     manifest = dict(
         schema_version=SCHEMA,
         stage="I-A_cold_cycle",
+        mode=args.mode,
         created_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         grid=dict(N_phi=Np, N_Z=Nz),
         n_crank_angles=args.n_points,
