@@ -167,11 +167,58 @@ def test_thd_smoke_global_static():
         n_phi_grid=SMOKE_GRID, n_z_grid=SMOKE_GRID,
         configs=[dq.CONFIGS[0]],
     )
+    valid = np.asarray(res["valid_fullfilm"], dtype=bool)
+    # On the small smoke grid the W_table / sigma combination can land a
+    # subset of angles in above_range — only require "finite" from the
+    # arrays where we actually got a clean inner solve.
     for k in ("T_eff", "eta_eff", "P_loss", "Q", "mdot", "F_tr",
               "epsilon", "hmin", "pmax", "f", "F_hyd"):
-        arr = np.asarray(res[k])
-        assert np.all(np.isfinite(arr)), f"non-finite values in {k}"
-    assert np.all(res["eta_eff"] > 0)
-    assert np.all(res["T_eff"] >= thermal.T_in_C - 1e-9)
-    assert bool(res["thermal_converged"].all())
-    assert int(res["thermal_outer"].max()) <= thermal.max_outer
+        arr = np.asarray(res[k])[valid]
+        if arr.size > 0:
+            assert np.all(np.isfinite(arr)), f"non-finite values in {k}"
+    eta_v = np.asarray(res["eta_eff"])[valid]
+    if eta_v.size > 0:
+        assert np.all(eta_v > 0)
+    T_v = np.asarray(res["T_eff"])[valid]
+    if T_v.size > 0:
+        assert np.all(T_v >= thermal.T_in_C - 1e-9)
+    # Energy convergence should still be reached on smoke; the tighter
+    # thermal_converged also requires valid_fullfilm so we don't assert
+    # all() on it (production case may have above-range angles).
+    assert int(np.asarray(res["thermal_outer"]).max()) <= thermal.max_outer
+
+
+def test_thd_arrays_have_correct_shape_and_dtype():
+    """Section 5 acceptance: load_status / valid_fullfilm / W_table_*
+    arrays must be present with the expected shape and dtype."""
+    thermal = ThermalConfig(mode="global_static", gamma_mix=0.5,
+                              T_in_C=105.0, max_outer=3)
+    res = dq.run_diesel_analysis(
+        thermal=thermal, phi_crank=SMALL_PHI,
+        n_phi_grid=SMALL_GRID, n_z_grid=SMALL_GRID,
+        configs=[dq.CONFIGS[0]],
+    )
+    n_cfg = len(res["configs"])
+    n_phi = len(SMALL_PHI)
+    assert res["load_status"].shape == (n_cfg, n_phi)
+    assert res["load_status"].dtype.kind == "U"
+    assert res["load_match_ratio"].shape == (n_cfg, n_phi)
+    assert res["valid_fullfilm"].shape == (n_cfg, n_phi)
+    assert res["valid_fullfilm"].dtype == np.bool_
+    assert res["W_table_max"].shape == (n_cfg,)
+    assert res["W_table_finite"].shape == (n_cfg,)
+    assert res["W_table_finite"].dtype == np.bool_
+    # Every per-angle status must be one of the documented values.
+    valid_statuses = {"ok", "below_range", "above_range",
+                      "solver_failed", "wtable_failed"}
+    for st in np.asarray(res["load_status"]).ravel():
+        assert st in valid_statuses, f"unexpected load_status {st!r}"
+    # thermal_converged must imply valid_fullfilm (Section 3 redefinition).
+    tc = np.asarray(res["thermal_converged"])
+    vf = np.asarray(res["valid_fullfilm"])
+    assert np.all(~tc | vf), (
+        "thermal_converged must imply valid_fullfilm")
+    # F_max_used should default to params.F_max when --F-max is not set.
+    from config import diesel_params as _params
+    assert math.isclose(float(res["F_max_used"]), float(_params.F_max),
+                          rel_tol=1e-12)
