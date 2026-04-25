@@ -227,11 +227,14 @@ def _solve_dynamic_with_retry(
         if sor_diverged or not bool(converged):
             return (P_, float("nan"), float("nan"), n_outer_, False,
                     "SOR_did_not_converge")
-        if not _solver_result_is_sane(0.0, P_):
-            # F is unknown yet; pass 0 to force the magnitude check on P.
+        # Sanity must be done on the DIMENSIONAL pressure (P * p_scale)
+        # — bare P is non-dimensional and always small. Without this
+        # rescale the SOR-divergent textured run can sneak past the
+        # P-magnitude guard with p_max ~ 400 GPa.
+        if not _solver_result_is_sane(0.0, P_ * float(p_scale)):
             return (P_, float("nan"), float("nan"), n_outer_, False,
-                    f"non_physical_P:max|P|="
-                    f"{float(np.max(np.abs(P_))):.3e}")
+                    f"non_physical_P:max|P_dim|="
+                    f"{float(np.max(np.abs(P_) * float(p_scale))):.3e}")
         Fx, Fy = compute_hydro_forces(
             P_, p_scale, Phi_mesh, phi_1D, Z_1D, R, L)
         if not (np.isfinite(Fx) and np.isfinite(Fy)):
