@@ -64,5 +64,18 @@ def _install_reynolds_stub():
     utils.create_H_with_ellipsoidal_depressions = _relief_stub
     sys.modules["reynolds_solver.utils"] = utils
 
+    # squeeze (used by diesel_transient).
+    sq = types.ModuleType("reynolds_solver.squeeze")
+    def _squeeze_to_api_params_stub(*a, **kw):
+        return 0.0, 0.0, 2.0
+    sq.squeeze_to_api_params = _squeeze_to_api_params_stub
+    sys.modules["reynolds_solver.squeeze"] = sq
+
+    # thermal (used by thermal_coupling). The pipeline-side
+    # thermal_coupling module already wraps this in a try/except, so
+    # leaving it un-stubbed makes SOLVER_THERMAL_AVAILABLE=False in
+    # tests — which is what the existing test_diesel_thd_contract
+    # tests already key on via importorskip.
+
 
 _install_reynolds_stub()

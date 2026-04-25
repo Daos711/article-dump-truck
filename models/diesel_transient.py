@@ -2,13 +2,64 @@
 
 Совместное решение уравнения Рейнольдса со squeeze и уравнения движения вала.
 Интегратор: Velocity Verlet с sub-iterations.
+
+Stage Diesel Transient THD-0 / global_relax overlay
+---------------------------------------------------
+``run_transient(thermal=ThermalConfig(...))`` adds a per-step thermal
+state on top of the existing transient runner:
+
+  * Walther viscosity-temperature fit per oil from existing
+    ``eta_pump`` (50 °C) + ``eta_diesel`` (105 °C).
+  * Per-step ``eta_step = mu(T_eff_used)`` and
+    ``p_scale_step = 6 * eta_step * omega * (R/c)**2``.
+  * After the accepted Verlet sub-iteration of a mechanical step,
+    ``T_target`` is computed from ``F_tr * U / (rho |Q| cp)`` via
+    ``global_static_step``; ``T_state`` is then advanced as
+
+        mode="off"             T_state = T_in
+        mode="global_static"   T_state = T_target
+        mode="global_relax"    T_state += alpha * (T_target - T_state)
+                                  with alpha = 1 - exp(-dt/tau_th_s)
+
+  * ``thermal=None`` / ``mode="off"`` reproduces the legacy isothermal
+    transient bit-for-bit (same eta = oil["eta_diesel"], same single
+    p_scale per config); the new THD arrays are filled consistently
+    (T_eff_used = T_eff = T_in, eta_eff = oil["eta_diesel"], etc.).
+
+Solver-side retry policy (Stage Texture Stability 2) is reused via
+``SolverRetryConfig``: textured-only, omegas (1.70, 1.55), cold-start.
 """
 import time as _time
+import warnings
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 from reynolds_solver.squeeze import squeeze_to_api_params
-from models.bearing_model import setup_grid, setup_texture, DEFAULT_CLOSURE, DEFAULT_CAVITATION
+from models.bearing_model import (
+    DEFAULT_CAVITATION, DEFAULT_CLOSURE,
+    compute_axial_leakage_m3_s,
+    setup_grid, setup_texture,
+)
+# Reuse the SolverRetryConfig + _omega_tag + sanity check from the
+# quasistatic stack (already battle-tested in Stage Texture Stability 2).
+from models.diesel_quasistatic import (
+    SolverRetryConfig,
+    _omega_tag,
+    _parse_retry_outcome,
+    _solver_result_is_sane,
+    _SOR_WARN_FRAGMENT,
+    _W_SANITY_LIMIT_N,
+    _P_SANITY_LIMIT_Pa,
+)
+from models.thermal_coupling import (
+    ThermalConfig,
+    build_oil_walther,
+    global_relax_step,
+    global_static_step,
+    viscosity_at_T_C,
+)
 from config import diesel_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
@@ -22,6 +73,14 @@ CONFIGS = [
     {"label": "Текстура + рапсовое", "textured": True,
      "oil": RAPESEED_OIL, "color": "red", "ls": "--"},
 ]
+
+# Public registry mapping CLI-friendly labels to CONFIGS index.
+CONFIG_KEYS: Dict[str, int] = {
+    "mineral_smooth":   0,
+    "rapeseed_smooth":  1,
+    "mineral_textured": 2,
+    "rapeseed_textured": 3,
+}
 
 
 def load_diesel(phi_deg, F_max=None):
@@ -65,13 +124,17 @@ def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
     )
 
 
+# numpy 2.x removed ``np.trapz``; pick the modern alias when present.
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
+
 def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
     """Вычислить компоненты гидродинамической силы на вал."""
     P_dim = P * p_scale
-    Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
-    Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
+    Fx = -_trapz(_trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
+    Fy = -_trapz(_trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
     return Fx, Fy
 
 
@@ -84,26 +147,230 @@ def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
     dP_dphi = np.gradient(P_dim, phi_1D[1] - phi_1D[0], axis=1)
     tau_pressure = h_dim / 2.0 * dP_dphi / R
     tau = tau_couette + tau_pressure
-    F_friction = np.trapz(np.trapz(np.abs(tau), phi_1D, axis=1),
-                          Z_1D, axis=0) * R * L / 2
+    F_friction = _trapz(_trapz(np.abs(tau), phi_1D, axis=1),
+                        Z_1D, axis=0) * R * L / 2
     return F_friction
 
 
-def get_step_deg(phi_deg):
-    """Адаптивный шаг: 0.25° у пика Вибе, базовый вне."""
+def get_step_deg(phi_deg, *, d_phi_base_deg: Optional[float] = None,
+                  d_phi_peak_deg: float = 0.25,
+                  peak_lo_deg: float = 330.0,
+                  peak_hi_deg: float = 420.0):
+    """Адаптивный шаг: ``d_phi_peak_deg`` у пика Вибе, ``d_phi_base_deg``
+    вне. Дефолт ``d_phi_base_deg=params.d_phi_crank_deg`` сохраняет
+    legacy behaviour."""
     phi_mod = phi_deg % 720.0
-    if 330.0 <= phi_mod <= 420.0:
-        return 0.25
-    return params.d_phi_crank_deg
+    base = (float(d_phi_base_deg)
+             if d_phi_base_deg is not None
+             else float(params.d_phi_crank_deg))
+    if peak_lo_deg <= phi_mod <= peak_hi_deg:
+        return float(d_phi_peak_deg)
+    return base
+
+
+def _solve_dynamic_with_retry(
+    H, d_phi, d_Z, R, L,
+    *,
+    base_kw: Dict[str, Any],
+    p_scale: float,
+    Phi_mesh, phi_1D, Z_1D,
+    retry_config: Optional[SolverRetryConfig],
+    textured: bool,
+):
+    """Wrap solve_reynolds with SOR-warning capture, sanity check, and
+    omega retry policy (Stage Texture Stability 2 reused).
+
+    Returns ``(P, Fx_hyd, Fy_hyd, n_outer, ok, reason)``.
+
+    On success ``ok=True`` and ``reason`` ∈ {"ok",
+    "ok_retry_omega_<X>"}. On failure ``ok=False`` and ``reason``
+    chains the failure reasons of every attempt; callers should treat
+    the angle as ``solver_failed`` and reset their warm-start.
+    """
+    def _attempt(kw_in):
+        sor_diverged = False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                res = solve_reynolds(H, d_phi, d_Z, R, L, **kw_in)
+            except Exception as exc:
+                return (None, float("nan"), float("nan"), 0, False,
+                        f"exception:{type(exc).__name__}:{exc}")
+            for w in caught:
+                if _SOR_WARN_FRAGMENT in str(w.message):
+                    sor_diverged = True
+                    break
+        # solve_reynolds may return (P, residual, n_iter, converged) or
+        # (P, residual, n_iter) (older builds without return_converged).
+        P_ = res[0]
+        n_outer_ = res[2] if len(res) >= 3 else 0
+        converged = res[3] if len(res) >= 4 else (not sor_diverged)
+        if sor_diverged or not bool(converged):
+            return (P_, float("nan"), float("nan"), n_outer_, False,
+                    "SOR_did_not_converge")
+        if not _solver_result_is_sane(0.0, P_):
+            # F is unknown yet; pass 0 to force the magnitude check on P.
+            return (P_, float("nan"), float("nan"), n_outer_, False,
+                    f"non_physical_P:max|P|="
+                    f"{float(np.max(np.abs(P_))):.3e}")
+        Fx, Fy = compute_hydro_forces(
+            P_, p_scale, Phi_mesh, phi_1D, Z_1D, R, L)
+        if not (np.isfinite(Fx) and np.isfinite(Fy)):
+            return (P_, float("nan"), float("nan"), n_outer_, False,
+                    "non_physical_F:nan")
+        F_mag = float(np.hypot(Fx, Fy))
+        if F_mag > _W_SANITY_LIMIT_N:
+            return (P_, float("nan"), float("nan"), n_outer_, False,
+                    f"non_physical_F:|F|={F_mag:.3e}")
+        return (P_, float(Fx), float(Fy), int(n_outer_), True, "ok")
+
+    primary = _attempt(base_kw)
+    if primary[4]:
+        return primary
+
+    if retry_config is None or not retry_config.applicable(textured):
+        return primary
+
+    fail_chain = [f"primary:{primary[5]}"]
+    P_init_retry = (None if retry_config.cold_start
+                     else base_kw.get("P_init"))
+    for omega in retry_config.omega_values:
+        kw_retry = dict(base_kw)
+        kw_retry["P_init"] = P_init_retry
+        kw_retry["omega"] = float(omega)
+        kw_retry["max_iter"] = int(retry_config.max_iter_retry)
+        attempt = _attempt(kw_retry)
+        if attempt[4]:
+            return (*attempt[:5],
+                     f"ok_retry_{_omega_tag(omega)}")
+        fail_chain.append(
+            f"retry_{_omega_tag(omega)}:{attempt[5]}")
+    out = list(primary)
+    out[5] = ";".join(fail_chain)
+    return tuple(out)
+
+
+def _compute_paired_transient(cfg_list, last_start, valid_dynamic,
+                               valid_no_clamp, T_eff_used, eta_eff,
+                               P_loss, hmin, pmax, F_tr):
+    """Stage Diesel Transient THD-0: paired smooth-vs-textured stats
+    on common_valid_dynamic AND common_valid_no_clamp masks for the
+    last cycle only.
+
+    Mirrors the quasistatic ``_compute_paired`` but uses time-step
+    arrays sliced to the last cycle and the dynamic validity gates.
+    """
+    by_oil: Dict[str, Dict[str, int]] = {}
+    for ic, cfg in enumerate(cfg_list):
+        oil_key = (cfg.get("oil") or {}).get("name", "")
+        bucket = by_oil.setdefault(oil_key, {})
+        if cfg.get("textured"):
+            bucket["textured_idx"] = ic
+        else:
+            bucket["smooth_idx"] = ic
+
+    out = []
+    sl = slice(last_start, None)
+    for oil_key, bucket in by_oil.items():
+        if "textured_idx" not in bucket or "smooth_idx" not in bucket:
+            continue
+        i_s, i_t = bucket["smooth_idx"], bucket["textured_idx"]
+        common_dyn = (np.asarray(valid_dynamic[i_s, sl], dtype=bool)
+                       & np.asarray(valid_dynamic[i_t, sl], dtype=bool))
+        common_noc = (np.asarray(valid_no_clamp[i_s, sl], dtype=bool)
+                       & np.asarray(valid_no_clamp[i_t, sl], dtype=bool))
+        rec = dict(
+            oil_name=oil_key,
+            smooth_idx=i_s, smooth_label=cfg_list[i_s]["label"],
+            textured_idx=i_t, textured_label=cfg_list[i_t]["label"],
+            common_valid_count=int(common_dyn.sum()),
+            common_no_clamp_count=int(common_noc.sum()),
+            mean_dT_eff=float("nan"),
+            mean_dP_loss=float("nan"),
+            mean_deta_eff=float("nan"),
+            mean_dh_min=float("nan"),
+            min_dp_max=float("nan"),
+            max_dp_max=float("nan"),
+            mean_T_smooth=float("nan"),
+            mean_T_textured=float("nan"),
+            mean_P_loss_smooth=float("nan"),
+            mean_P_loss_textured=float("nan"),
+        )
+        if common_noc.any():
+            T_s = T_eff_used[i_s, sl][common_noc]
+            T_t = T_eff_used[i_t, sl][common_noc]
+            P_s = P_loss[i_s, sl][common_noc]
+            P_t = P_loss[i_t, sl][common_noc]
+            e_s = eta_eff[i_s, sl][common_noc]
+            e_t = eta_eff[i_t, sl][common_noc]
+            h_s = hmin[i_s, sl][common_noc]
+            h_t = hmin[i_t, sl][common_noc]
+            pmx_s = pmax[i_s, sl][common_noc]
+            pmx_t = pmax[i_t, sl][common_noc]
+            rec["mean_dT_eff"] = float(np.mean(T_t - T_s))
+            rec["mean_dP_loss"] = float(np.mean(P_t - P_s))
+            rec["mean_deta_eff"] = float(np.mean(e_t - e_s))
+            rec["mean_dh_min"] = float(np.mean(h_t - h_s))
+            rec["min_dp_max"] = float(np.min(pmx_t - pmx_s))
+            rec["max_dp_max"] = float(np.max(pmx_t - pmx_s))
+            rec["mean_T_smooth"] = float(np.mean(T_s))
+            rec["mean_T_textured"] = float(np.mean(T_t))
+            rec["mean_P_loss_smooth"] = float(np.mean(P_s))
+            rec["mean_P_loss_textured"] = float(np.mean(P_t))
+        out.append(rec)
+    return out
 
 
 def run_transient(F_max=None, debug=False,
-                  closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION):
-    """Нестационарный расчёт для всех 4 конфигураций."""
+                  closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
+                  *,
+                  thermal: Optional[ThermalConfig] = None,
+                  configs=None,
+                  n_grid: Optional[int] = None,
+                  n_cycles: Optional[int] = None,
+                  d_phi_base_deg: Optional[float] = None,
+                  d_phi_peak_deg: float = 0.25,
+                  retry_config: Optional[SolverRetryConfig] = None):
+    """Нестационарный расчёт.
+
+    Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
+    or ``mode="off"`` reproduces the legacy isothermal transient
+    bit-for-bit. ``thermal.mode="global_static"`` uses the static
+    energy target on every step; ``thermal.mode="global_relax"`` carries
+    a thermal state across steps with first-order relaxation.
+
+    Parameters
+    ----------
+    thermal : ThermalConfig | None
+        ``None`` ⇒ legacy mode="off".
+    configs : list[dict] | None
+        Optional override of CONFIGS (e.g. one or two configs only).
+    n_grid : int | None
+        Override for ``params.N_grid_transient``.
+    n_cycles : int | None
+        Override for ``params.n_cycles``.
+    d_phi_base_deg : float | None
+        Base crank-angle step (deg). ``None`` keeps
+        ``params.d_phi_crank_deg``.
+    d_phi_peak_deg : float
+        Adaptive step at the firing peak.
+    retry_config : SolverRetryConfig | None
+        Solver retry policy. ``None`` ⇒ default
+        ``SolverRetryConfig()`` (textured-only, omegas (1.70, 1.55),
+        cold_start=True), matching Stage Texture Stability 2.
+    """
     if F_max is None:
         F_max = params.F_max_debug if debug else params.F_max
+    if thermal is None:
+        thermal = ThermalConfig(mode="off")
+    is_off = thermal.is_off()
+    cfg_list = list(configs) if configs is not None else CONFIGS
+    n_cycles_eff = int(n_cycles) if n_cycles is not None else int(
+        params.n_cycles)
+    if retry_config is None:
+        retry_config = SolverRetryConfig()
 
-    N = params.N_grid_transient
+    N = int(n_grid) if n_grid is not None else int(params.N_grid_transient)
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N, N)
     phi_c, Z_c = setup_texture(params)
 
@@ -111,83 +378,87 @@ def run_transient(F_max=None, debug=False,
     U = omega * params.R
     N_SUB = params.n_sub_iterations
 
-    # Предвычислить адаптивную сетку углов
+    # Adaptive crank-angle grid.
     phi_list = []
     phi_cur = 0.0
-    phi_total = 720.0 * params.n_cycles
+    phi_total = 720.0 * n_cycles_eff
     while phi_cur < phi_total - 1e-9:
         phi_list.append(phi_cur)
-        phi_cur += get_step_deg(phi_cur)
+        phi_cur += get_step_deg(
+            phi_cur,
+            d_phi_base_deg=d_phi_base_deg,
+            d_phi_peak_deg=d_phi_peak_deg,
+        )
     phi_crank_deg = np.array(phi_list)
     n_steps = len(phi_crank_deg)
-
-    # Индексы последнего цикла: найти первый шаг >= 720*(n_cycles-1)
-    last_cycle_start_deg = 720.0 * (params.n_cycles - 1)
+    last_cycle_start_deg = 720.0 * (n_cycles_eff - 1)
     last_start = int(np.searchsorted(phi_crank_deg, last_cycle_start_deg))
     n_last = n_steps - last_start
 
+    base_step = (float(d_phi_base_deg)
+                  if d_phi_base_deg is not None
+                  else float(params.d_phi_crank_deg))
     print(f"  Параметры: F_max={F_max/1e3:.0f} кН, "
-          f"{n_steps} шагов (адаптивный: 0.25° пик / {params.d_phi_crank_deg}° вне), "
-          f"N_SUB={N_SUB}, {params.n_cycles} цикла")
+          f"{n_steps} шагов (адаптивный: {d_phi_peak_deg}° пик / "
+          f"{base_step}° вне), N_SUB={N_SUB}, {n_cycles_eff} цикла; "
+          f"thermal mode={thermal.mode}, gamma={thermal.gamma_mix:.2f}, "
+          f"tau_th={thermal.tau_th_s:.3f}s")
 
-    n_cfg = len(CONFIGS)
+    n_cfg = len(cfg_list)
     eps_x_all = np.zeros((n_cfg, n_steps))
     eps_y_all = np.zeros((n_cfg, n_steps))
-    hmin_all = np.zeros((n_cfg, n_steps))
-    pmax_all = np.zeros((n_cfg, n_steps))
-    f_all = np.zeros((n_cfg, n_steps))
-    Ftr_all = np.zeros((n_cfg, n_steps))
-    Nloss_all = np.zeros((n_cfg, n_steps))
-    Fx_hyd_all = np.zeros((n_cfg, n_steps))
-    Fy_hyd_all = np.zeros((n_cfg, n_steps))
-    cfg_times = []  # время каждого конфига
+    hmin_all = np.full((n_cfg, n_steps), np.nan)
+    pmax_all = np.full((n_cfg, n_steps), np.nan)
+    f_all = np.full((n_cfg, n_steps), np.nan)
+    Ftr_all = np.full((n_cfg, n_steps), np.nan)
+    Nloss_all = np.full((n_cfg, n_steps), np.nan)
+    Fx_hyd_all = np.full((n_cfg, n_steps), np.nan)
+    Fy_hyd_all = np.full((n_cfg, n_steps), np.nan)
+    # Stage Diesel Transient THD-0 — new arrays.
+    T_eff_used_all = np.full((n_cfg, n_steps), np.nan)
+    T_eff_all = np.full((n_cfg, n_steps), np.nan)
+    T_target_all = np.full((n_cfg, n_steps), np.nan)
+    eta_eff_all = np.full((n_cfg, n_steps), np.nan)
+    eta_eff_next_all = np.full((n_cfg, n_steps), np.nan)
+    P_loss_all = np.full((n_cfg, n_steps), np.nan)
+    Q_all = np.full((n_cfg, n_steps), np.nan)
+    mdot_all = np.full((n_cfg, n_steps), np.nan)
+    mdot_floor_hit_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    solver_success_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    contact_clamp_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    retry_used_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    retry_omega_used_all = np.zeros((n_cfg, n_steps), dtype=float)
+    cfg_times: List[float] = []
+    contact_clamp_count = np.zeros(n_cfg, dtype=np.int32)
+    solver_failed_count = np.zeros(n_cfg, dtype=np.int32)
+    retry_recovered_count = np.zeros(n_cfg, dtype=np.int32)
+    retry_exhausted_count = np.zeros(n_cfg, dtype=np.int32)
+    omega_hits_per_cfg: List[Dict[str, int]] = [dict() for _ in range(n_cfg)]
 
-    for ic, cfg in enumerate(CONFIGS):
-        eta = cfg["oil"]["eta_diesel"]
-        alpha_pv = None  # PV отключена — overflow при 850 кН
-        p_scale = 6.0 * eta * omega * (params.R / params.c) ** 2
+    for ic, cfg in enumerate(cfg_list):
+        eta_const = float(cfg["oil"]["eta_diesel"])
+        rho = float(cfg["oil"]["rho"])
+
+        if is_off:
+            walther_fit = None
+        else:
+            walther_fit = build_oil_walther(
+                cfg["oil"],
+                cp_J_kgK=thermal.cp_J_kgK,
+                gamma_mix=thermal.gamma_mix,
+            )
+        T_state_C = float(thermal.T_in_C)
 
         print(f"\n  [{ic+1}/{n_cfg}] {cfg['label']}...")
         t_cfg_start = _time.time()
 
-        # Начальные условия
+        # Initial conditions.
         ex = params.eps_x0 * params.c
         ey = params.eps_y0 * params.c
         vx, vy = 0.0, 0.0
         ax_prev, ay_prev = 0.0, 0.0
         P_prev = None
         contact_count = 0
-        pv_fallback_count = 0
-
-        def _solve_at(ex_, ey_, vx_, vy_, P_init_, phi_deg_):
-            """Решить Reynolds в точке (ex_, ey_) и вернуть P, H, Fx, Fy."""
-            eps_x_ = ex_ / params.c
-            eps_y_ = ey_ / params.c
-            H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
-                            textured=cfg["textured"],
-                            phi_c_flat=phi_c, Z_c_flat=Z_c)
-            xp_, yp_, bt_ = squeeze_to_api_params(
-                -vx_, -vy_, params.c, omega, d_phi)
-            kw = dict(
-                closure=closure, cavitation=cavitation,
-                tol=1e-5, max_iter=50000,
-                P_init=P_init_,
-                xprime=xp_, yprime=yp_, beta=bt_,
-            )
-            if alpha_pv is not None:
-                phi_mod = phi_deg_ % 720.0
-                near_peak = 330.0 <= phi_mod <= 420.0
-                kw["alpha_pv"] = alpha_pv
-                kw["p_scale"] = p_scale
-                kw["relax_pv"] = 0.2 if near_peak else 0.4
-                kw["max_outer_pv"] = 80 if near_peak else 50
-            res = solve_reynolds(H_, d_phi, d_Z, params.R, params.L, **kw)
-            P_ = res[0]
-            n_outer_ = res[3] if len(res) == 4 else 0
-            max_outer_ = kw.get("max_outer_pv", 0)
-            Fx_, Fy_ = compute_hydro_forces(
-                P_, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
-            return P_, H_, Fx_, Fy_, n_outer_, max_outer_
 
         def _clamp(ex_, ey_, vx_, vy_):
             clamped = False
@@ -209,101 +480,178 @@ def run_transient(F_max=None, debug=False,
 
         for step in range(n_steps):
             phi_deg = phi_crank_deg[step] % 720.0
-            dt_step = np.deg2rad(get_step_deg(phi_crank_deg[step])) / omega
+            dt_step = np.deg2rad(get_step_deg(
+                phi_crank_deg[step],
+                d_phi_base_deg=d_phi_base_deg,
+                d_phi_peak_deg=d_phi_peak_deg,
+            )) / omega
 
-            # Сохранить состояние на начало шага
+            # Per-step thermal: η fixed for the whole Verlet substep.
+            T_used_C = float(T_state_C if not is_off else thermal.T_in_C)
+            if is_off or walther_fit is None:
+                eta_step = eta_const
+            else:
+                eta_step = float(viscosity_at_T_C(walther_fit, T_used_C))
+            p_scale_step = (
+                6.0 * eta_step * omega * (params.R / params.c) ** 2)
+
+            # Save state at start of step.
             ex_n, ey_n = ex, ey
             vx_n, vy_n = vx, vy
 
-            # --- Velocity Verlet с sub-iterations ---
-            # Начальный predict
+            # Initial Verlet predict.
             ex_pred = ex_n + vx_n * dt_step + 0.5 * ax_prev * dt_step**2
             ey_pred = ey_n + vy_n * dt_step + 0.5 * ay_prev * dt_step**2
-            ex_pred, ey_pred, vx_corr, vy_corr, clamped_p = _clamp(
+            ex_pred, ey_pred, _, _, clamped_p = _clamp(
                 ex_pred, ey_pred, vx_n, vy_n)
             if clamped_p:
                 contact_count += 1
                 P_prev = None
 
-            vx_corr, vy_corr = vx_n, vy_n  # reset for sub-iteration
+            vx_corr, vy_corr = vx_n, vy_n
             ax_new, ay_new = ax_prev, ay_prev
+            P = None
+            H = None
+            Fx_hyd = float("nan")
+            Fy_hyd = float("nan")
+            solve_ok = False
+            solve_reason = "no_attempt"
+            retry_recovered_step = False
+            omega_recovery: Optional[float] = None
 
             for k in range(N_SUB):
-                # Solve Reynolds at current predicted position
-                P, H, Fx_hyd, Fy_hyd, n_outer, max_outer = _solve_at(
-                    ex_pred, ey_pred, vx_corr, vy_corr, P_prev, phi_deg)
-
-                # Пьезовязкость: откат к изовязкому при расходимости
-                if alpha_pv is not None and max_outer > 0 and n_outer >= max_outer:
-                    pv_fallback_count += 1
-                    kw_iso = dict(
-                        closure=closure, cavitation=cavitation,
-                        tol=1e-5, max_iter=50000,
-                        P_init=None,
-                        xprime=0.0, yprime=0.0, beta=2.0,
-                    )
-                    xp_, yp_, bt_ = squeeze_to_api_params(
-                        -vx_corr, -vy_corr, params.c, omega, d_phi)
-                    kw_iso["xprime"] = xp_
-                    kw_iso["yprime"] = yp_
-                    kw_iso["beta"] = bt_
-                    eps_x_ = ex_pred / params.c
-                    eps_y_ = ey_pred / params.c
-                    H_fb = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
-                                      textured=cfg["textured"],
-                                      phi_c_flat=phi_c, Z_c_flat=Z_c)
-                    res_fb = solve_reynolds(H_fb, d_phi, d_Z, params.R, params.L,
-                                           **kw_iso)
-                    P = res_fb[0]
-                    H = H_fb
-                    Fx_hyd, Fy_hyd = compute_hydro_forces(
-                        P, p_scale, Phi_mesh, phi_1D, Z_1D, params.R, params.L)
-
+                eps_x_ = ex_pred / params.c
+                eps_y_ = ey_pred / params.c
+                H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
+                                 textured=cfg["textured"],
+                                 phi_c_flat=phi_c, Z_c_flat=Z_c)
+                xp_, yp_, bt_ = squeeze_to_api_params(
+                    -vx_corr, -vy_corr, params.c, omega, d_phi)
+                base_kw = dict(
+                    closure=closure, cavitation=cavitation,
+                    tol=1e-5, max_iter=50000,
+                    P_init=P_prev,
+                    xprime=xp_, yprime=yp_, beta=bt_,
+                )
+                P_, Fx_, Fy_, _, ok_, reason_ = _solve_dynamic_with_retry(
+                    H_, d_phi, d_Z, params.R, params.L,
+                    base_kw=base_kw,
+                    p_scale=p_scale_step,
+                    Phi_mesh=Phi_mesh, phi_1D=phi_1D, Z_1D=Z_1D,
+                    retry_config=retry_config,
+                    textured=bool(cfg["textured"]),
+                )
+                outcome = _parse_retry_outcome(reason_)
+                if outcome["retry_recovered"]:
+                    retry_recovered_step = True
+                    omega_recovery = outcome["retry_omega"]
+                if not ok_:
+                    P_prev = None
+                    P = P_
+                    H = H_
+                    Fx_hyd = float("nan")
+                    Fy_hyd = float("nan")
+                    solve_ok = False
+                    solve_reason = reason_
+                    break
+                P, H = P_, H_
+                Fx_hyd, Fy_hyd = float(Fx_), float(Fy_)
+                solve_ok = True
+                solve_reason = reason_
                 P_prev = P
 
-                # External load
                 Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
                 Fx_ext = float(Fx_ext)
                 Fy_ext = float(Fy_ext)
-
-                # New acceleration
                 ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
                 ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
-
-                # Correct velocity
                 vx_corr = vx_n + 0.5 * (ax_prev + ax_new) * dt_step
                 vy_corr = vy_n + 0.5 * (ay_prev + ay_new) * dt_step
 
-                # Re-predict for next sub-iteration (except last)
                 if k < N_SUB - 1:
-                    ex_pred = ex_n + vx_corr * dt_step + 0.5 * ax_new * dt_step**2
-                    ey_pred = ey_n + vy_corr * dt_step + 0.5 * ay_new * dt_step**2
+                    ex_pred = (ex_n + vx_corr * dt_step
+                                + 0.5 * ax_new * dt_step**2)
+                    ey_pred = (ey_n + vy_corr * dt_step
+                                + 0.5 * ay_new * dt_step**2)
                     ex_pred, ey_pred, vx_corr, vy_corr, cl = _clamp(
                         ex_pred, ey_pred, vx_corr, vy_corr)
                     if cl:
                         contact_count += 1
                         P_prev = None
 
-            # Accept
+            # Accept (even if solver failed — keep mechanical state
+            # progressing without poisoned pressure).
             ex, ey = ex_pred, ey_pred
             vx, vy = vx_corr, vy_corr
             ax_prev, ay_prev = ax_new, ay_new
 
-            # Final clamp
             ex, ey, vx, vy, clamped_final = _clamp(ex, ey, vx, vy)
             if clamped_final:
                 contact_count += 1
                 P_prev = None
+            step_clamped = bool(clamped_p or clamped_final)
 
-            # Характеристики
-            h_dim = H * params.c
-            h_min = np.min(h_dim)
-            p_max = np.max(P * p_scale)
-            F_friction = compute_friction(
-                P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
-                eta, omega, params.R, params.L, params.c)
-            F_hyd_mag = np.hypot(Fx_hyd, Fy_hyd)
-            mu_val = F_friction / max(F_hyd_mag, 1.0)
+            # Per-step diagnostics.
+            if solve_ok and P is not None and H is not None:
+                h_dim = H * params.c
+                h_min = float(np.min(h_dim))
+                p_max = float(np.max(P * p_scale_step))
+                F_friction = float(compute_friction(
+                    P, p_scale_step, H, Phi_mesh, phi_1D, Z_1D,
+                    eta_step, omega, params.R, params.L, params.c))
+                F_hyd_mag = float(np.hypot(Fx_hyd, Fy_hyd))
+                mu_val = (F_friction / max(F_hyd_mag, 1.0)
+                            if F_hyd_mag > 1.0 else 0.0)
+                P_loss_step = F_friction * U
+                Q_step = compute_axial_leakage_m3_s(
+                    P_dim=P * p_scale_step,
+                    h_dim=h_dim,
+                    phi_1D=phi_1D, Z_1D=Z_1D,
+                    eta=eta_step, R=params.R, L=params.L,
+                )
+                mdot_raw = rho * abs(Q_step)
+                mdot_step = max(mdot_raw, thermal.mdot_floor_kg_s)
+                mdot_floor = bool(mdot_raw < thermal.mdot_floor_kg_s)
+            else:
+                solver_failed_count[ic] += 1
+                h_min = float("nan")
+                p_max = float("nan")
+                F_friction = float("nan")
+                mu_val = float("nan")
+                P_loss_step = float("nan")
+                Q_step = float("nan")
+                mdot_step = float("nan")
+                mdot_floor = False
+
+            # Thermal update at the end of the mechanical step.
+            T_target_C = float(thermal.T_in_C)
+            if (not is_off) and solve_ok and np.isfinite(P_loss_step):
+                T_target_C = float(global_static_step(
+                    T_in_C=thermal.T_in_C,
+                    P_loss_W=P_loss_step,
+                    mdot_kg_s=mdot_step,
+                    cp_J_kgK=thermal.cp_J_kgK,
+                    gamma=thermal.gamma_mix,
+                    model=walther_fit,
+                ))
+                if thermal.mode == "global_static":
+                    T_state_C = T_target_C
+                elif thermal.mode == "global_relax":
+                    T_state_C = float(global_relax_step(
+                        T_prev_C=T_state_C,
+                        T_target_C=T_target_C,
+                        dt_s=dt_step,
+                        tau_th_s=thermal.tau_th_s,
+                    ))
+            elif is_off:
+                T_state_C = float(thermal.T_in_C)
+            # Else: solve failed AND not off → keep previous T_state.
+
+            # Compute eta at the new T_state for diagnostics.
+            if is_off or walther_fit is None:
+                eta_next = eta_const
+            else:
+                eta_next = float(viscosity_at_T_C(walther_fit, T_state_C))
 
             eps_x_all[ic, step] = ex / params.c
             eps_y_all[ic, step] = ey / params.c
@@ -311,25 +659,103 @@ def run_transient(F_max=None, debug=False,
             pmax_all[ic, step] = p_max
             f_all[ic, step] = mu_val
             Ftr_all[ic, step] = F_friction
-            Nloss_all[ic, step] = F_friction * U
+            Nloss_all[ic, step] = P_loss_step
             Fx_hyd_all[ic, step] = Fx_hyd
             Fy_hyd_all[ic, step] = Fy_hyd
+            T_eff_used_all[ic, step] = T_used_C
+            T_eff_all[ic, step] = T_state_C
+            T_target_all[ic, step] = T_target_C
+            eta_eff_all[ic, step] = eta_step
+            eta_eff_next_all[ic, step] = eta_next
+            P_loss_all[ic, step] = P_loss_step
+            Q_all[ic, step] = Q_step
+            mdot_all[ic, step] = mdot_step
+            mdot_floor_hit_all[ic, step] = mdot_floor
+            solver_success_all[ic, step] = bool(solve_ok)
+            contact_clamp_all[ic, step] = step_clamped
+            retry_used_all[ic, step] = bool(retry_recovered_step)
+            if retry_recovered_step:
+                retry_recovered_count[ic] += 1
+                retry_omega_used_all[ic, step] = float(omega_recovery or 0.0)
+                if omega_recovery is not None:
+                    tag = _omega_tag(omega_recovery)
+                    omega_hits_per_cfg[ic][tag] = (
+                        omega_hits_per_cfg[ic].get(tag, 0) + 1)
+            if (not solve_ok) and ";" in solve_reason:
+                # Chained reason ⇒ retry exhausted.
+                retry_exhausted_count[ic] += 1
 
             if (step + 1) % progress_interval == 0:
                 pct = 100 * (step + 1) / n_steps
                 eps_now = np.hypot(ex, ey) / params.c
-                print(f"    {pct:3.0f}%: φ={phi_deg:6.1f}°, "
-                      f"|ε|={eps_now:.3f}, h_min={h_min*1e6:.1f} мкм, "
-                      f"p_max={p_max/1e6:.1f} МПа")
+                Tref = (T_state_C if not is_off
+                         else thermal.T_in_C)
+                msg = (f"    {pct:3.0f}%: φ={phi_deg:6.1f}°, "
+                        f"|ε|={eps_now:.3f}, "
+                        f"h_min={h_min*1e6 if np.isfinite(h_min) else float('nan'):.1f} мкм, "
+                        f"p_max={p_max/1e6 if np.isfinite(p_max) else float('nan'):.1f} МПа, "
+                        f"T_eff={Tref:.1f}°C")
+                print(msg)
 
+        contact_clamp_count[ic] = contact_count
         t_cfg = _time.time() - t_cfg_start
         cfg_times.append(t_cfg)
-        print(f"    Контакт (clamp): {contact_count} из {n_steps} шагов")
-        if pv_fallback_count > 0:
-            print(f"    Пьезовязкость: {pv_fallback_count} откатов к изовязкому")
+        n_solver_fail = int(solver_failed_count[ic])
+        n_retry_rec = int(retry_recovered_count[ic])
+        n_retry_exh = int(retry_exhausted_count[ic])
+        print(f"    Контакт (clamp): {contact_count} / {n_steps} шагов")
+        print(f"    Solver: failed={n_solver_fail}, "
+              f"retry_recovered={n_retry_rec}, "
+              f"retry_exhausted={n_retry_exh}")
+        if not is_off:
+            T_eff_last = T_eff_all[ic, last_start:]
+            finite_T = T_eff_last[np.isfinite(T_eff_last)]
+            if finite_T.size > 0:
+                print(f"    T_eff last cycle: "
+                      f"min/mean/max = {finite_T.min():.1f}/"
+                      f"{finite_T.mean():.1f}/{finite_T.max():.1f} °C")
         print(f"    Время: {t_cfg:.1f} с")
 
-    # Углы для последнего цикла
+    # Validity gates.
+    finite_mask = (
+        np.isfinite(hmin_all)
+        & np.isfinite(pmax_all)
+        & np.isfinite(Ftr_all)
+        & np.isfinite(Nloss_all)
+        & np.isfinite(Q_all)
+        & np.isfinite(mdot_all)
+        & np.isfinite(T_eff_all)
+        & (eta_eff_all > 0)
+    )
+    valid_dynamic_all = solver_success_all & finite_mask
+    valid_no_clamp_all = valid_dynamic_all & ~contact_clamp_all
+
+    # Thermal periodic convergence: compare last cycle to previous on
+    # the matching adaptive grid (same step count by construction).
+    thermal_cycle_delta = np.full(n_cfg, np.nan)
+    thermal_periodic_converged = np.zeros(n_cfg, dtype=bool)
+    if n_cycles_eff >= 2 and not is_off:
+        prev_cycle_start_deg = 720.0 * (n_cycles_eff - 2)
+        prev_start = int(np.searchsorted(phi_crank_deg,
+                                            prev_cycle_start_deg))
+        prev_n = last_start - prev_start
+        comp_n = min(prev_n, n_last)
+        if comp_n > 0:
+            for ic in range(n_cfg):
+                T_prev_cycle = T_eff_all[ic, prev_start:prev_start + comp_n]
+                T_last_cycle = T_eff_all[ic, last_start:last_start + comp_n]
+                mask = np.isfinite(T_prev_cycle) & np.isfinite(T_last_cycle)
+                if mask.any():
+                    delta = float(np.max(np.abs(
+                        T_last_cycle[mask] - T_prev_cycle[mask])))
+                    thermal_cycle_delta[ic] = delta
+                    thermal_periodic_converged[ic] = delta < 0.5
+
+    paired = _compute_paired_transient(
+        cfg_list, last_start, valid_dynamic_all, valid_no_clamp_all,
+        T_eff_used_all, eta_eff_all, P_loss_all, hmin_all, pmax_all,
+        Ftr_all)
+
     phi_last = phi_crank_deg[last_start:]
     Fx_ext_last, Fy_ext_last = load_diesel(phi_last % 720.0, F_max=F_max)
 
@@ -349,6 +775,32 @@ def run_transient(F_max=None, debug=False,
         "Fy_hyd": Fy_hyd_all,
         "Fy_ext_last": Fy_ext_last,
         "F_max": F_max,
-        "configs": CONFIGS,
+        "configs": cfg_list,
         "cfg_times": cfg_times,
+        # Stage Diesel Transient THD-0 — new keys.
+        "T_eff_used": T_eff_used_all,
+        "T_eff": T_eff_all,
+        "T_target": T_target_all,
+        "eta_eff": eta_eff_all,
+        "eta_eff_next": eta_eff_next_all,
+        "P_loss": P_loss_all,
+        "Q": Q_all,
+        "mdot": mdot_all,
+        "mdot_floor_hit": mdot_floor_hit_all,
+        "solver_success": solver_success_all,
+        "valid_dynamic": valid_dynamic_all,
+        "valid_no_clamp": valid_no_clamp_all,
+        "contact_clamp": contact_clamp_all,
+        "retry_used": retry_used_all,
+        "retry_omega_used": retry_omega_used_all,
+        "contact_clamp_count": contact_clamp_count,
+        "solver_failed_count": solver_failed_count,
+        "retry_recovered_count": retry_recovered_count,
+        "retry_exhausted_count": retry_exhausted_count,
+        "omega_hits_per_config": omega_hits_per_cfg,
+        "thermal_cycle_delta": thermal_cycle_delta,
+        "thermal_periodic_converged": thermal_periodic_converged,
+        "paired_comparison": paired,
+        "thermal_config": thermal.to_dict(),
+        "retry_config": retry_config.to_dict(),
     }

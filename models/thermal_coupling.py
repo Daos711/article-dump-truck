@@ -21,6 +21,7 @@ THD outer loop is owned by ``models/diesel_quasistatic.run_diesel_analysis``
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -34,11 +35,18 @@ try:
         mu_at_T_C as _mu_at_T_C,
         global_static_target_C as _global_static_target_C,
     )
+    try:
+        from reynolds_solver.thermal import (  # type: ignore
+            global_relax_step_C as _global_relax_step_C,
+        )
+    except ImportError:  # pragma: no cover — older solver builds
+        _global_relax_step_C = None
     SOLVER_THERMAL_AVAILABLE = True
 except ImportError:  # pragma: no cover — env-dependent
     _fit_walther_two_point = None
     _mu_at_T_C = None
     _global_static_target_C = None
+    _global_relax_step_C = None
     SOLVER_THERMAL_AVAILABLE = False
 
 
@@ -58,7 +66,12 @@ class ThermalConfig:
     ``mode == "off"`` preserves the legacy isothermal behaviour (no
     fixed-point iteration; viscosity = ``oil["eta_diesel"]``).
     ``mode == "global_static"`` runs a per-angle fixed-point iteration
-    around ``global_static_target_C``, see Section 3 of the patch spec.
+    around ``global_static_target_C`` (see Section 3 of the THD-0
+    patch spec).
+    ``mode == "global_relax"`` (Stage Diesel Transient THD) carries a
+    thermal state across mechanical time steps via a first-order
+    relaxation toward ``global_static_target_C`` with time constant
+    ``tau_th_s``.
     """
     mode: str = "off"
     T_in_C: float = 105.0
@@ -68,6 +81,7 @@ class ThermalConfig:
     tol_T_C: float = 0.5
     max_outer: int = 5
     underrelax_T: float = 0.6
+    tau_th_s: float = 0.5
 
     def is_off(self) -> bool:
         return str(self.mode).lower() == "off"
@@ -78,6 +92,7 @@ class ThermalConfig:
             cp_J_kgK=self.cp_J_kgK, mdot_floor_kg_s=self.mdot_floor_kg_s,
             tol_T_C=self.tol_T_C, max_outer=self.max_outer,
             underrelax_T=self.underrelax_T,
+            tau_th_s=self.tau_th_s,
         )
 
 
@@ -239,10 +254,50 @@ def global_static_step(
         ))
 
 
+def global_relax_step(
+    *,
+    T_prev_C: float,
+    T_target_C: float,
+    dt_s: float,
+    tau_th_s: float,
+) -> float:
+    """One first-order relaxation step toward the static energy target.
+
+    ``T_next = T_prev + (1 - exp(-dt/tau_th)) * (T_target - T_prev)``
+
+    ``tau_th_s -> 0``  → instantaneous = ``T_target`` (degenerate
+    global_static).
+    ``tau_th_s -> inf`` → ``T_next = T_prev`` (frozen).
+
+    Wraps ``reynolds_solver.thermal.global_relax_step_C`` when
+    available; falls back to the closed-form expression so unit tests
+    can exercise the wrapper without the solver package.
+    """
+    dt = float(dt_s)
+    tau = float(tau_th_s)
+    if dt <= 0.0 or tau <= 0.0:
+        return float(T_target_C)
+    if _global_relax_step_C is not None:
+        try:
+            return float(_global_relax_step_C(
+                T_prev_C=float(T_prev_C),
+                T_target_C=float(T_target_C),
+                dt_s=dt, tau_th_s=tau,
+            ))
+        except TypeError:
+            # Older solver builds with positional arg only.
+            return float(_global_relax_step_C(
+                float(T_prev_C), float(T_target_C), dt, tau))
+    # Pure-pipeline fallback. Equivalent first-order step.
+    alpha = 1.0 - math.exp(-dt / tau)
+    return float(T_prev_C) + alpha * (float(T_target_C) - float(T_prev_C))
+
+
 __all__ = [
     "SOLVER_THERMAL_AVAILABLE",
     "ThermalConfig",
     "build_oil_walther",
     "viscosity_at_T_C",
     "global_static_step",
+    "global_relax_step",
 ]
