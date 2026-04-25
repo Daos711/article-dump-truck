@@ -7,7 +7,7 @@ No squeeze, no thermal. Shell-fixed placement.
 from __future__ import annotations
 
 import argparse, csv, datetime, json, math, os, sys, time, warnings
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
@@ -40,6 +40,15 @@ from models.diesel_stage1_cycle import (
 from models.continuation_runner import (
     ContinuationConfig,
     run_continuation_cycle,
+)
+from models.anchor_solver import (
+    PS_BUDGETS,
+    AnchorState,
+    AnchorReport,
+    DEFAULT_EXPLICIT_PHI_ANCHOR_DEG,
+    pick_anchor_phi,
+    solve_anchor_smooth,
+    solve_anchor_textured,
 )
 
 OMEGA = 2 * math.pi * n_rpm / 60.0
@@ -78,10 +87,13 @@ def _ps(H, dp, dz, phi_bc, g_init=None, d_mask=None, g_bc=None,
 
 
 def eval_pt(X, Y, Phi, Zm, p1, z1, dp, dz, relief, phi_bc,
-            g_init=None, d_mask=None, g_bc=None):
+            g_init=None, d_mask=None, g_bc=None,
+            ps_max_iter=50_000, hs_warmup_iter=20_000):
     H0 = 1.0 + float(X)*np.cos(Phi) + float(Y)*np.sin(Phi)
     H = H0 + relief
-    P, theta, ps_res, ps_it = _ps(H, dp, dz, phi_bc, g_init, d_mask, g_bc)
+    P, theta, ps_res, ps_it = _ps(H, dp, dz, phi_bc, g_init, d_mask, g_bc,
+                                    max_iter=ps_max_iter,
+                                    hs_warmup_iter=hs_warmup_iter)
     Pd = P * P_SCALE
     Fx = -np.trapezoid(np.trapezoid(Pd*np.cos(Phi), p1, axis=1),
                         z1, axis=0)*R*L/2
@@ -216,18 +228,197 @@ def _run_independent_nr(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     return all_rows
 
 
+def _make_eval_factory(Phi, Zm, p1, z1, dp, dz, phi_bc,
+                         relief, d_mask, g_bc):
+    """Mode-aware eval factory: ``factory(mode_str)`` -> eval_fn(X,Y,g)."""
+    def factory(mode="accepted_node"):
+        b = PS_BUDGETS.get(mode, PS_BUDGETS["accepted_node"])
+        def _eval(X, Y, g_init, _b=b):
+            return eval_pt(X, Y, Phi, Zm, p1, z1, dp, dz,
+                           relief, phi_bc, g_init, d_mask, g_bc,
+                           ps_max_iter=_b["ps_max_iter"],
+                           hs_warmup_iter=_b["hs_warmup_iter"])
+        return _eval
+    return factory
+
+
+def _make_textured_geometry_factory(Phi, Zm, p1, z1, dp, dz, phi_bc,
+                                      base_tex_relief, d_mask, g_bc):
+    """Returns ``geometry_factory(alpha_tex, mode)`` -> eval_fn.
+
+    Texture amplitude is scaled by alpha in [0, 1]; only the relief field
+    changes (Section 4.2: keep all other parameters fixed).
+    """
+    def make(alpha_tex: float, mode: str = "anchor_stage_first"):
+        rel = float(alpha_tex) * base_tex_relief
+        b = PS_BUDGETS.get(mode, PS_BUDGETS["anchor_stage_first"])
+        def _eval(X, Y, g_init, _b=b, _rel=rel):
+            return eval_pt(X, Y, Phi, Zm, p1, z1, dp, dz,
+                           _rel, phi_bc, g_init, d_mask, g_bc,
+                           ps_max_iter=_b["ps_max_iter"],
+                           hs_warmup_iter=_b["hs_warmup_iter"])
+        return _eval
+    return make
+
+
+def _log_anchor_report(rep: AnchorReport, geo_tag: str):
+    print(f"  [anchor:{geo_tag}] mode={rep.mode} "
+          f"phi_anchor={rep.phi_anchor_deg:.1f}° "
+          f"reason: {rep.selection_reason}")
+    if rep.candidates:
+        cs = ", ".join(f"{c:.0f}" for c in rep.candidates)
+        print(f"  [anchor:{geo_tag}] candidates: [{cs}]")
+    for e in rep.smooth_lambda_log:
+        print(f"  [anchor:{geo_tag}:smooth] lam={e['lambda_']:.2f} "
+              f"sched={e['schedule']} st={e['status'][:4]} "
+              f"nr={e['nr_iters']} eps={e['eps']:.3f} "
+              f"res={e['rel_residual']:.1e} t={e['wall_sec']:.1f}s")
+    for e in rep.textured_log:
+        path = e.get("path", "?")
+        if "alpha_tex" in e and path == "geometry_continuation":
+            tag = f"alpha={e['alpha_tex']:.2f}"
+        else:
+            tag = path
+        print(f"  [anchor:{geo_tag}:textured] {tag} "
+              f"st={e['status'][:4]} nr={e['nr_iters']} "
+              f"eps={e['eps']:.3f} res={e['rel_residual']:.1e} "
+              f"t={e['wall_sec']:.1f}s")
+
+
+def _node_to_row(nd, geo_tag, load_fn, dt_total, n_nodes):
+    Wx, Wy = load_fn(nd.phi_deg)
+    Wn = math.sqrt(Wx**2 + Wy**2)
+    return dict(
+        geometry=geo_tag,
+        phi_crank_deg=nd.phi_deg,
+        Wx_N=Wx, Wy_N=Wy, W_N=Wn,
+        eps=nd.eps, attitude_deg=nd.attitude_deg,
+        h_min_um=nd.h_min*1e6,
+        p_max_MPa=nd.p_max/1e6,
+        Ploss_W=nd.Ploss,
+        Qout_m3s=nd.Qout,
+        friction=nd.friction,
+        cav_frac=nd.cav_frac,
+        status=nd.status,
+        rel_residual=nd.rel_residual,
+        nr_iters=nd.nr_iters,
+        elapsed_sec=dt_total / max(n_nodes, 1))
+
+
 def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
                        smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa,
-                       load_fn):
+                       load_fn,
+                       *,
+                       anchor_mode: str = "explicit",
+                       phi_anchor_deg: Optional[float] = None,
+                       legacy_matched_phis: Optional[List[float]] = None,
+                       out_dir: Optional[str] = None):
+    """Anchor-first continuation runner.
+
+    Stage I-A patch policy (see ANCHOR_PATCH_NOTE.md):
+      1. Pick anchor angle in a medium-load, well-conditioned sector
+         (NEVER global min/max load).
+      2. Solve smooth anchor via load homotopy in lambda at fixed phi_a.
+      3. Solve textured anchor seeded from accepted smooth state; rescue
+         via geometry continuation in alpha_tex if direct solve fails.
+      4. Only after accepted anchor — march the regular continuation_phi
+         cycle from the anchor outward.
+    """
     all_rows: List[Dict] = []
     phi_list = phi_arr.tolist()
 
-    # Find best anchor: lowest-load angle for easiest initial convergence
-    loads = [np.linalg.norm(get_load_at_angle(cycle, p)) for p in phi_list]
-    idx_min_load = int(np.argmin(loads))
-    phi_anchor = phi_list[idx_min_load]
-    print(f"  Anchor angle: φ={phi_anchor:.1f}° (min load = {loads[idx_min_load]:.0f}N)")
+    d_mask = feed_mask
+    g_bc = g_bc_val if p_Pa > 0 else None
 
+    smooth_factory = _make_eval_factory(
+        Phi, Zm, p1, z1, dp, dz, phi_bc, smooth_relief, d_mask, g_bc)
+    tex_factory = _make_eval_factory(
+        Phi, Zm, p1, z1, dp, dz, phi_bc, tex_relief, d_mask, g_bc)
+    tex_geom_factory = _make_textured_geometry_factory(
+        Phi, Zm, p1, z1, dp, dz, phi_bc, tex_relief, d_mask, g_bc)
+
+    # ── 1. Anchor selection ───────────────────────────────────────
+    explicit_phi = (phi_anchor_deg if phi_anchor_deg is not None
+                    else DEFAULT_EXPLICIT_PHI_ANCHOR_DEG)
+    phi_anchor, reason, cand_list = pick_anchor_phi(
+        phi_list, load_fn,
+        mode=anchor_mode,
+        explicit_phi_deg=explicit_phi,
+        legacy_matched_phis=legacy_matched_phis,
+        scout_eval_fn=(smooth_factory("scout") if anchor_mode == "scout_best"
+                        else None),
+    )
+    Wx_a, Wy_a = load_fn(phi_anchor)
+    Wa_anchor = np.array([Wx_a, Wy_a], dtype=float)
+    Wn_a = float(np.linalg.norm(Wa_anchor))
+    print(f"\n{'='*60}")
+    print(f"  ANCHOR POLICY: {anchor_mode} "
+          f"-> phi_anchor={phi_anchor:.1f}° |W|={Wn_a:.0f}N")
+    print(f"  reason: {reason}")
+    if cand_list:
+        cs = ", ".join(f"{c:.0f}" for c in cand_list)
+        print(f"  candidates: [{cs}]")
+
+    # ── 2. Smooth anchor (load homotopy at fixed phi_a) ──────────
+    print(f"\n  SMOOTH ANCHOR @ phi={phi_anchor:.1f}°")
+    t0 = time.time()
+    smooth_anchor, smooth_log = solve_anchor_smooth(
+        phi_anchor, Wa_anchor, smooth_factory,
+        eps_max=EPS_MAX, step_cap=STEP_CAP,
+        tol=TOL_HARD, soft_tol=TOL_SOFT,
+    )
+    smooth_anchor_dt = time.time() - t0
+
+    rep_sm = AnchorReport(
+        mode=anchor_mode, phi_anchor_deg=phi_anchor,
+        candidates=cand_list, selection_reason=reason,
+        smooth_lambda_log=smooth_log,
+        smooth_state=smooth_anchor,
+        smooth_ok=smooth_anchor is not None,
+        wall_total_sec=smooth_anchor_dt,
+    )
+    _log_anchor_report(rep_sm, "smooth")
+    if smooth_anchor is None:
+        print(f"  [anchor:smooth] FAILED after {smooth_anchor_dt:.1f}s "
+              f"— aborting continuation")
+        if out_dir is not None:
+            _dump_anchor_log(out_dir, rep_sm, None)
+        return all_rows
+    print(f"  [anchor:smooth] ✓ accepted in {smooth_anchor_dt:.1f}s "
+          f"eps={smooth_anchor.eps:.4f} h={smooth_anchor.h_min*1e6:.1f}μm "
+          f"res={smooth_anchor.rel_residual:.1e}")
+
+    # ── 3. Textured anchor (smooth-seeded, optional geom continuation) ──
+    print(f"\n  TEXTURED ANCHOR @ phi={phi_anchor:.1f}°")
+    t0 = time.time()
+    tex_anchor, tex_log = solve_anchor_textured(
+        phi_anchor, Wa_anchor, tex_factory, smooth_anchor,
+        geometry_factory=tex_geom_factory,
+        eps_max=EPS_MAX, step_cap=STEP_CAP,
+        tol=TOL_HARD, soft_tol=TOL_SOFT,
+    )
+    tex_anchor_dt = time.time() - t0
+    rep_tx = AnchorReport(
+        mode=anchor_mode, phi_anchor_deg=phi_anchor,
+        candidates=cand_list, selection_reason=reason,
+        textured_log=tex_log,
+        textured_state=tex_anchor,
+        textured_ok=tex_anchor is not None,
+        wall_total_sec=tex_anchor_dt,
+    )
+    _log_anchor_report(rep_tx, "textured")
+    if tex_anchor is None:
+        print(f"  [anchor:textured] FAILED after {tex_anchor_dt:.1f}s "
+              f"— textured branch will be skipped")
+    else:
+        print(f"  [anchor:textured] ✓ accepted in {tex_anchor_dt:.1f}s "
+              f"eps={tex_anchor.eps:.4f} h={tex_anchor.h_min*1e6:.1f}μm "
+              f"res={tex_anchor.rel_residual:.1e}")
+
+    if out_dir is not None:
+        _dump_anchor_log(out_dir, rep_sm, rep_tx)
+
+    # ── 4. Cycle march from anchor (existing continuation_phi logic) ──
     cfg = ContinuationConfig(
         corrector_max_iter=10,
         corrector_tol=TOL_HARD,
@@ -237,47 +428,28 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
         max_subdiv_depth=4,
         min_dphi_deg=1.5)
 
-    for geo_tag, relief in [("smooth", smooth_relief), ("textured", tex_relief)]:
+    geo_tasks = [("smooth", smooth_factory, smooth_anchor)]
+    if tex_anchor is not None:
+        geo_tasks.append(("textured", tex_factory, tex_anchor))
+
+    for geo_tag, factory, anchor_state in geo_tasks:
         print(f"\n{'='*60}")
-        print(f"  {geo_tag.upper()} (continuation_phi)")
-
-        d_mask = feed_mask
-        g_bc = g_bc_val if p_Pa > 0 else None
-
-        def _eval_factory(rel=relief, dm=d_mask, gb=g_bc):
-            def _eval(X, Y, g_init):
-                return eval_pt(X, Y, Phi, Zm, p1, z1, dp, dz,
-                               rel, phi_bc, g_init, dm, gb)
-            return _eval
+        print(f"  {geo_tag.upper()} (continuation_phi from anchor "
+              f"@ {anchor_state.phi_deg:.1f}°)")
 
         t0 = time.time()
         nodes = run_continuation_cycle(
-            phi_list, load_fn, _eval_factory, cfg,
-            phi_anchor_deg=phi_anchor)
+            phi_list, load_fn, factory, cfg,
+            phi_anchor_deg=anchor_state.phi_deg,
+            anchor_state=anchor_state)
         dt_total = time.time() - t0
 
         for nd in nodes:
-            Wx, Wy = load_fn(nd.phi_deg)
-            Wn = math.sqrt(Wx**2 + Wy**2)
-            row = dict(
-                geometry=geo_tag,
-                phi_crank_deg=nd.phi_deg,
-                Wx_N=Wx, Wy_N=Wy, W_N=Wn,
-                eps=nd.eps, attitude_deg=nd.attitude_deg,
-                h_min_um=nd.h_min*1e6,
-                p_max_MPa=nd.p_max/1e6,
-                Ploss_W=nd.Ploss,
-                Qout_m3s=nd.Qout,
-                friction=nd.friction,
-                cav_frac=nd.cav_frac,
-                status=nd.status,
-                rel_residual=nd.rel_residual,
-                nr_iters=nd.nr_iters,
-                elapsed_sec=dt_total / max(len(nodes), 1))
+            row = _node_to_row(nd, geo_tag, load_fn, dt_total, len(nodes))
             all_rows.append(row)
 
             st = "✓" if nd.status in ("hard_converged","soft_converged") else "✗"
-            print(f"  [{st}] φ={nd.phi_deg:6.1f}° W={Wn:7.0f}N "
+            print(f"  [{st}] φ={nd.phi_deg:6.1f}° W={row['W_N']:7.0f}N "
                   f"ε={nd.eps:.4f} h={nd.h_min*1e6:.1f}μm "
                   f"P={nd.Ploss:.1f}W "
                   f"res={nd.rel_residual:.1e} [{nd.status[:4]}] "
@@ -290,6 +462,52 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     return all_rows
 
 
+def _dump_anchor_log(out_dir: str,
+                       rep_sm: Optional[AnchorReport],
+                       rep_tx: Optional[AnchorReport]):
+    """Write anchor.json next to the cycle outputs."""
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    payload = dict()
+    if rep_sm is not None:
+        payload["smooth"] = dict(
+            mode=rep_sm.mode,
+            phi_anchor_deg=rep_sm.phi_anchor_deg,
+            candidates=rep_sm.candidates,
+            selection_reason=rep_sm.selection_reason,
+            wall_total_sec=rep_sm.wall_total_sec,
+            ok=rep_sm.smooth_ok,
+            lambda_log=rep_sm.smooth_lambda_log,
+            ps_budgets={k: PS_BUDGETS[k] for k in
+                         ("scout", "trial", "anchor_stage_first",
+                          "anchor_stage_later", "accepted_node",
+                          "midpoint_rescue")},
+        )
+        if rep_sm.smooth_state is not None:
+            s = rep_sm.smooth_state
+            payload["smooth"]["state"] = dict(
+                phi_deg=s.phi_deg, X=s.X, Y=s.Y, eps=s.eps,
+                attitude_deg=s.attitude_deg, h_min=s.h_min, p_max=s.p_max,
+                Ploss=s.Ploss, friction=s.friction,
+                rel_residual=s.rel_residual, status=s.status)
+    if rep_tx is not None:
+        payload["textured"] = dict(
+            wall_total_sec=rep_tx.wall_total_sec,
+            ok=rep_tx.textured_ok,
+            log=rep_tx.textured_log,
+        )
+        if rep_tx.textured_state is not None:
+            s = rep_tx.textured_state
+            payload["textured"]["state"] = dict(
+                phi_deg=s.phi_deg, X=s.X, Y=s.Y, eps=s.eps,
+                attitude_deg=s.attitude_deg, h_min=s.h_min, p_max=s.p_max,
+                Ploss=s.Ploss, friction=s.friction,
+                rel_residual=s.rel_residual, status=s.status)
+    with open(os.path.join(out_dir, "anchor.json"), "w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
 def main():
     pa = argparse.ArgumentParser(description="Stage I-A: cold quasi-static diesel cycle")
     pa.add_argument("--n-points", type=int, default=CYCLE_N_COARSE)
@@ -299,6 +517,19 @@ def main():
     pa.add_argument("--out", required=True)
     pa.add_argument("--mode", default="independent_nr",
                     choices=["independent_nr", "continuation_phi"])
+    pa.add_argument("--anchor-mode", default="explicit",
+                    choices=["explicit", "from_legacy_matched_sector",
+                             "scout_best"],
+                    help="Stage I-A anchor selection policy. Default "
+                         "'explicit' uses --phi-anchor-deg.")
+    pa.add_argument("--phi-anchor-deg", type=float,
+                    default=DEFAULT_EXPLICIT_PHI_ANCHOR_DEG,
+                    help="Anchor crank angle for --anchor-mode=explicit. "
+                         "Default 500° (medium-load sector for the "
+                         "current surrogate_heavyduty_v1 case).")
+    pa.add_argument("--legacy-history-csv",
+                    help="Optional CSV from a previous run for "
+                         "--anchor-mode=from_legacy_matched_sector.")
     args = pa.parse_args()
 
     Np,Nz=(int(x) for x in args.grid.split("x"))
@@ -354,10 +585,31 @@ def main():
         return get_load_at_angle(cycle, phi_deg)
 
     if args.mode == "continuation_phi":
+        legacy_phis = None
+        if args.legacy_history_csv and os.path.exists(args.legacy_history_csv):
+            try:
+                with open(args.legacy_history_csv, "r", encoding="utf-8") as f:
+                    rdr = csv.DictReader(f)
+                    rows = [r for r in rdr]
+                sm_ok = {float(r["phi_crank_deg"]) for r in rows
+                          if r.get("geometry") == "smooth"
+                          and r.get("status", "failed") != "failed"}
+                tx_ok = {float(r["phi_crank_deg"]) for r in rows
+                          if r.get("geometry") == "textured"
+                          and r.get("status", "failed") != "failed"}
+                legacy_phis = sorted(sm_ok & tx_ok)
+                print(f"  [legacy] matched-sector phis: {len(legacy_phis)} "
+                      f"angles where BOTH smooth+textured were accepted")
+            except Exception as e:
+                print(f"  [legacy] failed to parse CSV: {e}")
         all_rows = _run_continuation(
             phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, args.phi_bc,
             smooth_relief, tex_relief, feed_mask, g_bc_val, p_Pa,
-            _load_fn)
+            _load_fn,
+            anchor_mode=args.anchor_mode,
+            phi_anchor_deg=args.phi_anchor_deg,
+            legacy_matched_phis=legacy_phis,
+            out_dir=args.out)
     else:
         all_rows = _run_independent_nr(
             phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, args.phi_bc,

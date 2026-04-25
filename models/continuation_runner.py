@@ -209,18 +209,42 @@ def run_continuation_cycle(
         anchor_Y: float = -0.4,
         anchor_g: Optional[np.ndarray] = None,
         phi_anchor_deg: float = None,
+        anchor_state: Optional[Any] = None,
 ) -> List[SolvedNode]:
     """Run continuation over cycle.
 
-    eval_factory() -> eval_fn(X, Y, g_init) -> (metrics, P, theta)
-    load_fn(phi_deg) -> (Wx, Wy)
+    ``eval_factory`` may be either:
+      * legacy zero-arg: ``eval_factory()`` -> eval_fn(X, Y, g_init), or
+      * mode-aware:      ``eval_factory(mode_str)`` -> eval_fn(X, Y, g_init).
+
+    Anchor policy: this runner does NOT solve the anchor itself anymore.
+    Callers MUST supply an accepted anchor via ``anchor_state`` (an object
+    with attributes phi_deg, X, Y, eps, attitude_deg, h_min, p_max,
+    cav_frac, friction, Ploss, Qout, rel_residual, g, status). When
+    ``anchor_state`` is provided, the runner uses it as node 0 and only
+    marches the remaining angles through the regular predictor/corrector
+    pipeline.
+
+    The legacy fallback (anchor_state=None, generic seed + subdivision-style
+    corrector solve at the anchor angle) is retained for backwards compat
+    with non-Stage I-A users only and is NOT recommended for Stage I-A —
+    that path violates the anchor-policy hard rules of the patch spec.
     """
     if cfg is None:
         cfg = ContinuationConfig()
 
+    # Mode-aware factories take a mode kwarg; legacy ones take none.
+    try:
+        eval_fn = eval_factory("accepted_node")
+        eval_fn_mid = eval_factory("midpoint_rescue")
+    except TypeError:
+        eval_fn = eval_factory()
+        eval_fn_mid = eval_fn
+
     # Rotate cycle to start at anchor
     if phi_anchor_deg is None:
-        phi_anchor_deg = phi_targets_deg[0]
+        phi_anchor_deg = (anchor_state.phi_deg if anchor_state is not None
+                          else phi_targets_deg[0])
     idx_anchor = 0
     min_dist = 1e9
     for i, p in enumerate(phi_targets_deg):
@@ -235,38 +259,56 @@ def run_continuation_cycle(
     accepted_history: List[Tuple[float, float, float]] = []
     g_prev = anchor_g
 
-    eval_fn = eval_factory()
-
-    # Anchor solve
     phi0 = phi_targets_deg[ordered[0]]
-    Wx0, Wy0 = load_fn(phi0)
-    Wa0 = np.array([Wx0, Wy0], dtype=float)
 
-    eps_seed = min(0.85, 0.4 * (float(np.linalg.norm(Wa0)) / 1000) ** 0.25)
-    if abs(anchor_X) < 1e-6 and abs(anchor_Y + 0.4) < 1e-6:
-        anchor_X, anchor_Y = 0.0, -eps_seed
+    if anchor_state is not None:
+        # Use externally-solved anchor as node 0. Do NOT re-solve.
+        node0 = SolvedNode(
+            phi_deg=float(anchor_state.phi_deg),
+            X=anchor_state.X, Y=anchor_state.Y,
+            eps=anchor_state.eps,
+            attitude_deg=anchor_state.attitude_deg,
+            h_min=anchor_state.h_min, p_max=anchor_state.p_max,
+            cav_frac=anchor_state.cav_frac,
+            friction=anchor_state.friction,
+            Ploss=anchor_state.Ploss, Qout=anchor_state.Qout,
+            rel_residual=anchor_state.rel_residual,
+            status=getattr(anchor_state, "status", "hard_converged"),
+            nr_iters=0, predictor_type="anchor_external",
+            corrector_type="anchor_solver")
+        results.append(node0)
+        accepted_history.append((node0.phi_deg, node0.X, node0.Y))
+        g_prev = getattr(anchor_state, "g", anchor_g)
+    else:
+        # Legacy path (kept for non-Stage I-A callers).
+        Wx0, Wy0 = load_fn(phi0)
+        Wa0 = np.array([Wx0, Wy0], dtype=float)
+        eps_seed = min(0.85, 0.4 * (float(np.linalg.norm(Wa0)) / 1000) ** 0.25)
+        if abs(anchor_X) < 1e-6 and abs(anchor_Y + 0.4) < 1e-6:
+            anchor_X, anchor_Y = 0.0, -eps_seed
+        anchor_cfg = ContinuationConfig(
+            corrector_max_iter=cfg.corrector_max_iter * 3,
+            corrector_tol=cfg.corrector_tol,
+            corrector_soft_tol=cfg.corrector_soft_tol,
+            step_cap=cfg.step_cap,
+            eps_max=cfg.eps_max)
+        d0, g0, nit0 = corrector_solve(Wa0, eval_fn, anchor_X, anchor_Y,
+                                         g_prev, anchor_cfg)
+        node0 = SolvedNode(
+            phi_deg=phi0, predictor_type="seed_legacy",
+            nr_iters=nit0, **{k: d0[k] for k in (
+                "X", "Y", "eps", "attitude_deg", "h_min", "p_max",
+                "cav_frac", "friction", "Ploss", "Qout",
+                "rel_residual", "status")},
+            corrector_type=d0["corrector_type"])
+        results.append(node0)
+        if d0["status"] != "failed":
+            accepted_history.append((phi0, d0["X"], d0["Y"]))
+            g_prev = g0
 
-    anchor_cfg = ContinuationConfig(
-        corrector_max_iter=cfg.corrector_max_iter * 3,
-        corrector_tol=cfg.corrector_tol,
-        corrector_soft_tol=cfg.corrector_soft_tol,
-        step_cap=cfg.step_cap,
-        eps_max=cfg.eps_max)
-    d0, g0, nit0 = corrector_solve(Wa0, eval_fn, anchor_X, anchor_Y,
-                                     g_prev, anchor_cfg)
-    node0 = SolvedNode(
-        phi_deg=phi0, predictor_type="seed",
-        nr_iters=nit0, **{k: d0[k] for k in (
-            "X", "Y", "eps", "attitude_deg", "h_min", "p_max",
-            "cav_frac", "friction", "Ploss", "Qout",
-            "rel_residual", "status")},
-        corrector_type=d0["corrector_type"])
-    results.append(node0)
-    if d0["status"] != "failed":
-        accepted_history.append((phi0, d0["X"], d0["Y"]))
-        g_prev = g0
-
-    # March through remaining targets
+    # March through remaining targets using the regular continuation logic.
+    # Anchor is already accepted (or fallback-attempted) above; only after
+    # that do we engage subdivision / midpoint rescue / branch-jump checks.
     for idx in range(1, len(ordered)):
         target_i = ordered[idx]
         phi_target = phi_targets_deg[target_i]
@@ -275,7 +317,7 @@ def run_continuation_cycle(
 
         node, g_out = _solve_with_subdivision(
             phi_target, Wa, eval_fn, load_fn, accepted_history,
-            g_prev, cfg, depth=0)
+            g_prev, cfg, depth=0, eval_fn_rescue=eval_fn_mid)
         results.append(node)
         if node.status != "failed":
             accepted_history.append((node.phi_deg, node.X, node.Y))
@@ -293,6 +335,7 @@ def _solve_with_subdivision(
         g_prev: Optional[np.ndarray],
         cfg: ContinuationConfig,
         depth: int,
+        eval_fn_rescue: Optional[Callable] = None,
 ) -> Tuple[SolvedNode, Optional[np.ndarray]]:
     """Solve at phi_target, with subdivision on failure.
 
@@ -353,28 +396,30 @@ def _solve_with_subdivision(
     if abs(dphi) < cfg.min_dphi_deg:
         return _make_failed_node(phi_target, d, nit, depth, pred_type), None
 
-    # Step 1: solve midpoint as stepping stone
+    # Step 1: solve midpoint as stepping stone — uses rescue PS budget if
+    # caller provided a separate eval_fn_rescue (heavier than accepted_node).
     phi_mid = phi_prev + dphi / 2.0
     Wx_mid, Wy_mid = load_fn(phi_mid)
     Wa_mid = np.array([Wx_mid, Wy_mid], dtype=float)
+    eval_mid = eval_fn_rescue if eval_fn_rescue is not None else eval_fn
 
     mid_node, g_mid = _solve_with_subdivision(
-        phi_mid, Wa_mid, eval_fn, load_fn, history,
-        g_prev, cfg, depth + 1)
+        phi_mid, Wa_mid, eval_mid, load_fn, history,
+        g_prev, cfg, depth + 1, eval_fn_rescue=eval_fn_rescue)
 
     if mid_node.status != "failed":
         # Midpoint succeeded — use it as stepping stone to target
         history_ext = list(history) + [(phi_mid, mid_node.X, mid_node.Y)]
         target_node, g_target = _solve_with_subdivision(
             phi_target, Wa, eval_fn, load_fn, history_ext,
-            g_mid, cfg, depth + 1)
+            g_mid, cfg, depth + 1, eval_fn_rescue=eval_fn_rescue)
         if target_node.status != "failed":
             return target_node, g_target
 
     # Step 2: midpoint failed or stepping stone failed — try fresh seed
     Wn = float(np.linalg.norm(Wa))
     eps_s = min(0.85, 0.4 * (Wn / 1000) ** 0.25)
-    d2, g2, nit2 = corrector_solve(Wa, eval_fn, 0.0, -eps_s, None, cfg)
+    d2, g2, nit2 = corrector_solve(Wa, eval_mid, 0.0, -eps_s, None, cfg)
     if d2["status"] != "failed":
         node = SolvedNode(
             phi_deg=phi_target, predictor_type="reseed",

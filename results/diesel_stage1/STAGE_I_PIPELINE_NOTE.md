@@ -73,3 +73,33 @@ Possible resolutions (not attempted in I-A):
 - `input_case.json` — full case definition
 - `eps_vs_phi.png`, `hmin_vs_phi.png`, `ploss_vs_phi.png` — overlays
 - `load_hodograph.png`, `wx_wy_vs_phi.png` — load cycle visualization
+- `anchor.json` — anchor diagnostic (after I-A anchor patch, see below)
+
+## Anchor policy fix
+
+**Status:** see `ANCHOR_PATCH_NOTE.md` for the full pipeline-side patch
+note. Summary:
+
+- Default anchor was previously `argmin(|W|)` over the cycle and was
+  solved through the generic angle-subdivision corrector. That path
+  trapped the runner in an ill-conditioned region before the first
+  accepted node (Stage I-A "stuck before first accepted point" symptom).
+- Fix splits Stage I-A into two regimes:
+  1. **Land on the branch** — `models/anchor_solver.py` with mild load
+     homotopy `λ = [0.4, 0.6, 0.8, 1.0]` at a fixed, well-conditioned
+     anchor angle (default φ_a = **500°** for `surrogate_heavyduty_v1`).
+     Smooth anchor is accepted first; textured anchor is seeded from the
+     smooth anchor state, with optional geometry continuation
+     `α_tex = [0.33, 0.66, 1.0]` as rescue.
+  2. **March the branch** — `models/continuation_runner.py::run_continuation_cycle`
+     now takes an externally-solved `anchor_state` and skips its internal
+     anchor solve. Existing predictor / corrector / subdivision /
+     branch-jump logic operates only on angles after the anchor.
+- PS budgets are now stage-dependent (anchor_stage_first / _later, trial,
+  scout, accepted_node, midpoint_rescue). Trial evaluations are strictly
+  cheaper than accepted evaluations; production PS budget is no longer
+  spent on every candidate inside the corrector.
+- New CLI flags on `scripts/run_diesel_stage1.py`:
+  `--anchor-mode {explicit|from_legacy_matched_sector|scout_best}`,
+  `--phi-anchor-deg`, `--legacy-history-csv`.
+- Pipeline-side logic is covered by `tests/test_anchor_solver.py` (10/10).
