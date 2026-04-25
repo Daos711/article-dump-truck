@@ -36,23 +36,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
-# squeeze submodule layout differs between solver builds; some installs
-# expose ``squeeze_to_api_params`` directly from the top-level module.
-# Fall through both paths and raise only if a production run actually
-# tries to call it without the helper present.
+# squeeze helper location differs between solver layouts. The current
+# upstream layout is ``reynolds_solver.dynamic.squeeze``; older builds
+# kept a flat ``reynolds_solver.squeeze``; some expose it on the top
+# level. Try every known path before raising.
 try:
-    from reynolds_solver.squeeze import squeeze_to_api_params
+    from reynolds_solver.dynamic.squeeze import squeeze_to_api_params
 except ImportError:
     try:
-        from reynolds_solver import squeeze_to_api_params  # type: ignore
+        from reynolds_solver.squeeze import squeeze_to_api_params  # type: ignore
     except ImportError:
-        def squeeze_to_api_params(*_a, **_kw):  # type: ignore
-            raise RuntimeError(
-                "reynolds_solver does not expose squeeze_to_api_params; "
-                "production transient runs need either "
-                "reynolds_solver.squeeze.squeeze_to_api_params or the "
-                "top-level alias. Pipeline contract tests don't depend "
-                "on this helper.")
+        try:
+            from reynolds_solver import squeeze_to_api_params  # type: ignore
+        except ImportError:
+            def squeeze_to_api_params(*_a, **_kw):  # type: ignore
+                raise RuntimeError(
+                    "reynolds_solver.squeeze_to_api_params not found in "
+                    "any known location (tried reynolds_solver.dynamic."
+                    "squeeze, reynolds_solver.squeeze, top-level). "
+                    "Production transient runs need the squeeze helper; "
+                    "pipeline contract tests don't depend on it.")
 from models.bearing_model import (
     DEFAULT_CAVITATION, DEFAULT_CLOSURE,
     compute_axial_leakage_m3_s,

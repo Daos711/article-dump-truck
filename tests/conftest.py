@@ -64,12 +64,20 @@ def _install_reynolds_stub():
     utils.create_H_with_ellipsoidal_depressions = _relief_stub
     sys.modules["reynolds_solver.utils"] = utils
 
-    # squeeze (used by diesel_transient).
-    sq = types.ModuleType("reynolds_solver.squeeze")
+    # squeeze helper (used by diesel_transient). Stub both the modern
+    # nested path (reynolds_solver.dynamic.squeeze) and the historical
+    # flat path (reynolds_solver.squeeze) so the import guard in
+    # diesel_transient finds one of them in the sandbox.
     def _squeeze_to_api_params_stub(*a, **kw):
         return 0.0, 0.0, 2.0
-    sq.squeeze_to_api_params = _squeeze_to_api_params_stub
-    sys.modules["reynolds_solver.squeeze"] = sq
+    sq_flat = types.ModuleType("reynolds_solver.squeeze")
+    sq_flat.squeeze_to_api_params = _squeeze_to_api_params_stub
+    sys.modules["reynolds_solver.squeeze"] = sq_flat
+    dyn_pkg = types.ModuleType("reynolds_solver.dynamic")
+    sq_nested = types.ModuleType("reynolds_solver.dynamic.squeeze")
+    sq_nested.squeeze_to_api_params = _squeeze_to_api_params_stub
+    sys.modules["reynolds_solver.dynamic"] = dyn_pkg
+    sys.modules["reynolds_solver.dynamic.squeeze"] = sq_nested
 
     # thermal (used by thermal_coupling). The pipeline-side
     # thermal_coupling module already wraps this in a try/except, so
