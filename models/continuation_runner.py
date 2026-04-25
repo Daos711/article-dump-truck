@@ -90,11 +90,21 @@ def corrector_solve(
         X0: float, Y0: float,
         g_init: Optional[np.ndarray],
         cfg: ContinuationConfig,
+        eval_fn_trial: Optional[Callable] = None,
 ) -> Tuple[Dict[str, Any], Optional[np.ndarray], int]:
     """Short-budget damped NR with LM safeguard.
 
+    Section 5.3 of the patch spec: trial evaluations (Jacobian probes,
+    line-search trial points) MUST be cheaper than accepted evaluations.
+    When ``eval_fn_trial`` is supplied, it is used for those probes; the
+    accepted-step evaluation that updates state still uses ``eval_fn``.
+    When ``eval_fn_trial`` is None we fall back to the legacy single-budget
+    behaviour.
+
     Returns (result_dict, g_out, n_iters).
     """
+    if eval_fn_trial is None:
+        eval_fn_trial = eval_fn
     Wn = float(np.linalg.norm(Wa))
     dXY = 1e-4
     X, Y = float(X0), float(Y0)
@@ -113,11 +123,11 @@ def corrector_solve(
     for it in range(cfg.corrector_max_iter):
         if rR < cfg.corrector_tol:
             break
-        # Jacobian
+        # Jacobian — trial budget.
         J = np.zeros((2, 2))
         for col, (dX_, dY_) in enumerate([(dXY, 0.0), (0.0, dXY)]):
-            mp, _, _ = eval_fn(X + dX_, Y + dY_, g_cur)
-            mn, _, _ = eval_fn(X - dX_, Y - dY_, g_cur)
+            mp, _, _ = eval_fn_trial(X + dX_, Y + dY_, g_cur)
+            mn, _, _ = eval_fn_trial(X - dX_, Y - dY_, g_cur)
             J[0, col] = (mp["Fx"] - mn["Fx"]) / (2 * dXY)
             J[1, col] = (mp["Fy"] - mn["Fy"]) / (2 * dXY)
         Rx = Fx - Wa[0]
@@ -142,22 +152,25 @@ def corrector_solve(
         if cap < 1:
             ddX *= cap
             ddY *= cap
-        # Backtracking
+        # Backtracking — trial budget for screening; accept with full budget.
         ok = False
         for alpha in [1.0, 0.5, 0.25]:
             Xt = X + alpha * ddX
             Yt = Y + alpha * ddY
             if math.sqrt(Xt**2 + Yt**2) >= cfg.eps_max:
                 continue
-            mt, Pt, tht = eval_fn(Xt, Yt, g_cur)
+            mt, _, _ = eval_fn_trial(Xt, Yt, g_cur)
             rt = math.sqrt((mt["Fx"] - Wa[0])**2 + (mt["Fy"] - Wa[1])**2) / max(Wn, 1e-20)
             if rt < rR:
+                # Re-evaluate this accepted candidate at full budget so the
+                # state we keep has fully converged PS at this node.
+                mF, PF, thF = eval_fn(Xt, Yt, g_cur)
                 X, Y = Xt, Yt
-                Fx, Fy = mt["Fx"], mt["Fy"]
-                hm, pm, cv, fr, pl, qo = (mt["h_min"], mt["p_max"],
-                    mt["cav_frac"], mt["friction"], mt["Ploss"], mt["Qout"])
-                rR = rt
-                g_cur_out = _pack_g(Pt, tht)
+                Fx, Fy = mF["Fx"], mF["Fy"]
+                hm, pm, cv, fr, pl, qo = (mF["h_min"], mF["p_max"],
+                    mF["cav_frac"], mF["friction"], mF["Ploss"], mF["Qout"])
+                rR = math.sqrt((Fx - Wa[0])**2 + (Fy - Wa[1])**2) / max(Wn, 1e-20)
+                g_cur_out = _pack_g(PF, thF)
                 g_cur = g_cur_out
                 ok = True
                 n_it += 1
@@ -237,9 +250,11 @@ def run_continuation_cycle(
     try:
         eval_fn = eval_factory("accepted_node")
         eval_fn_mid = eval_factory("midpoint_rescue")
+        eval_fn_trial = eval_factory("trial")
     except TypeError:
         eval_fn = eval_factory()
         eval_fn_mid = eval_fn
+        eval_fn_trial = eval_fn
 
     # Rotate cycle to start at anchor
     if phi_anchor_deg is None:
@@ -317,7 +332,9 @@ def run_continuation_cycle(
 
         node, g_out = _solve_with_subdivision(
             phi_target, Wa, eval_fn, load_fn, accepted_history,
-            g_prev, cfg, depth=0, eval_fn_rescue=eval_fn_mid)
+            g_prev, cfg, depth=0,
+            eval_fn_rescue=eval_fn_mid,
+            eval_fn_trial=eval_fn_trial)
         results.append(node)
         if node.status != "failed":
             accepted_history.append((node.phi_deg, node.X, node.Y))
@@ -336,6 +353,7 @@ def _solve_with_subdivision(
         cfg: ContinuationConfig,
         depth: int,
         eval_fn_rescue: Optional[Callable] = None,
+        eval_fn_trial: Optional[Callable] = None,
 ) -> Tuple[SolvedNode, Optional[np.ndarray]]:
     """Solve at phi_target, with subdivision on failure.
 
@@ -366,9 +384,10 @@ def _solve_with_subdivision(
         X_pred *= scale
         Y_pred *= scale
 
-    # Corrector
+    # Corrector — trial-budget probes, full-budget accepted update.
     d, g_out, nit = corrector_solve(Wa, eval_fn, X_pred, Y_pred,
-                                      g_prev, cfg)
+                                      g_prev, cfg,
+                                      eval_fn_trial=eval_fn_trial)
 
     # Branch-jump check
     if d["status"] != "failed":
@@ -405,21 +424,26 @@ def _solve_with_subdivision(
 
     mid_node, g_mid = _solve_with_subdivision(
         phi_mid, Wa_mid, eval_mid, load_fn, history,
-        g_prev, cfg, depth + 1, eval_fn_rescue=eval_fn_rescue)
+        g_prev, cfg, depth + 1,
+        eval_fn_rescue=eval_fn_rescue,
+        eval_fn_trial=eval_fn_trial)
 
     if mid_node.status != "failed":
         # Midpoint succeeded — use it as stepping stone to target
         history_ext = list(history) + [(phi_mid, mid_node.X, mid_node.Y)]
         target_node, g_target = _solve_with_subdivision(
             phi_target, Wa, eval_fn, load_fn, history_ext,
-            g_mid, cfg, depth + 1, eval_fn_rescue=eval_fn_rescue)
+            g_mid, cfg, depth + 1,
+            eval_fn_rescue=eval_fn_rescue,
+            eval_fn_trial=eval_fn_trial)
         if target_node.status != "failed":
             return target_node, g_target
 
     # Step 2: midpoint failed or stepping stone failed — try fresh seed
     Wn = float(np.linalg.norm(Wa))
     eps_s = min(0.85, 0.4 * (Wn / 1000) ** 0.25)
-    d2, g2, nit2 = corrector_solve(Wa, eval_mid, 0.0, -eps_s, None, cfg)
+    d2, g2, nit2 = corrector_solve(Wa, eval_mid, 0.0, -eps_s, None, cfg,
+                                      eval_fn_trial=eval_fn_trial)
     if d2["status"] != "failed":
         node = SolvedNode(
             phi_deg=phi_target, predictor_type="reseed",
