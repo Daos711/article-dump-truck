@@ -21,7 +21,7 @@ THD outer loop is owned by ``models/diesel_quasistatic.run_diesel_analysis``
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 # Lazy import — keep module importable even when the solver package isn't
@@ -82,7 +82,12 @@ class ThermalConfig:
 
 # ─── Oil model from existing oil dictionaries (Section 2) ──────────
 
-def build_oil_walther(oil: Dict[str, Any]) -> Any:
+def build_oil_walther(
+    oil: Dict[str, Any],
+    *,
+    cp_J_kgK: Optional[float] = None,
+    gamma_mix: Optional[float] = None,
+) -> Any:
     """Fit Walther viscosity-temperature law from an existing oil dict.
 
     The reference points are:
@@ -92,6 +97,19 @@ def build_oil_walther(oil: Dict[str, Any]) -> Any:
     Density ``oil["rho"]`` is used to convert dynamic viscosity (Pa·s)
     to kinematic viscosity (cSt = mm²/s) for the solver fit:
         ν[cSt] = η[Pa·s] / ρ[kg/m³] * 1e6
+
+    The solver's ``fit_walther_two_point`` returns an ``OilModel`` that
+    *also* carries ``rho_kg_m3`` / ``cp_J_kgK`` / ``alpha_pv_base`` /
+    ``gamma_mix`` for downstream use by ``mu_at_T_C`` and other thermal
+    helpers. To make the round-trip
+    ``mu_at_T_C(105 °C) == oil["eta_diesel"]`` exact, the actual oil
+    density must be embedded in the OilModel — otherwise the solver
+    falls back to its own default and the dynamic-viscosity conversion
+    drifts. We therefore pass ``rho_kg_m3``, ``alpha_pv_base`` and
+    optionally ``cp_J_kgK`` / ``gamma_mix`` (sourced from
+    ``ThermalConfig`` when available) as kwargs. If the installed
+    ``fit_walther_two_point`` doesn't accept these, we fall back to the
+    bare two-point fit.
 
     Returns
     -------
@@ -104,19 +122,50 @@ def build_oil_walther(oil: Dict[str, Any]) -> Any:
     rho = float(oil["rho"])
     nu_50_cSt = float(oil["eta_pump"]) / rho * 1e6
     nu_105_cSt = float(oil["eta_diesel"]) / rho * 1e6
-    return _fit_walther_two_point(
+
+    base = dict(
         T1_C=50.0, nu1_cSt=nu_50_cSt,
         T2_C=105.0, nu2_cSt=nu_105_cSt,
     )
+    extras: Dict[str, Any] = dict(rho_kg_m3=rho)
+    alpha_pv = oil.get("alpha_pv")
+    if alpha_pv is not None:
+        extras["alpha_pv_base"] = float(alpha_pv)
+    if cp_J_kgK is not None:
+        extras["cp_J_kgK"] = float(cp_J_kgK)
+    if gamma_mix is not None:
+        extras["gamma_mix"] = float(gamma_mix)
+
+    # Try the modern OilModel signature first; fall back kwarg-by-kwarg
+    # if the installed solver is older / takes a narrower signature.
+    last_err: Optional[Exception] = None
+    for trial in (
+        {**base, **extras},
+        {**base, "rho_kg_m3": rho},
+        base,
+    ):
+        try:
+            return _fit_walther_two_point(**trial)
+        except TypeError as e:
+            last_err = e
+            continue
+    raise last_err  # type: ignore[misc]
 
 
 def viscosity_at_T_C(walther_fit: Any, T_C: float) -> float:
     """Dynamic viscosity (Pa·s) at ``T_C`` from a fitted Walther model.
 
-    Direct passthrough to ``reynolds_solver.thermal.mu_at_T_C``.
+    Argument order in the solver's ``mu_at_T_C`` is ``(T_C, model)`` —
+    we keep the pipeline-side wrapper as ``(walther_fit, T_C)`` so the
+    rest of the pipeline reads naturally and centralises the bridging.
     """
     _require_solver_thermal("mu_at_T_C")
-    return float(_mu_at_T_C(walther_fit, T_C))
+    try:
+        return float(_mu_at_T_C(T_C, walther_fit))
+    except TypeError:
+        # Some older versions of the solver may swap the order; try the
+        # alternative before giving up.
+        return float(_mu_at_T_C(walther_fit, T_C))
 
 
 # ─── Single global_static step (Section 3 step 7) ──────────────────
@@ -128,23 +177,37 @@ def global_static_step(
     mdot_kg_s: float,
     cp_J_kgK: float,
     gamma: float,
+    model: Any = None,
 ) -> float:
     """One static energy-balance update.
 
     T_target = T_in + gamma * P_loss / (mdot * cp)
 
-    Direct passthrough to ``reynolds_solver.thermal.global_static_target_C``;
-    we keep the wrapper so the rest of the pipeline depends on a stable
-    pipeline-side name and so the import is centralised in one place.
+    Wraps ``reynolds_solver.thermal.global_static_target_C``. The solver
+    may take either an explicit ``cp_J_kgK`` / ``gamma`` pair or an
+    ``OilModel`` (which already carries those scalars). We try the
+    explicit-args form first (matches the patch spec); if the installed
+    solver insists on ``model=`` we fall back to that with the supplied
+    OilModel.
     """
     _require_solver_thermal("global_static_target_C")
-    return float(_global_static_target_C(
-        T_in_C=float(T_in_C),
-        P_loss_W=float(P_loss_W),
-        mdot_kg_s=float(mdot_kg_s),
-        cp_J_kgK=float(cp_J_kgK),
-        gamma=float(gamma),
-    ))
+    try:
+        return float(_global_static_target_C(
+            T_in_C=float(T_in_C),
+            P_loss_W=float(P_loss_W),
+            mdot_kg_s=float(mdot_kg_s),
+            cp_J_kgK=float(cp_J_kgK),
+            gamma=float(gamma),
+        ))
+    except TypeError:
+        if model is None:
+            raise
+        return float(_global_static_target_C(
+            T_in_C=float(T_in_C),
+            P_loss_W=float(P_loss_W),
+            mdot_kg_s=float(mdot_kg_s),
+            model=model,
+        ))
 
 
 __all__ = [

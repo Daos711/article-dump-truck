@@ -234,6 +234,7 @@ def _angle_thd_step(
         T_target = global_static_step(
             T_in_C=T_in, P_loss_W=P_loss, mdot_kg_s=mdot,
             cp_J_kgK=cp, gamma=gamma,
+            model=walther_fit,
         )
         last_T_target = float(T_target)
         if abs(T_target - T_guess) < thermal.tol_T_C:
@@ -338,8 +339,17 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
               f"max={F_ext.max()/1000:.1f} кН")
 
         # Walther fit (only when THD is active — keeps mode='off' free of
-        # solver thermal dependency).
-        walther_fit = build_oil_walther(cfg["oil"]) if not is_off else None
+        # solver thermal dependency). Pass cp/gamma into the OilModel so
+        # the solver's static balance step uses the same numbers as
+        # ThermalConfig.
+        if is_off:
+            walther_fit = None
+        else:
+            walther_fit = build_oil_walther(
+                cfg["oil"],
+                cp_J_kgK=thermal.cp_J_kgK,
+                gamma_mix=thermal.gamma_mix,
+            )
 
         # Шаг 2: по каждому углу.
         n_below = n_above = 0
