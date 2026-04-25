@@ -7,6 +7,12 @@ import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 
+# numpy 2.x removed ``np.trapz`` in favour of ``np.trapezoid``; older
+# numpy releases only have ``np.trapz``. Use whichever is available so
+# the module is forward- and backward-compatible without spamming the
+# DeprecationWarning fired by ``np.trapz`` on numpy 1.x.
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
 DEFAULT_CLOSURE = "laminar"
 DEFAULT_CAVITATION = "half_sommerfeld"
 
@@ -234,10 +240,10 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
 
     # Несущая способность: интегрирование давления
     # Меши (N_Z, N_phi): axis=0 — Z, axis=1 — φ
-    Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
-    Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
+    Fx = -_trapz(_trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
+    Fy = -_trapz(_trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
     F = np.sqrt(Fx**2 + Fy**2)
 
     # Сила трения на поверхности вала
@@ -247,8 +253,8 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     tau_pressure = h_dim / 2.0 * dP_dphi / R
     tau = tau_couette + tau_pressure
 
-    F_friction = np.trapz(np.trapz(np.abs(tau), phi_1D, axis=1),
-                          Z_1D, axis=0) * R * L / 2
+    F_friction = _trapz(_trapz(np.abs(tau), phi_1D, axis=1),
+                        Z_1D, axis=0) * R * L / 2
 
     # Коэффициент трения
     mu_val = F_friction / max(F, 1.0) if F > 1.0 else 0.0
@@ -319,7 +325,6 @@ def compute_axial_leakage_m3_s(
     q_z_lo = h_dim[0, :] ** 3 / (12.0 * float(eta)) * np.abs(dP_dz[0, :])
     q_z_hi = h_dim[-1, :] ** 3 / (12.0 * float(eta)) * np.abs(dP_dz[-1, :])
 
-    _trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     Q = float(R) * (
         _trapz(q_z_lo, phi_1D) + _trapz(q_z_hi, phi_1D)
     )
