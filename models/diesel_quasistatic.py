@@ -24,9 +24,22 @@ unconditionally.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+
+
+# Stage THD-0B sanity thresholds. Above these the SOR has visibly
+# diverged but still returns *finite* floats (e.g. delta=1.0 at
+# 50 000 iterations on textured peaks). Treat that as a solver failure
+# so build_load_table / find_epsilon_for_load do not poison the chain.
+_W_SANITY_LIMIT_N = 1.0e10     # 10 GN — 4 orders of magnitude above
+                                #         any physical bearing load
+_P_SANITY_LIMIT_Pa = 1.0e10    # 10 GPa — 1 order of magnitude above
+                                #         peak hydrodynamic pressure
+_SOR_WARN_FRAGMENT = "SOR не сошёлся"  # exact warning emitted by
+                                          # bearing_model on non-conv.
 
 from models.bearing_model import (
     setup_grid, setup_texture, make_H, solve_and_compute,
@@ -79,6 +92,79 @@ def load_diesel(phi_deg, F_max=None):
     F_inertia = 0.1 * F_max * np.cos(2 * np.deg2rad(phi_deg))
     F_total = F_gas + F_inertia + 0.05 * F_max
     return np.maximum(F_total, 20000.0)
+
+
+def _solver_result_is_sane(F: float, P: np.ndarray) -> bool:
+    """Reject results that look mathematically valid but are physically
+    nonsense.
+
+    Checks:
+      * ``F`` and every entry of ``P`` are finite;
+      * ``|F| < _W_SANITY_LIMIT_N`` (10 GN);
+      * ``max|P| < _P_SANITY_LIMIT_Pa`` (10 GPa).
+
+    SOR can return arrays with values ~1e72 when divergent (the textured
+    BelAZ peak triggers this). Such results pass ``np.isfinite`` but are
+    clearly garbage; pretending they are real poisons the warm-start
+    chain and the load matcher.
+    """
+    if not np.isfinite(F):
+        return False
+    if abs(float(F)) > _W_SANITY_LIMIT_N:
+        return False
+    if not np.all(np.isfinite(P)):
+        return False
+    if float(np.max(np.abs(P))) > _P_SANITY_LIMIT_Pa:
+        return False
+    return True
+
+
+def _solve_and_check(
+    H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
+    phi_1D, Z_1D, Phi_mesh, *, P_init=None,
+    closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
+):
+    """Wrap solve_and_compute with SOR-warning capture + sanity check.
+
+    Returns ``(P, F, mu, Q, h_min, p_max, F_tr, ok)`` where ``ok`` is
+    False when the SOR warned non-convergence OR the sanity check
+    rejected the magnitudes. On failure callers should reset their
+    ``P_init`` warm-start to ``None`` and mark the angle as
+    ``solver_failed``.
+    """
+    sor_diverged = False
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            P, F, mu_v, Qv, hm, pm, F_tr, _, _, _ = solve_and_compute(
+                H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
+                phi_1D, Z_1D, Phi_mesh, P_init=P_init,
+                closure=closure, cavitation=cavitation,
+            )
+        except Exception as exc:
+            return (None, float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), False,
+                    f"exception:{type(exc).__name__}:{exc}")
+        for w in caught:
+            msg = str(w.message)
+            if _SOR_WARN_FRAGMENT in msg:
+                sor_diverged = True
+                break
+
+    if sor_diverged:
+        return (P, float("nan"), float("nan"), float("nan"),
+                float("nan"), float("nan"), float("nan"), False,
+                "SOR_did_not_converge")
+
+    if not _solver_result_is_sane(F, P):
+        F_repr = (f"{float(F):.3e}" if np.isfinite(F) else repr(F))
+        P_repr = f"max|P|={float(np.max(np.abs(P))):.3e}"
+        return (P, float("nan"), float("nan"), float("nan"),
+                float("nan"), float("nan"), float("nan"), False,
+                f"non_physical:F={F_repr},{P_repr}")
+
+    return (P, float(F), float(mu_v), float(Qv), float(hm),
+            float(pm), float(F_tr), True, "ok")
 
 
 def _eps_max_hydro(override: Optional[float] = None) -> float:
@@ -135,22 +221,14 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     for i, eps in enumerate(eps_table):
         H = make_H(eps, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        try:
-            P, F, _, _, _, _, _, _, _, _ = solve_and_compute(
-                H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
-                phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
-                closure=closure, cavitation=cavitation,
-            )
-        except Exception as exc:
-            print(f"    [warn] solve_and_compute exception at eps={eps:.3f}: "
-                  f"{type(exc).__name__}: {exc}")
-            W_table[i] = np.nan
-            P_prev = None
-            n_failed += 1
-            continue
-        if not (np.isfinite(F) and np.all(np.isfinite(P))):
-            print(f"    [warn] non-finite W_table entry at eps={eps:.3f} "
-                  f"(F={F!r}); resetting P_init")
+        P, F, _, _, _, _, _, ok, reason = _solve_and_check(
+            H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
+            phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
+            closure=closure, cavitation=cavitation,
+        )
+        if not ok:
+            print(f"    [warn] W_table eps={eps:.3f} rejected: {reason}; "
+                  f"resetting P_init")
             W_table[i] = np.nan
             P_prev = None
             n_failed += 1
@@ -241,22 +319,19 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
         eps_mid = min(eps_mid, eps_top)
         H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
                    textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
-        try:
-            _, F_hyd, mu, Qv, h_min, p_max, F_tr, _, _, _ = solve_and_compute(
+        _, F_hyd, mu, Qv, h_min, p_max, F_tr, ok, reason = (
+            _solve_and_check(
                 H, d_phi, d_Z, params.R, params.L, eta_eff,
                 params.n, params.c,
                 phi_1D, Z_1D, Phi_mesh,
                 closure=closure, cavitation=cavitation,
             )
-        except Exception as exc:
-            print(f"    [warn] solve_and_compute exception at "
-                  f"eps={eps_mid:.3f}: {type(exc).__name__}: {exc}")
+        )
+        if not ok:
+            print(f"    [warn] inner solve eps={eps_mid:.3f} rejected: "
+                  f"{reason}")
             return (eps_mid, float("nan"), float("nan"), float("nan"),
                     float("nan"), float("nan"), float("nan"),
-                    "solver_failed")
-        if not all(np.isfinite([F_hyd, mu, Qv, h_min, p_max, F_tr])):
-            return (eps_mid, float(F_hyd), float(mu), float(Qv),
-                    float(h_min), float(p_max), float(F_tr),
                     "solver_failed")
         if F_hyd > F_target:
             eps_hi = eps_mid
