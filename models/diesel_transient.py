@@ -715,12 +715,20 @@ def run_transient(F_max=None, debug=False,
                 eps_now = np.hypot(ex, ey) / params.c
                 Tref = (T_state_C if not is_off
                          else thermal.T_in_C)
+                t_now = _time.time() - t_cfg_start
+                # ETA assumes a constant rate from the start of this
+                # config; firing peak slows it down, off-peak speeds up,
+                # so ETA is a useful order-of-magnitude not a promise.
+                eta_total = (t_now / max(pct, 1e-6) * 100.0
+                              if pct > 0 else 0.0)
+                eta_left = max(0.0, eta_total - t_now)
                 msg = (f"    {pct:3.0f}%: φ={phi_deg:6.1f}°, "
                         f"|ε|={eps_now:.3f}, "
                         f"h_min={h_min*1e6 if np.isfinite(h_min) else float('nan'):.1f} мкм, "
                         f"p_max={p_max/1e6 if np.isfinite(p_max) else float('nan'):.1f} МПа, "
-                        f"T_eff={Tref:.1f}°C")
-                print(msg)
+                        f"T_eff={Tref:.1f}°C, "
+                        f"t={t_now:.0f}s, ETA={eta_left:.0f}s")
+                print(msg, flush=True)
 
         contact_clamp_count[ic] = contact_count
         t_cfg = _time.time() - t_cfg_start
