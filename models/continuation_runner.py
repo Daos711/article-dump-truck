@@ -57,6 +57,17 @@ class SolvedNode:
     corrector_type: str = "newton"
 
 
+def _wrap_dphi(target: float, ref: float, period: float = 720.0) -> float:
+    """Shortest signed angular delta target-ref on a wrapped period.
+
+    Without wrap-safety, marching past phi=720° onto phi=0° yields a
+    nominal delta of -710° instead of +10°, which makes the secant
+    predictor extrapolate ~71 steps ahead and breaks the first wrap
+    node every time.
+    """
+    return ((float(target) - float(ref) + period / 2) % period) - period / 2
+
+
 def _secant_predict(q1: Tuple[float, float], q2: Tuple[float, float],
                      dphi_prev: float, dphi_target: float
                      ) -> Tuple[float, float]:
@@ -367,12 +378,12 @@ def _solve_with_subdivision(
 
     Returns (node, g_out).
     """
-    # Predictor
+    # Predictor — wrap-safe phi differences (cycle wraps at 720 deg).
     if len(history) >= 2:
         phi1, X1, Y1 = history[-2]
         phi2, X2, Y2 = history[-1]
-        dphi_prev = phi2 - phi1
-        dphi_target = phi_target - phi2
+        dphi_prev = _wrap_dphi(phi2, phi1)
+        dphi_target = _wrap_dphi(phi_target, phi2)
         X_pred, Y_pred = _secant_predict((X1, Y1), (X2, Y2),
                                           dphi_prev, dphi_target)
         pred_type = "secant"
@@ -419,13 +430,13 @@ def _solve_with_subdivision(
         return _make_failed_node(phi_target, d, nit, depth, pred_type), None
 
     phi_prev = history[-1][0] if history else phi_target - 20
-    dphi = phi_target - phi_prev
+    dphi = _wrap_dphi(phi_target, phi_prev)
     if abs(dphi) < cfg.min_dphi_deg:
         return _make_failed_node(phi_target, d, nit, depth, pred_type), None
 
     # Step 1: solve midpoint as stepping stone — uses rescue PS budget if
     # caller provided a separate eval_fn_rescue (heavier than accepted_node).
-    phi_mid = phi_prev + dphi / 2.0
+    phi_mid = (phi_prev + dphi / 2.0) % 720.0
     Wx_mid, Wy_mid = load_fn(phi_mid)
     Wa_mid = np.array([Wx_mid, Wy_mid], dtype=float)
     eval_mid = eval_fn_rescue if eval_fn_rescue is not None else eval_fn
