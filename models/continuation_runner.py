@@ -223,6 +223,7 @@ def run_continuation_cycle(
         anchor_g: Optional[np.ndarray] = None,
         phi_anchor_deg: float = None,
         anchor_state: Optional[Any] = None,
+        node_callback: Optional[Callable] = None,
 ) -> List[SolvedNode]:
     """Run continuation over cycle.
 
@@ -294,6 +295,8 @@ def run_continuation_cycle(
         results.append(node0)
         accepted_history.append((node0.phi_deg, node0.X, node0.Y))
         g_prev = getattr(anchor_state, "g", anchor_g)
+        if node_callback is not None:
+            node_callback(node0, 0, len(ordered))
     else:
         # Legacy path (kept for non-Stage I-A callers).
         Wx0, Wy0 = load_fn(phi0)
@@ -308,7 +311,8 @@ def run_continuation_cycle(
             step_cap=cfg.step_cap,
             eps_max=cfg.eps_max)
         d0, g0, nit0 = corrector_solve(Wa0, eval_fn, anchor_X, anchor_Y,
-                                         g_prev, anchor_cfg)
+                                         g_prev, anchor_cfg,
+                                         eval_fn_trial=eval_fn_trial)
         node0 = SolvedNode(
             phi_deg=phi0, predictor_type="seed_legacy",
             nr_iters=nit0, **{k: d0[k] for k in (
@@ -320,6 +324,8 @@ def run_continuation_cycle(
         if d0["status"] != "failed":
             accepted_history.append((phi0, d0["X"], d0["Y"]))
             g_prev = g0
+        if node_callback is not None:
+            node_callback(node0, 0, len(ordered))
 
     # March through remaining targets using the regular continuation logic.
     # Anchor is already accepted (or fallback-attempted) above; only after
@@ -339,6 +345,8 @@ def run_continuation_cycle(
         if node.status != "failed":
             accepted_history.append((node.phi_deg, node.X, node.Y))
             g_prev = g_out
+        if node_callback is not None:
+            node_callback(node, idx, len(ordered))
 
     return results
 

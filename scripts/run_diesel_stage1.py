@@ -438,29 +438,43 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     for geo_tag, factory, anchor_state in geo_tasks:
         print(f"\n{'='*60}")
         print(f"  {geo_tag.upper()} (continuation_phi from anchor "
-              f"@ {anchor_state.phi_deg:.1f}°)")
+              f"@ {anchor_state.phi_deg:.1f}°)", flush=True)
+
+        # Streaming progress callback: print as soon as each node is done,
+        # so the user can see actual progress instead of one big silent
+        # block until the whole cycle finishes.
+        t_start = [time.time()]
+        def _on_node(nd, idx, n_total, _ts=t_start, _gt=geo_tag):
+            now = time.time()
+            dt_node = now - _ts[0]
+            _ts[0] = now
+            st = "✓" if nd.status in ("hard_converged","soft_converged") else "✗"
+            Wx_n, Wy_n = load_fn(nd.phi_deg)
+            Wn_n = math.sqrt(Wx_n**2 + Wy_n**2)
+            print(f"  [{st}] {idx+1:3d}/{n_total} φ={nd.phi_deg:6.1f}° "
+                  f"W={Wn_n:7.0f}N ε={nd.eps:.4f} "
+                  f"h={nd.h_min*1e6:.1f}μm P={nd.Ploss:.1f}W "
+                  f"res={nd.rel_residual:.1e} [{nd.status[:4]}] "
+                  f"pred={nd.predictor_type} d={nd.subdiv_depth} "
+                  f"{dt_node:.0f}s",
+                  flush=True)
 
         t0 = time.time()
         nodes = run_continuation_cycle(
             phi_list, load_fn, factory, cfg,
             phi_anchor_deg=anchor_state.phi_deg,
-            anchor_state=anchor_state)
+            anchor_state=anchor_state,
+            node_callback=_on_node)
         dt_total = time.time() - t0
 
         for nd in nodes:
             row = _node_to_row(nd, geo_tag, load_fn, dt_total, len(nodes))
             all_rows.append(row)
 
-            st = "✓" if nd.status in ("hard_converged","soft_converged") else "✗"
-            print(f"  [{st}] φ={nd.phi_deg:6.1f}° W={row['W_N']:7.0f}N "
-                  f"ε={nd.eps:.4f} h={nd.h_min*1e6:.1f}μm "
-                  f"P={nd.Ploss:.1f}W "
-                  f"res={nd.rel_residual:.1e} [{nd.status[:4]}] "
-                  f"pred={nd.predictor_type} d={nd.subdiv_depth}")
-
         n_acc = sum(1 for nd in nodes if nd.status != "failed")
         print(f"  {geo_tag}: {n_acc}/{len(nodes)} converged "
-              f"({n_acc/max(len(nodes),1)*100:.0f}%) in {dt_total:.0f}s")
+              f"({n_acc/max(len(nodes),1)*100:.0f}%) in {dt_total:.0f}s",
+              flush=True)
 
     return all_rows
 
