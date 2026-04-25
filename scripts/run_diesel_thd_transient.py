@@ -41,7 +41,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from models.diesel_transient import (
-    CONFIGS, CONFIG_KEYS, run_transient,
+    CONFIGS, CONFIG_KEYS, EnvelopeAbortConfig, run_transient,
 )
 from models.thermal_coupling import ThermalConfig
 from models.diesel_quasistatic import SolverRetryConfig
@@ -229,8 +229,15 @@ def _stats_line(arr_full, mask, *, scale: float = 1.0,
 # ─── output: data + summary ───────────────────────────────────────
 
 def _save_data(run_dir, results, thermal, retry_cfg):
+    any_aborted = bool(np.any(np.asarray(results.get("aborted",
+                                                          False))))
+    save_partial = bool(
+        results.get("envelope_abort_config", {}).get(
+            "save_partial_on_abort", True))
+    fname = ("data_partial.npz" if (any_aborted and save_partial)
+              else "data.npz")
     np.savez(
-        os.path.join(run_dir, "data.npz"),
+        os.path.join(run_dir, fname),
         phi_crank_deg=results["phi_crank_deg"],
         phi_last=results["phi_last"],
         last_start=int(results["last_start"]),
@@ -267,6 +274,15 @@ def _save_data(run_dir, results, thermal, retry_cfg):
         retry_exhausted_count=results["retry_exhausted_count"],
         thermal_cycle_delta=results["thermal_cycle_delta"],
         thermal_periodic_converged=results["thermal_periodic_converged"],
+        aborted=results["aborted"],
+        abort_reason=results["abort_reason"],
+        first_clamp_phi=results["first_clamp_phi"],
+        first_solver_failed_phi=results["first_solver_failed_phi"],
+        first_invalid_phi=results["first_invalid_phi"],
+        steps_attempted=results["steps_attempted"],
+        steps_completed=results["steps_completed"],
+        applicable=results["applicable"],
+        applicable_reason=results["applicable_reason"],
         thermal_mode=thermal.mode,
         gamma=thermal.gamma_mix,
         tau_th_s=thermal.tau_th_s,
@@ -284,8 +300,12 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     sl = _last_cycle_slice(results)
     n_steps_last = int(results["n_steps_per_cycle"])
     cfgs = results["configs"]
+    any_aborted = bool(np.any(np.asarray(results.get("aborted", False))))
+    header = "Stage Diesel Transient THD-0 BelAZ run"
+    if any_aborted:
+        header = "Stage Diesel Transient THD-0 run — ABORTED OUTSIDE ENVELOPE"
     lines = [
-        "Stage Diesel Transient THD-0 BelAZ run",
+        header,
         f"  thermal mode    : {thermal.mode}",
         f"  gamma           : {thermal.gamma_mix:.4f}",
         f"  tau_th_s        : {thermal.tau_th_s:.4f}",
@@ -309,6 +329,23 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         "",
     ]
     lines = [ln for ln in lines if ln != ""] + [""]
+
+    if any_aborted:
+        # Make the condition unambiguous in the summary header for any
+        # downstream reader: this run is a load-envelope diagnostic,
+        # not a THD result.
+        first_aborted = next(
+            (ic for ic, c in enumerate(cfgs)
+             if bool(results["aborted"][ic])), None)
+        if first_aborted is not None:
+            n_done = int(results["steps_completed"][first_aborted])
+            phi_at = float(results["phi_crank_deg"][min(
+                n_done, len(results["phi_crank_deg"]) - 1)])
+            lines.extend([
+                f"abort triggered at step {n_done} (phi={phi_at:.1f} deg)",
+                "This is a load-envelope diagnostic, not a THD result.",
+                "",
+            ])
 
     for ic, cfg in enumerate(cfgs):
         valid_dyn = np.asarray(results["valid_dynamic"][ic, sl], dtype=bool)
@@ -352,6 +389,32 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             f"  thermal_cycle_delta: "
             f"{delta_t if np.isfinite(delta_t) else float('nan'):.3f} C",
             f"  thermal_periodic_converged: {per_conv}",
+        ])
+        # Stage Diesel Transient Load-Envelope-0 — envelope block.
+        applicable = bool(results["applicable"][ic])
+        applicable_reason = str(results["applicable_reason"][ic])
+        aborted = bool(results["aborted"][ic])
+        abort_reason = str(results["abort_reason"][ic])
+        n_attempted = int(results["steps_attempted"][ic])
+        n_completed = int(results["steps_completed"][ic])
+        first_clamp = float(results["first_clamp_phi"][ic])
+        first_invalid = float(results["first_invalid_phi"][ic])
+        first_solver_fail = float(results["first_solver_failed_phi"][ic])
+        status = "aborted_outside_envelope" if aborted else "ok"
+        lines.extend([
+            "  envelope:",
+            f"    applicable          : "
+            f"{'yes' if applicable else 'no'}",
+            f"    reason              : {applicable_reason}",
+            f"    status              : {status}",
+            f"    abort_reason        : {abort_reason or '-'}",
+            f"    steps_completed     : {n_completed}/{n_attempted}",
+            f"    first_clamp_phi     : "
+            f"{first_clamp if np.isfinite(first_clamp) else float('nan'):.1f} deg",
+            f"    first_invalid_phi   : "
+            f"{first_invalid if np.isfinite(first_invalid) else float('nan'):.1f} deg",
+            f"    first_solver_fail_phi: "
+            f"{first_solver_fail if np.isfinite(first_solver_fail) else float('nan'):.1f} deg",
             "",
         ])
 
@@ -403,8 +466,123 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         f.write("\n".join(lines))
 
 
+_ENVELOPE_CSV_COLUMNS = (
+    "F_scale", "F_max_used", "config",
+    "n_steps_attempted", "n_steps_completed",
+    "solver_success_count", "valid_dynamic_count",
+    "valid_no_clamp_count",
+    "contact_clamp_count", "solver_failed_count",
+    "retry_recovered_count", "retry_exhausted_count",
+    "first_clamp_phi", "first_invalid_phi",
+    "max_epsilon", "min_h_min_valid",
+    "p95_pmax_valid", "p99_pmax_valid", "max_pmax_valid",
+    "min_T_eff_valid", "mean_T_eff_valid", "max_T_eff_valid",
+    "mean_P_loss_valid", "mdot_floor_hit_count",
+    "thermal_cycle_delta",
+    "aborted", "abort_reason",
+    "applicable", "applicable_reason",
+)
+
+
+def _envelope_rows_from_results(scale, F_max_used, results) -> List[Dict[str, Any]]:
+    """One row per config for the load-envelope CSV (Section 2)."""
+    cfgs = results["configs"]
+    rows = []
+    for ic, cfg in enumerate(cfgs):
+        n_attempted = int(results["steps_attempted"][ic])
+        n_completed = int(results["steps_completed"][ic])
+        sl = slice(0, n_completed) if n_completed > 0 else slice(0, 0)
+        sol_ok = np.asarray(results["solver_success"])[ic, sl]
+        vd = np.asarray(results["valid_dynamic"])[ic, sl]
+        vnc = np.asarray(results["valid_no_clamp"])[ic, sl]
+        cc = np.asarray(results["contact_clamp"])[ic, sl]
+        eps = np.sqrt(
+            np.asarray(results["eps_x"])[ic, sl] ** 2
+            + np.asarray(results["eps_y"])[ic, sl] ** 2
+        )
+        hmin = np.asarray(results["hmin"])[ic, sl]
+        pmax = np.asarray(results["pmax"])[ic, sl]
+        T_eff = np.asarray(results["T_eff"])[ic, sl]
+        P_loss = np.asarray(results["P_loss"])[ic, sl]
+        mdot_fh = np.asarray(results["mdot_floor_hit"])[ic, sl]
+        valid_mask = vd & np.isfinite(hmin) & np.isfinite(pmax)
+
+        def _pct(a, q):
+            a = a[np.isfinite(a)]
+            if a.size == 0:
+                return float("nan")
+            return float(np.percentile(a, q))
+
+        def _safe_min(a, mask):
+            v = a[mask]
+            v = v[np.isfinite(v)]
+            return float(v.min()) if v.size else float("nan")
+
+        def _safe_max(a, mask):
+            v = a[mask]
+            v = v[np.isfinite(v)]
+            return float(v.max()) if v.size else float("nan")
+
+        def _safe_mean(a, mask):
+            v = a[mask]
+            v = v[np.isfinite(v)]
+            return float(v.mean()) if v.size else float("nan")
+
+        rows.append({
+            "F_scale": float(scale),
+            "F_max_used": float(F_max_used),
+            "config": cfg["label"],
+            "n_steps_attempted": n_attempted,
+            "n_steps_completed": n_completed,
+            "solver_success_count": int(sol_ok.sum()),
+            "valid_dynamic_count": int(vd.sum()),
+            "valid_no_clamp_count": int(vnc.sum()),
+            "contact_clamp_count": int(cc.sum()),
+            "solver_failed_count": int(results["solver_failed_count"][ic]),
+            "retry_recovered_count": int(
+                results["retry_recovered_count"][ic]),
+            "retry_exhausted_count": int(
+                results["retry_exhausted_count"][ic]),
+            "first_clamp_phi": float(results["first_clamp_phi"][ic]),
+            "first_invalid_phi": float(results["first_invalid_phi"][ic]),
+            "max_epsilon": float(np.nanmax(eps)) if eps.size else float("nan"),
+            "min_h_min_valid": _safe_min(hmin, valid_mask),
+            "p95_pmax_valid": _pct(pmax[valid_mask], 95)
+                if valid_mask.any() else float("nan"),
+            "p99_pmax_valid": _pct(pmax[valid_mask], 99)
+                if valid_mask.any() else float("nan"),
+            "max_pmax_valid": _safe_max(pmax, valid_mask),
+            "min_T_eff_valid": _safe_min(T_eff, valid_mask),
+            "mean_T_eff_valid": _safe_mean(T_eff, valid_mask),
+            "max_T_eff_valid": _safe_max(T_eff, valid_mask),
+            "mean_P_loss_valid": _safe_mean(P_loss, valid_mask),
+            "mdot_floor_hit_count": int(mdot_fh.sum()),
+            "thermal_cycle_delta": float(
+                results["thermal_cycle_delta"][ic]),
+            "aborted": bool(results["aborted"][ic]),
+            "abort_reason": str(results["abort_reason"][ic]),
+            "applicable": bool(results["applicable"][ic]),
+            "applicable_reason": str(results["applicable_reason"][ic]),
+        })
+    return rows
+
+
+def _write_envelope_csv(sweep_root: str,
+                         rows: List[Dict[str, Any]]) -> None:
+    import csv as _csv
+    path = os.path.join(sweep_root, "load_envelope.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=list(_ENVELOPE_CSV_COLUMNS))
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in _ENVELOPE_CSV_COLUMNS})
+
+
 def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
-              args, configs, out_base) -> str:
+              args, configs, out_base,
+              *,
+              envelope_abort: Optional[EnvelopeAbortConfig] = None,
+              return_results: bool = False):
     F_max_used = float(getattr(args, "F_max_resolved", 0.0)) or None
     F_max_source = getattr(args, "F_max_source", "")
     extra_tag = ""
@@ -412,9 +590,19 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         extra_tag = "Fmaxdebug"
     if not retry_cfg.enabled:
         extra_tag = (extra_tag + "_no_retry").strip("_")
-    run_dir = _make_run_dir(out_base, thermal.mode,
-                              thermal.gamma_mix, thermal.tau_th_s,
-                              extra_tag=extra_tag)
+    # Sweep mode lands every scale in its own Fscale_<N>p<MM> folder
+    # under a parent _load_envelope dir (out_base is already the parent).
+    scale_for_dir = getattr(args, "_scale_for_dir", None)
+    if scale_for_dir is not None:
+        run_dir = os.path.join(
+            out_base,
+            f"Fscale_{scale_for_dir:.2f}".replace(".", "p"),
+        )
+        os.makedirs(run_dir, exist_ok=True)
+    else:
+        run_dir = _make_run_dir(out_base, thermal.mode,
+                                  thermal.gamma_mix, thermal.tau_th_s,
+                                  extra_tag=extra_tag)
     print("=" * 60)
     print(f"  Stage Diesel Transient THD-0 -> {run_dir}")
     print(f"  mode={thermal.mode} gamma={thermal.gamma_mix:.3f} "
@@ -439,6 +627,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         d_phi_base_deg=args.d_phi_base,
         d_phi_peak_deg=args.d_phi_peak,
         retry_config=retry_cfg,
+        envelope_abort=envelope_abort,
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -501,6 +690,8 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
     _plot_retry_status(results, run_dir)
 
     print(f"  done in {dt:.1f}s")
+    if return_results:
+        return run_dir, results, dt
     return run_dir
 
 
@@ -551,27 +742,56 @@ def main(argv=None):
     pa.add_argument("--no-texture-retry", dest="no_texture_retry",
                     action="store_true",
                     help="Disable textured-only conservative SOR retry.")
+    # Stage Diesel Transient Load-Envelope-0 — abort + sweep policy.
+    pa.add_argument("--F-max-scale-sweep", dest="F_max_scale_sweep",
+                    default=None,
+                    help="Comma-separated list of F_max scales for a "
+                         "load-envelope sweep, e.g. "
+                         "'0.3,0.5,0.7,0.85,1.0'. Overrides "
+                         "--F-max-scale. Each scale lands in its own "
+                         "subfolder; sweep aggregator writes "
+                         "load_envelope.csv at the parent directory.")
+    pa.add_argument("--abort-on-clamp-frac", dest="abort_clamp_frac",
+                    type=float, default=0.30,
+                    help="Abort a config if the clamp fraction so far "
+                         "exceeds this threshold. Default 0.30.")
+    pa.add_argument("--abort-on-solver-fail-frac",
+                    dest="abort_solver_fail_frac", type=float,
+                    default=0.30,
+                    help="Abort a config if the solver-failed fraction "
+                         "so far exceeds this threshold. Default 0.30.")
+    pa.add_argument("--abort-after-consecutive-invalid",
+                    dest="abort_consec_invalid", type=int, default=30,
+                    help="Abort a config after this many consecutive "
+                         "not-valid_dynamic steps. Default 30.")
+    pa.add_argument("--save-partial-on-abort", dest="save_partial",
+                    action="store_true", default=True,
+                    help="On abort, write data_partial.npz with the "
+                         "completed-step prefix instead of dropping it. "
+                         "Default ON.")
+    pa.add_argument("--no-save-partial-on-abort",
+                    dest="save_partial", action="store_false",
+                    help="Override: do NOT save partial data on abort.")
+    pa.add_argument("--no-envelope-abort", dest="no_envelope_abort",
+                    action="store_true",
+                    help="Disable the envelope-abort policy entirely "
+                         "(legacy 'run to the end no matter what').")
     args = pa.parse_args(argv)
 
-    # Resolve F_max.
+    # Resolve base F_max (without scale).
     if args.F_max is not None:
-        F_max_resolved = float(args.F_max)
-        F_max_source = f"explicit override = {F_max_resolved:.1f} N"
+        F_max_base = float(args.F_max)
+        F_max_base_source = f"explicit override = {F_max_base:.1f} N"
     elif args.F_max_debug:
-        F_max_resolved = float(getattr(params, "F_max_debug",
-                                          params.F_max))
-        F_max_source = (f"params.F_max_debug = {F_max_resolved:.1f} N "
-                        "(SANITY MODE — not a production result)")
+        F_max_base = float(getattr(params, "F_max_debug",
+                                       params.F_max))
+        F_max_base_source = (
+            f"params.F_max_debug = {F_max_base:.1f} N "
+            "(SANITY MODE — not a production result)")
     else:
-        F_max_resolved = float(params.F_max)
-        F_max_source = (f"params.F_max = {F_max_resolved:.1f} N "
-                        "(production BelAZ)")
-    if args.F_max_scale is not None:
-        scale = float(args.F_max_scale)
-        F_max_resolved *= scale
-        F_max_source += f" * scale={scale}"
-    args.F_max_resolved = F_max_resolved
-    args.F_max_source = F_max_source
+        F_max_base = float(params.F_max)
+        F_max_base_source = (f"params.F_max = {F_max_base:.1f} N "
+                              "(production BelAZ)")
 
     # Retry policy.
     if args.no_texture_retry:
@@ -592,6 +812,19 @@ def main(argv=None):
             cold_start=True,
         )
 
+    # Envelope-abort policy (Stage Diesel Transient Load-Envelope-0).
+    if args.no_envelope_abort:
+        envelope_abort = EnvelopeAbortConfig.disabled()
+    else:
+        envelope_abort = EnvelopeAbortConfig(
+            enabled=True,
+            clamp_frac_max=float(args.abort_clamp_frac),
+            solver_fail_frac_max=float(args.abort_solver_fail_frac),
+            consecutive_invalid_max=int(args.abort_consec_invalid),
+            save_partial_on_abort=bool(args.save_partial),
+        )
+    args.envelope_abort = envelope_abort
+
     configs = _select_configs(_parse_csv(args.configs))
 
     if args.gamma_sweep:
@@ -599,18 +832,65 @@ def main(argv=None):
     else:
         gammas = [float(args.gamma)]
 
+    # Resolve F_max scale list (Section 2 of the patch spec).
+    if args.F_max_scale_sweep:
+        try:
+            scales = [float(x) for x in
+                       args.F_max_scale_sweep.split(",")
+                       if x.strip()]
+        except Exception as exc:
+            raise SystemExit(
+                f"--F-max-scale-sweep must be a comma-separated list "
+                f"of floats; got {args.F_max_scale_sweep!r}: {exc}")
+    elif args.F_max_scale is not None:
+        scales = [float(args.F_max_scale)]
+    else:
+        scales = [1.0]
+
+    if args.F_max_scale_sweep:
+        # Single parent dir for the whole sweep.
+        sweep_ts = datetime.now().strftime("%y%m%d_%H%M%S")
+        sweep_root = os.path.join(args.out_base,
+                                     f"{sweep_ts}_load_envelope")
+        os.makedirs(sweep_root, exist_ok=True)
+        envelope_rows: List[Dict[str, Any]] = []
+    else:
+        sweep_root = None
+        envelope_rows = None
+
     out_dirs = []
-    for g in gammas:
-        thermal = ThermalConfig(
-            mode=args.mode,
-            T_in_C=args.T_in,
-            gamma_mix=g,
-            cp_J_kgK=args.cp,
-            mdot_floor_kg_s=args.mdot_floor,
-            tau_th_s=float(args.tau_th),
-        )
-        out_dirs.append(_run_one(thermal, retry_cfg, args,
-                                    configs, args.out_base))
+    for scale in scales:
+        F_max_resolved = F_max_base * float(scale)
+        F_max_source = (f"{F_max_base_source} * scale={scale}"
+                          if scale != 1.0 else F_max_base_source)
+        args.F_max_resolved = F_max_resolved
+        args.F_max_source = F_max_source
+        args._scale_for_dir = float(scale) if sweep_root else None
+        for g in gammas:
+            thermal = ThermalConfig(
+                mode=args.mode,
+                T_in_C=args.T_in,
+                gamma_mix=g,
+                cp_J_kgK=args.cp,
+                mdot_floor_kg_s=args.mdot_floor,
+                tau_th_s=float(args.tau_th),
+            )
+            out_base_for_run = sweep_root or args.out_base
+            run_dir, results, dt = _run_one(
+                thermal, retry_cfg, args, configs,
+                out_base_for_run,
+                envelope_abort=envelope_abort,
+                return_results=True,
+            )
+            out_dirs.append(run_dir)
+            if envelope_rows is not None:
+                envelope_rows.extend(_envelope_rows_from_results(
+                    scale, F_max_resolved, results))
+
+    if envelope_rows is not None and sweep_root:
+        _write_envelope_csv(sweep_root, envelope_rows)
+        print(f"\nLoad-envelope CSV: "
+              f"{os.path.join(sweep_root, 'load_envelope.csv')}")
 
     print("\nFinished runs:")
     for d in out_dirs:

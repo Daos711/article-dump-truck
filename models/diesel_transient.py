@@ -31,6 +31,7 @@ Solver-side retry policy (Stage Texture Stability 2) is reused via
 """
 import time as _time
 import warnings
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -100,6 +101,108 @@ CONFIG_KEYS: Dict[str, int] = {
     "mineral_textured": 2,
     "rapeseed_textured": 3,
 }
+
+
+# ─── Stage Diesel Transient Load-Envelope-0 — abort policy ────────
+
+
+@dataclass(frozen=True)
+class EnvelopeAbortConfig:
+    """Run-safety policy for transient configs that fall outside the
+    full-film envelope (e.g. production 850 kN, where Verlet locks the
+    shaft to ε_max within the first few crank angles).
+
+    The runner stops a config cleanly — without traceback or
+    KeyboardInterrupt — when one of the thresholds trips:
+
+    * ``clamp_frac_max``       — fraction of clamped steps so far.
+    * ``solver_fail_frac_max`` — fraction of solver_failed steps so far.
+    * ``consecutive_invalid_max`` — streak of consecutive
+      not-valid_dynamic steps from the most recent step.
+
+    Both fractional checks honour ``warmup_steps`` to avoid aborting
+    on the first few unstable Verlet steps.
+    """
+    enabled: bool = True
+    clamp_frac_max: float = 0.30
+    solver_fail_frac_max: float = 0.30
+    consecutive_invalid_max: int = 30
+    save_partial_on_abort: bool = True
+    warmup_steps: int = 5
+
+    @classmethod
+    def disabled(cls) -> "EnvelopeAbortConfig":
+        return cls(enabled=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dict(
+            enabled=self.enabled,
+            clamp_frac_max=self.clamp_frac_max,
+            solver_fail_frac_max=self.solver_fail_frac_max,
+            consecutive_invalid_max=self.consecutive_invalid_max,
+            save_partial_on_abort=self.save_partial_on_abort,
+            warmup_steps=self.warmup_steps,
+        )
+
+
+# ─── envelope classification (Section 3 of the patch spec) ────────
+
+ENVELOPE_THRESHOLDS = dict(
+    solver_success_frac_min=0.95,
+    valid_dynamic_frac_min=0.90,
+    valid_no_clamp_frac_min=0.85,
+    paired_no_clamp_frac_min=0.80,
+)
+
+
+def classify_envelope_per_config(*,
+                                    n_completed: int,
+                                    solver_success_count: int,
+                                    valid_dynamic_count: int,
+                                    valid_no_clamp_count: int,
+                                    retry_exhausted_count: int,
+                                    aborted: bool) -> Tuple[bool, str]:
+    """Per-config applicable gate.
+
+    Returns ``(applicable, reason)`` where ``reason`` is "ok" on
+    success or a human-readable failure string.
+    """
+    if aborted:
+        return False, "aborted_outside_envelope"
+    if n_completed <= 0:
+        return False, "no_steps_completed"
+    sf = float(solver_success_count) / float(n_completed)
+    vd = float(valid_dynamic_count) / float(n_completed)
+    vnc = float(valid_no_clamp_count) / float(n_completed)
+    th = ENVELOPE_THRESHOLDS
+    if sf < th["solver_success_frac_min"]:
+        return False, (
+            f"solver_success_frac={sf:.2f} < "
+            f"{th['solver_success_frac_min']:.2f}")
+    if vd < th["valid_dynamic_frac_min"]:
+        return False, (
+            f"valid_dynamic_frac={vd:.2f} < "
+            f"{th['valid_dynamic_frac_min']:.2f}")
+    if vnc < th["valid_no_clamp_frac_min"]:
+        return False, (
+            f"valid_no_clamp_frac={vnc:.2f} < "
+            f"{th['valid_no_clamp_frac_min']:.2f}")
+    if retry_exhausted_count > 0:
+        return False, f"retry_exhausted={retry_exhausted_count} > 0"
+    return True, "ok"
+
+
+def classify_paired_envelope(common_no_clamp_count: int,
+                               n_steps_min: int) -> Tuple[bool, str]:
+    """Per-paired-pair applicable gate (Section 3)."""
+    if n_steps_min <= 0:
+        return False, "no_overlap"
+    frac = float(common_no_clamp_count) / float(n_steps_min)
+    th = ENVELOPE_THRESHOLDS["paired_no_clamp_frac_min"]
+    if frac < th:
+        return False, (
+            f"common_valid_no_clamp_frac={frac:.2f} < {th:.2f}")
+    return True, "ok"
 
 
 def load_diesel(phi_deg, F_max=None):
@@ -352,7 +455,8 @@ def run_transient(F_max=None, debug=False,
                   n_cycles: Optional[int] = None,
                   d_phi_base_deg: Optional[float] = None,
                   d_phi_peak_deg: float = 0.25,
-                  retry_config: Optional[SolverRetryConfig] = None):
+                  retry_config: Optional[SolverRetryConfig] = None,
+                  envelope_abort: Optional[EnvelopeAbortConfig] = None):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -391,6 +495,8 @@ def run_transient(F_max=None, debug=False,
         params.n_cycles)
     if retry_config is None:
         retry_config = SolverRetryConfig()
+    if envelope_abort is None:
+        envelope_abort = EnvelopeAbortConfig()
 
     N = int(n_grid) if n_grid is not None else int(params.N_grid_transient)
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N, N)
@@ -456,6 +562,16 @@ def run_transient(F_max=None, debug=False,
     retry_recovered_count = np.zeros(n_cfg, dtype=np.int32)
     retry_exhausted_count = np.zeros(n_cfg, dtype=np.int32)
     omega_hits_per_cfg: List[Dict[str, int]] = [dict() for _ in range(n_cfg)]
+    # Stage Load-Envelope-0: per-config abort/envelope diagnostics.
+    aborted_arr = np.zeros(n_cfg, dtype=bool)
+    abort_reason_arr = np.full(n_cfg, "", dtype="<U64")
+    first_clamp_phi_arr = np.full(n_cfg, np.nan)
+    first_solver_failed_phi_arr = np.full(n_cfg, np.nan)
+    first_invalid_phi_arr = np.full(n_cfg, np.nan)
+    steps_attempted_arr = np.zeros(n_cfg, dtype=np.int32)
+    steps_completed_arr = np.zeros(n_cfg, dtype=np.int32)
+    applicable_arr = np.zeros(n_cfg, dtype=bool)
+    applicable_reason_arr = np.full(n_cfg, "", dtype="<U96")
 
     for ic, cfg in enumerate(cfg_list):
         eta_const = float(cfg["oil"]["eta_diesel"])
@@ -730,6 +846,71 @@ def run_transient(F_max=None, debug=False,
                         f"t={t_now:.0f}s, ETA={eta_left:.0f}s")
                 print(msg, flush=True)
 
+            # ── envelope diagnostics + abort policy (Section 1) ──
+            if step_clamped and np.isnan(first_clamp_phi_arr[ic]):
+                first_clamp_phi_arr[ic] = float(phi_deg)
+            if (not solve_ok) and np.isnan(first_solver_failed_phi_arr[ic]):
+                first_solver_failed_phi_arr[ic] = float(phi_deg)
+            this_step_invalid = not bool(
+                solver_success_all[ic, step]
+                and not contact_clamp_all[ic, step]
+                and np.isfinite(hmin_all[ic, step])
+            )
+            if this_step_invalid and np.isnan(first_invalid_phi_arr[ic]):
+                first_invalid_phi_arr[ic] = float(phi_deg)
+            if envelope_abort.enabled \
+                    and (step + 1) >= envelope_abort.warmup_steps:
+                attempted = step + 1
+                clamp_so_far = int(np.sum(
+                    contact_clamp_all[ic, : attempted]))
+                fail_so_far = int(solver_failed_count[ic])
+                clamp_frac = clamp_so_far / attempted
+                fail_frac = fail_so_far / attempted
+                # Streak of consecutive not-valid_dynamic steps from
+                # the most recent step backward. Uses solver_success
+                # AND finite-everything (mirrors valid_dynamic).
+                consec = 0
+                for k in range(step, -1, -1):
+                    bad = not bool(
+                        solver_success_all[ic, k]
+                        and np.isfinite(hmin_all[ic, k])
+                        and np.isfinite(pmax_all[ic, k])
+                        and np.isfinite(Ftr_all[ic, k])
+                    )
+                    if bad:
+                        consec += 1
+                    else:
+                        break
+                abort_reason = ""
+                if clamp_frac > envelope_abort.clamp_frac_max:
+                    abort_reason = "clamp_frac_exceeded"
+                elif fail_frac > envelope_abort.solver_fail_frac_max:
+                    abort_reason = "solver_fail_frac_exceeded"
+                elif consec >= envelope_abort.consecutive_invalid_max:
+                    abort_reason = "consecutive_invalid_exceeded"
+                if abort_reason:
+                    aborted_arr[ic] = True
+                    abort_reason_arr[ic] = abort_reason
+                    steps_attempted_arr[ic] = attempted
+                    steps_completed_arr[ic] = attempted
+                    print(f"    [abort] config={cfg['label']!r} "
+                          f"reason={abort_reason} "
+                          f"step={attempted}/{n_steps} "
+                          f"phi={phi_deg:.1f}° "
+                          f"(clamp_frac={clamp_frac:.2f}, "
+                          f"fail_frac={fail_frac:.2f}, "
+                          f"consec_invalid={consec}); "
+                          f"writing partial result and continuing",
+                          flush=True)
+                    break
+
+        # If we did not abort, the natural loop end means we ran every
+        # step. Otherwise steps_attempted/_completed were already set
+        # above by the abort branch.
+        if not aborted_arr[ic]:
+            steps_attempted_arr[ic] = n_steps
+            steps_completed_arr[ic] = n_steps
+
         contact_clamp_count[ic] = contact_count
         t_cfg = _time.time() - t_cfg_start
         cfg_times.append(t_cfg)
@@ -789,6 +970,30 @@ def run_transient(F_max=None, debug=False,
         T_eff_used_all, eta_eff_all, P_loss_all, hmin_all, pmax_all,
         Ftr_all)
 
+    # Per-config envelope classification (Section 3 of the patch).
+    for ic in range(n_cfg):
+        n_completed = int(steps_completed_arr[ic])
+        # Solver_success / valid counts use the COMPLETED steps only —
+        # aborted configs would otherwise inflate denominator with
+        # zero-filled tail rows.
+        if n_completed > 0:
+            sl = slice(0, n_completed)
+            ss_count = int(np.sum(solver_success_all[ic, sl]))
+            vd_count = int(np.sum(valid_dynamic_all[ic, sl]))
+            vnc_count = int(np.sum(valid_no_clamp_all[ic, sl]))
+        else:
+            ss_count = vd_count = vnc_count = 0
+        ok, reason = classify_envelope_per_config(
+            n_completed=n_completed,
+            solver_success_count=ss_count,
+            valid_dynamic_count=vd_count,
+            valid_no_clamp_count=vnc_count,
+            retry_exhausted_count=int(retry_exhausted_count[ic]),
+            aborted=bool(aborted_arr[ic]),
+        )
+        applicable_arr[ic] = ok
+        applicable_reason_arr[ic] = reason
+
     phi_last = phi_crank_deg[last_start:]
     Fx_ext_last, Fy_ext_last = load_diesel(phi_last % 720.0, F_max=F_max)
 
@@ -836,4 +1041,15 @@ def run_transient(F_max=None, debug=False,
         "paired_comparison": paired,
         "thermal_config": thermal.to_dict(),
         "retry_config": retry_config.to_dict(),
+        # Stage Diesel Transient Load-Envelope-0 — per-config envelope.
+        "envelope_abort_config": envelope_abort.to_dict(),
+        "aborted": aborted_arr,
+        "abort_reason": abort_reason_arr,
+        "first_clamp_phi": first_clamp_phi_arr,
+        "first_solver_failed_phi": first_solver_failed_phi_arr,
+        "first_invalid_phi": first_invalid_phi_arr,
+        "steps_attempted": steps_attempted_arr,
+        "steps_completed": steps_completed_arr,
+        "applicable": applicable_arr,
+        "applicable_reason": applicable_reason_arr,
     }
