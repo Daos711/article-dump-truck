@@ -117,6 +117,40 @@ def _plot_last_cycle(results, key, ylabel, fname, title, run_dir,
     plt.close(fig)
 
 
+def _plot_orbit_lastcycle(results, run_dir, *,
+                            fname: str = "orbit_lastcycle.png"):
+    """Per-config last-cycle orbit on (eps_x, eps_y) with the
+    eps=1 contact circle.
+
+    Smooth configs are drawn solid, textured dashed (per Section 4
+    of the patch spec). All configs share one figure so smooth vs
+    textured overlay is direct.
+    """
+    sl = _last_cycle_slice(results)
+    cfgs = results["configs"]
+    eps_x = np.asarray(results["eps_x"])[:, sl]
+    eps_y = np.asarray(results["eps_y"])[:, sl]
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for ic, cfg in enumerate(cfgs):
+        ls = "--" if cfg.get("textured") else "-"
+        ax.plot(eps_x[ic], eps_y[ic],
+                color=cfg.get("color", None),
+                linestyle=ls, linewidth=1.4,
+                label=cfg["label"])
+    theta = np.linspace(0, 2 * np.pi, 256)
+    ax.plot(np.cos(theta), np.sin(theta), "k--", lw=0.6, alpha=0.4,
+            label="eps=1 contact")
+    ax.set_xlabel("eps_x = e_x / c", fontsize=11)
+    ax.set_ylabel("eps_y = e_y / c", fontsize=11)
+    ax.set_title("Shaft orbit — last cycle", fontsize=12)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, fname), dpi=150)
+    plt.close(fig)
+
+
 def _plot_orbit(results, run_dir):
     sl = _last_cycle_slice(results)
     cfgs = results["configs"]
@@ -461,6 +495,150 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         ])
         lines.append("")
 
+    # ── Per-config production metrics block ────────────────────────
+    prod = results.get("production_metrics") or []
+    fs = results.get("firing_sector_deg", (340.0, 480.0))
+    if prod:
+        lines.extend([
+            "=" * 60,
+            "Per-config production transient metrics (last cycle)",
+            f"firing sector: {fs[0]:.1f}-{fs[1]:.1f} deg",
+            "=" * 60,
+        ])
+        for ic, cfg in enumerate(cfgs):
+            rec = prod[ic]
+            lines.extend([
+                f"[{cfg['label']}]",
+                "  pressure (firing sector, valid_no_clamp):",
+                f"    p95 p_max : "
+                f"{rec.get('pmax_firing_p95', float('nan'))/1e6:.2f} MPa",
+                f"    p99 p_max : "
+                f"{rec.get('pmax_firing_p99', float('nan'))/1e6:.2f} MPa",
+                f"    max p_max : "
+                f"{rec.get('pmax_firing_max', float('nan'))/1e6:.2f} MPa  "
+                f"(n_steps={int(rec.get('pmax_firing_count', 0))})",
+                "  film thickness (last cycle, valid_no_clamp):",
+                f"    P5 h_min  : "
+                f"{rec.get('hmin_p5', float('nan'))*1e6:.2f} um",
+                f"    min h_min : "
+                f"{rec.get('hmin_min', float('nan'))*1e6:.2f} um",
+                f"    steps below 10/8/6 um : "
+                f"{int(rec.get('steps_hmin_below_10um',0))}/"
+                f"{int(rec.get('steps_hmin_below_8um',0))}/"
+                f"{int(rec.get('steps_hmin_below_6um',0))}",
+                f"    angle below 10/8/6 um : "
+                f"{rec.get('angle_hmin_below_10um',0):.1f}/"
+                f"{rec.get('angle_hmin_below_8um',0):.1f}/"
+                f"{rec.get('angle_hmin_below_6um',0):.1f} deg",
+                "  orbit (last cycle, valid_dynamic):",
+                f"    max |eps|         : "
+                f"{rec.get('max_eps_lastcycle', float('nan')):.4f} "
+                f"@ phi={rec.get('phi_at_max_eps', float('nan')):.1f} deg",
+                f"    eps at phi=421°   : "
+                f"{rec.get('eps_at_phi_421', float('nan')):.4f}",
+                f"    recovery to 0.90  : "
+                f"{rec.get('angle_recovery_to_0p9', float('nan')):.1f} deg "
+                f"(failed={rec.get('recovery_failed_0p9', False)})",
+                f"    recovery to 0.85  : "
+                f"{rec.get('angle_recovery_to_0p85', float('nan')):.1f} deg "
+                f"(failed={rec.get('recovery_failed_0p85', False)})",
+                f"    recovery to 0.80  : "
+                f"{rec.get('angle_recovery_to_0p8', float('nan')):.1f} deg "
+                f"(failed={rec.get('recovery_failed_0p8', False)})",
+                f"    AUC eps on 360-480°: "
+                f"{rec.get('auc_eps_360_480', float('nan')):.2f} deg",
+                "  power loss (firing sector, valid_no_clamp):",
+                f"    impulse  : "
+                f"{rec.get('ploss_impulse_firing_J', float('nan')):.3f} J",
+                f"    mean P_loss : "
+                f"{rec.get('ploss_firing_mean_W', float('nan')):.1f} W",
+                f"    max P_loss  : "
+                f"{rec.get('ploss_firing_max_W', float('nan')):.1f} W",
+                "",
+            ])
+
+    # ── Paired transient metrics (extended) ─────────────────────────
+    paired_ext = results.get("paired_extended") or []
+    if paired_ext:
+        lines.extend([
+            "=" * 60,
+            "Paired transient metrics "
+            "(common_valid_no_clamp mask only)",
+            f"firing sector: {fs[0]:.1f}-{fs[1]:.1f} deg",
+            "=" * 60,
+        ])
+        for r in paired_ext:
+            lines.extend([
+                f"[{r['oil_name']}]",
+                f"  smooth        : {r['smooth_label']}",
+                f"  textured      : {r['textured_label']}",
+                f"  common_valid_no_clamp count : "
+                f"{r['common_valid_no_clamp_count']}",
+                f"  common_valid_dynamic count  : "
+                f"{r['common_valid_dynamic_count']}",
+                "",
+                "  Pressure mitigation (firing sector):",
+                f"    p95 p_max  smooth/textured: "
+                f"{r['smooth_pmax_firing_p95']/1e6:.2f} / "
+                f"{r['textured_pmax_firing_p95']/1e6:.2f}  "
+                f"(delta = {r['delta_pmax_firing_p95']/1e6:+.2f} MPa)",
+                f"    p99 p_max  smooth/textured: "
+                f"{r['smooth_pmax_firing_p99']/1e6:.2f} / "
+                f"{r['textured_pmax_firing_p99']/1e6:.2f}  "
+                f"(delta = {r['delta_pmax_firing_p99']/1e6:+.2f} MPa)",
+                f"    max p_max  smooth/textured: "
+                f"{r['smooth_pmax_firing_max']/1e6:.2f} / "
+                f"{r['textured_pmax_firing_max']/1e6:.2f}  "
+                f"(delta = {r['delta_pmax_firing_max']/1e6:+.2f} MPa)",
+                "",
+                "  Film thickness:",
+                f"    P5 h_min  smooth/textured : "
+                f"{r['smooth_hmin_p5']*1e6:.2f} / "
+                f"{r['textured_hmin_p5']*1e6:.2f} um  "
+                f"(delta = {r['delta_hmin_p5']*1e6:+.2f} um)",
+                f"    min h_min smooth/textured : "
+                f"{r['smooth_hmin_min']*1e6:.2f} / "
+                f"{r['textured_hmin_min']*1e6:.2f} um  "
+                f"(delta = {r['delta_hmin_min']*1e6:+.2f} um)",
+                f"    steps below 10 um  smooth/textured: "
+                f"{r['smooth_steps_hmin_below_10um']} / "
+                f"{r['textured_steps_hmin_below_10um']}  "
+                f"(delta = {r['delta_steps_hmin_below_10um']:+d})",
+                f"    steps below 8 um   smooth/textured: "
+                f"{r['smooth_steps_hmin_below_8um']} / "
+                f"{r['textured_steps_hmin_below_8um']}  "
+                f"(delta = {r['delta_steps_hmin_below_8um']:+d})",
+                f"    steps below 6 um   smooth/textured: "
+                f"{r['smooth_steps_hmin_below_6um']} / "
+                f"{r['textured_steps_hmin_below_6um']}  "
+                f"(delta = {r['delta_steps_hmin_below_6um']:+d})",
+                "",
+                "  Orbit dynamics:",
+                f"    max |eps|     smooth/textured: "
+                f"{r['smooth_max_eps_lastcycle']:.4f} / "
+                f"{r['textured_max_eps_lastcycle']:.4f}  "
+                f"(delta = {r['delta_max_eps_lastcycle']:+.4f})",
+                f"    eps at 421°   smooth/textured: "
+                f"{r['smooth_eps_at_phi_421']:.4f} / "
+                f"{r['textured_eps_at_phi_421']:.4f}  "
+                f"(delta = {r['delta_eps_at_phi_421']:+.4f})",
+                f"    AUC eps 360-480°  smooth/textured: "
+                f"{r['smooth_auc_eps_360_480']:.2f} / "
+                f"{r['textured_auc_eps_360_480']:.2f} deg  "
+                f"(delta = {r['delta_auc_eps_360_480']:+.2f} deg)",
+                "",
+                "  Power loss in firing sector:",
+                f"    impulse smooth/textured (J): "
+                f"{r['smooth_ploss_impulse_firing_J']:.3f} / "
+                f"{r['textured_ploss_impulse_firing_J']:.3f}  "
+                f"(delta = {r['delta_ploss_impulse_firing_J']:+.3f} J)",
+                f"    mean    smooth/textured (W): "
+                f"{r['smooth_ploss_firing_mean_W']:.1f} / "
+                f"{r['textured_ploss_firing_mean_W']:.1f}  "
+                f"(delta = {r['delta_ploss_firing_mean_W']:+.1f} W)",
+                "",
+            ])
+
     with open(os.path.join(run_dir, "summary.txt"), "w",
               encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -628,6 +806,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         d_phi_peak_deg=args.d_phi_peak,
         retry_config=retry_cfg,
         envelope_abort=envelope_abort,
+        firing_sector_deg=getattr(args, "firing_sector_resolved", None),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -686,6 +865,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
     plt.close(fig)
 
     _plot_orbit(results, run_dir)
+    _plot_orbit_lastcycle(results, run_dir)
     _plot_valid_status(results, run_dir)
     _plot_retry_status(results, run_dir)
 
@@ -776,6 +956,11 @@ def main(argv=None):
                     action="store_true",
                     help="Disable the envelope-abort policy entirely "
                          "(legacy 'run to the end no matter what').")
+    pa.add_argument("--firing-sector", dest="firing_sector",
+                    default=None,
+                    help="Firing sector in crank-angle degrees, "
+                         "comma-separated 'lo,hi'. Default uses the "
+                         "BelAZ-class window (340.0,480.0).")
     args = pa.parse_args(argv)
 
     # Resolve base F_max (without scale).
@@ -824,6 +1009,19 @@ def main(argv=None):
             save_partial_on_abort=bool(args.save_partial),
         )
     args.envelope_abort = envelope_abort
+
+    # Firing-sector resolution.
+    if args.firing_sector:
+        try:
+            lo, hi = (float(x) for x in
+                       args.firing_sector.split(",", 1))
+            args.firing_sector_resolved = (lo, hi)
+        except Exception as exc:
+            raise SystemExit(
+                f"--firing-sector must be 'lo,hi'; got "
+                f"{args.firing_sector!r}: {exc}")
+    else:
+        args.firing_sector_resolved = None
 
     configs = _select_configs(_parse_csv(args.configs))
 

@@ -375,6 +375,426 @@ def _solve_dynamic_with_retry(
     return tuple(out)
 
 
+# ─── Stage Diesel Transient Production Metrics ────────────────────
+
+# Default firing sector for the BelAZ-class load profile (peak at
+# φ ≈ 370°). 140° wide, captures both the buildup and the decay.
+DEFAULT_FIRING_SECTOR_DEG: Tuple[float, float] = (340.0, 480.0)
+
+# Recovery thresholds reported per config: how far past max-ε does the
+# orbit need to travel before |ε| drops below each level. nan when the
+# orbit never recovers below the level on the last cycle.
+_RECOVERY_LEVELS = (0.90, 0.85, 0.80)
+_HMIN_THRESHOLDS_M = (10e-6, 8e-6, 6e-6)
+_AUC_RANGE_DEG = (360.0, 480.0)
+
+
+def _firing_mask(phi_mod: np.ndarray,
+                  firing_sector_deg: Tuple[float, float]) -> np.ndarray:
+    """Bool mask of crank-angle steps falling inside the firing sector
+    (handling the [-360, 1080] wrap explicitly)."""
+    lo, hi = firing_sector_deg
+    if lo <= hi:
+        return (phi_mod >= lo) & (phi_mod <= hi)
+    # Wrapped sector — e.g. (700, 50) — split into two bands.
+    return (phi_mod >= lo) | (phi_mod <= hi)
+
+
+def _percentile(arr: np.ndarray, q: float) -> float:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return float("nan")
+    return float(np.percentile(a, q))
+
+
+def _safe_min(arr: np.ndarray) -> float:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(a.min()) if a.size else float("nan")
+
+
+def _safe_max(arr: np.ndarray) -> float:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(a.max()) if a.size else float("nan")
+
+
+def _safe_mean(arr: np.ndarray) -> float:
+    a = np.asarray(arr, dtype=float)
+    a = a[np.isfinite(a)]
+    return float(a.mean()) if a.size else float("nan")
+
+
+def _recovery_angle_deg(phi_mod: np.ndarray, eps: np.ndarray,
+                         level: float) -> Tuple[float, bool]:
+    """Distance in degrees from the per-cycle max-ε crank angle to the
+    first subsequent step where ``|ε| < level``.
+
+    Returns ``(angle_deg_or_nan, recovered)``.
+    """
+    if eps.size == 0:
+        return float("nan"), False
+    i_peak = int(np.argmax(eps))
+    if not np.isfinite(eps[i_peak]):
+        return float("nan"), False
+    # Search forward from the peak; on the last cycle ``phi_mod`` is
+    # nominally monotone so cumulative-from-peak is fine.
+    after = eps[i_peak:]
+    phi_after = phi_mod[i_peak:]
+    drop = np.where(np.isfinite(after) & (after < float(level)))[0]
+    if drop.size == 0:
+        return float("nan"), False
+    j = int(drop[0])
+    return float(phi_after[j] - phi_after[0]), True
+
+
+def _auc_eps_over_range(phi_mod: np.ndarray, eps: np.ndarray,
+                         lo_deg: float, hi_deg: float) -> float:
+    """∫|ε|(φ) dφ over [lo, hi] using trapezoid on the available
+    samples. Returns ``nan`` if fewer than two finite points fall in
+    the window."""
+    mask = (phi_mod >= float(lo_deg)) & (phi_mod <= float(hi_deg))
+    mask &= np.isfinite(eps)
+    if int(mask.sum()) < 2:
+        return float("nan")
+    return float(_trapz(eps[mask], phi_mod[mask]))
+
+
+def _compute_production_metrics(*,
+                                 cfg_list,
+                                 last_start: int,
+                                 phi_crank_deg: np.ndarray,
+                                 eps_x_all: np.ndarray,
+                                 eps_y_all: np.ndarray,
+                                 hmin_all: np.ndarray,
+                                 pmax_all: np.ndarray,
+                                 P_loss_all: np.ndarray,
+                                 valid_dynamic_all: np.ndarray,
+                                 valid_no_clamp_all: np.ndarray,
+                                 omega_rad_s: float,
+                                 firing_sector_deg: Tuple[float, float],
+                                 ) -> List[Dict[str, Any]]:
+    """Per-config last-cycle production metrics.
+
+    All metrics use the basic ``valid_no_clamp`` mask except recovery /
+    AUC / max-ε which use ``valid_dynamic`` (so the contact-clamp
+    boundary doesn't drown out the orbital signal). Returns a list of
+    dicts, one per config.
+    """
+    out: List[Dict[str, Any]] = []
+    sl = slice(int(last_start), None)
+    phi_last = np.asarray(phi_crank_deg)[sl]
+    phi_mod = phi_last % 720.0
+    firing_mask = _firing_mask(phi_mod, firing_sector_deg)
+    auc_lo, auc_hi = _AUC_RANGE_DEG
+    for ic, _cfg in enumerate(cfg_list):
+        vd = np.asarray(valid_dynamic_all[ic, sl], dtype=bool)
+        vnc = np.asarray(valid_no_clamp_all[ic, sl], dtype=bool)
+        ex = np.asarray(eps_x_all[ic, sl], dtype=float)
+        ey = np.asarray(eps_y_all[ic, sl], dtype=float)
+        eps_mag = np.sqrt(ex * ex + ey * ey)
+        hmin = np.asarray(hmin_all[ic, sl], dtype=float)
+        pmax = np.asarray(pmax_all[ic, sl], dtype=float)
+        Plo = np.asarray(P_loss_all[ic, sl], dtype=float)
+
+        # Pressure peak metrics — firing sector + valid_no_clamp.
+        fmask = firing_mask & vnc & np.isfinite(pmax)
+        rec: Dict[str, Any] = {
+            "pmax_firing_p95":  _percentile(pmax[fmask], 95),
+            "pmax_firing_p99":  _percentile(pmax[fmask], 99),
+            "pmax_firing_max":  _safe_max(pmax[fmask]),
+            "pmax_firing_count": int(fmask.sum()),
+        }
+
+        # h_min thresholds — last cycle, valid_no_clamp.
+        hmask = vnc & np.isfinite(hmin)
+        hmin_v = hmin[hmask]
+        rec["hmin_p5"] = _percentile(hmin_v, 5)
+        rec["hmin_min"] = _safe_min(hmin_v)
+        # Per-step belows + angle equivalent (deg). The angle uses
+        # the actual local Δφ (last cycle phi_mod is monotone for
+        # adaptive grid) to weight each below-threshold step.
+        if hmin_v.size > 0:
+            phi_h = phi_mod[hmask]
+            # local step length: forward difference (last entry uses
+            # the same as previous to keep array length).
+            if phi_h.size >= 2:
+                d_phi_local = np.diff(phi_h)
+                d_phi_local = np.append(
+                    d_phi_local, d_phi_local[-1])
+            else:
+                d_phi_local = np.zeros_like(phi_h)
+            for thr_m, key_steps, key_angle in (
+                (10e-6, "steps_hmin_below_10um",
+                 "angle_hmin_below_10um"),
+                (8e-6, "steps_hmin_below_8um",
+                 "angle_hmin_below_8um"),
+                (6e-6, "steps_hmin_below_6um",
+                 "angle_hmin_below_6um"),
+            ):
+                m = hmin_v < thr_m
+                rec[key_steps] = int(m.sum())
+                rec[key_angle] = float(np.sum(d_phi_local[m]))
+        else:
+            for key_steps, key_angle in (
+                ("steps_hmin_below_10um", "angle_hmin_below_10um"),
+                ("steps_hmin_below_8um",  "angle_hmin_below_8um"),
+                ("steps_hmin_below_6um",  "angle_hmin_below_6um"),
+            ):
+                rec[key_steps] = 0
+                rec[key_angle] = 0.0
+
+        # Eccentricity peak (valid_dynamic — orbit even at clamp).
+        emask = vd & np.isfinite(eps_mag)
+        if int(emask.sum()) > 0:
+            eps_v = eps_mag[emask]
+            phi_v = phi_mod[emask]
+            i_peak = int(np.argmax(eps_v))
+            rec["max_eps_lastcycle"] = float(eps_v[i_peak])
+            rec["phi_at_max_eps"] = float(phi_v[i_peak])
+        else:
+            rec["max_eps_lastcycle"] = float("nan")
+            rec["phi_at_max_eps"] = float("nan")
+
+        # ε at φ=421° (firing-peak exit) — interpolated from the last
+        # cycle. Use linear interpolation against phi_mod sorted view;
+        # if 421° falls outside the available range return nan.
+        phi_target = 421.0
+        finite_e = np.isfinite(eps_mag) & vd
+        if finite_e.any():
+            phi_v = phi_mod[finite_e]
+            eps_v = eps_mag[finite_e]
+            order = np.argsort(phi_v)
+            phi_s = phi_v[order]
+            eps_s = eps_v[order]
+            if (phi_target >= phi_s[0]) and (phi_target <= phi_s[-1]):
+                rec["eps_at_phi_421"] = float(
+                    np.interp(phi_target, phi_s, eps_s))
+            else:
+                rec["eps_at_phi_421"] = float("nan")
+        else:
+            rec["eps_at_phi_421"] = float("nan")
+
+        # Recovery angles to 0.90 / 0.85 / 0.80.
+        if int(emask.sum()) > 0:
+            phi_v = phi_mod[emask]
+            eps_v = eps_mag[emask]
+            for level in _RECOVERY_LEVELS:
+                ang, ok = _recovery_angle_deg(phi_v, eps_v, level)
+                key = f"angle_recovery_to_{str(level).replace('.', 'p')}"
+                key_failed = f"recovery_failed_{str(level).replace('.', 'p')}"
+                rec[key] = ang
+                rec[key_failed] = bool(not ok)
+        else:
+            for level in _RECOVERY_LEVELS:
+                rec[f"angle_recovery_to_{str(level).replace('.', 'p')}"] = (
+                    float("nan"))
+                rec[f"recovery_failed_{str(level).replace('.', 'p')}"] = True
+
+        # AUC ε on [360°, 480°].
+        rec["auc_eps_360_480"] = _auc_eps_over_range(
+            phi_mod[emask] if emask.any() else phi_mod,
+            eps_mag[emask] if emask.any() else eps_mag,
+            auc_lo, auc_hi)
+
+        # Power loss in firing sector — impulse over time.
+        fmask_pl = firing_mask & vnc & np.isfinite(Plo)
+        if int(fmask_pl.sum()) >= 2:
+            phi_pl = phi_mod[fmask_pl]
+            P_pl = Plo[fmask_pl]
+            order = np.argsort(phi_pl)
+            phi_s = phi_pl[order]
+            P_s = P_pl[order]
+            t_s = np.deg2rad(phi_s) / float(omega_rad_s)
+            rec["ploss_impulse_firing_J"] = float(_trapz(P_s, t_s))
+            rec["ploss_firing_mean_W"] = _safe_mean(P_pl)
+            rec["ploss_firing_max_W"] = _safe_max(P_pl)
+        else:
+            rec["ploss_impulse_firing_J"] = float("nan")
+            rec["ploss_firing_mean_W"] = float("nan")
+            rec["ploss_firing_max_W"] = float("nan")
+
+        rec["firing_sector_deg"] = (float(firing_sector_deg[0]),
+                                      float(firing_sector_deg[1]))
+        out.append(rec)
+    return out
+
+
+def _compute_paired_extended(cfg_list, paired_basic, prod_metrics,
+                               last_start, valid_no_clamp_all,
+                               valid_dynamic_all,
+                               eps_x_all, eps_y_all,
+                               hmin_all, pmax_all, P_loss_all,
+                               omega_rad_s,
+                               firing_sector_deg,
+                               phi_crank_deg
+                               ) -> List[Dict[str, Any]]:
+    """Per-pair (smooth vs textured) deltas of the extended metrics
+    on the **common_valid_no_clamp** mask of the last cycle.
+
+    Stays consistent with ``_compute_paired_transient`` for the basic
+    block — extended metrics are computed only on common_valid_no_clamp
+    (or common_valid_dynamic for orbit-related entries) so the deltas
+    are always paired on the same set of crank-angle steps.
+    """
+    by_oil: Dict[str, Dict[str, int]] = {}
+    for ic, cfg in enumerate(cfg_list):
+        oil_key = (cfg.get("oil") or {}).get("name", "")
+        bucket = by_oil.setdefault(oil_key, {})
+        if cfg.get("textured"):
+            bucket["textured_idx"] = ic
+        else:
+            bucket["smooth_idx"] = ic
+    sl = slice(int(last_start), None)
+    phi_last = np.asarray(phi_crank_deg)[sl]
+    phi_mod = phi_last % 720.0
+    firing_mask = _firing_mask(phi_mod, firing_sector_deg)
+    auc_lo, auc_hi = _AUC_RANGE_DEG
+    out = []
+    for oil_key, bucket in by_oil.items():
+        if "textured_idx" not in bucket or "smooth_idx" not in bucket:
+            continue
+        i_s = bucket["smooth_idx"]
+        i_t = bucket["textured_idx"]
+        common_dyn = (np.asarray(valid_dynamic_all[i_s, sl], dtype=bool)
+                       & np.asarray(valid_dynamic_all[i_t, sl], dtype=bool))
+        common_noc = (np.asarray(valid_no_clamp_all[i_s, sl], dtype=bool)
+                       & np.asarray(valid_no_clamp_all[i_t, sl], dtype=bool))
+        rec = dict(
+            oil_name=oil_key,
+            smooth_idx=i_s, smooth_label=cfg_list[i_s]["label"],
+            textured_idx=i_t, textured_label=cfg_list[i_t]["label"],
+            common_valid_no_clamp_count=int(common_noc.sum()),
+            common_valid_dynamic_count=int(common_dyn.sum()),
+        )
+        # Pressure-peak deltas — on common_valid_no_clamp ∩ firing.
+        f_noc = common_noc & firing_mask
+        for q, key in ((95, "pmax_firing_p95"),
+                        (99, "pmax_firing_p99")):
+            ps = np.asarray(pmax_all[i_s, sl])[f_noc]
+            pt = np.asarray(pmax_all[i_t, sl])[f_noc]
+            rec[f"smooth_{key}"] = _percentile(ps, q)
+            rec[f"textured_{key}"] = _percentile(pt, q)
+            rec[f"delta_{key}"] = (rec[f"textured_{key}"]
+                                      - rec[f"smooth_{key}"])
+        # max p_max in firing
+        ps = np.asarray(pmax_all[i_s, sl])[f_noc]
+        pt = np.asarray(pmax_all[i_t, sl])[f_noc]
+        rec["smooth_pmax_firing_max"] = _safe_max(ps)
+        rec["textured_pmax_firing_max"] = _safe_max(pt)
+        rec["delta_pmax_firing_max"] = (
+            rec["textured_pmax_firing_max"]
+            - rec["smooth_pmax_firing_max"])
+
+        # h_min P5 / min on common_no_clamp
+        hs = np.asarray(hmin_all[i_s, sl])[common_noc]
+        ht = np.asarray(hmin_all[i_t, sl])[common_noc]
+        rec["smooth_hmin_p5"] = _percentile(hs, 5)
+        rec["textured_hmin_p5"] = _percentile(ht, 5)
+        rec["delta_hmin_p5"] = (rec["textured_hmin_p5"]
+                                   - rec["smooth_hmin_p5"])
+        rec["smooth_hmin_min"] = _safe_min(hs)
+        rec["textured_hmin_min"] = _safe_min(ht)
+        rec["delta_hmin_min"] = (rec["textured_hmin_min"]
+                                    - rec["smooth_hmin_min"])
+        # Steps below thresholds (common_no_clamp, both finite).
+        hsv = hs[np.isfinite(hs)]
+        htv = ht[np.isfinite(ht)]
+        for thr_m, key in ((10e-6, "steps_hmin_below_10um"),
+                             (8e-6, "steps_hmin_below_8um"),
+                             (6e-6, "steps_hmin_below_6um")):
+            ns = int(np.sum(hsv < thr_m))
+            nt = int(np.sum(htv < thr_m))
+            rec[f"smooth_{key}"] = ns
+            rec[f"textured_{key}"] = nt
+            rec[f"delta_{key}"] = nt - ns
+
+        # Orbit metrics use common_valid_dynamic.
+        ex_s = np.asarray(eps_x_all[i_s, sl])[common_dyn]
+        ey_s = np.asarray(eps_y_all[i_s, sl])[common_dyn]
+        ex_t = np.asarray(eps_x_all[i_t, sl])[common_dyn]
+        ey_t = np.asarray(eps_y_all[i_t, sl])[common_dyn]
+        eps_s = np.sqrt(ex_s ** 2 + ey_s ** 2)
+        eps_t = np.sqrt(ex_t ** 2 + ey_t ** 2)
+        rec["smooth_max_eps_lastcycle"] = _safe_max(eps_s)
+        rec["textured_max_eps_lastcycle"] = _safe_max(eps_t)
+        rec["delta_max_eps_lastcycle"] = (
+            rec["textured_max_eps_lastcycle"]
+            - rec["smooth_max_eps_lastcycle"])
+        # ε at 421° via interp on common.
+        phi_common = phi_mod[common_dyn]
+        if phi_common.size >= 2:
+            order = np.argsort(phi_common)
+            phi_s_ = phi_common[order]
+            if 421.0 >= phi_s_[0] and 421.0 <= phi_s_[-1]:
+                rec["smooth_eps_at_phi_421"] = float(np.interp(
+                    421.0, phi_s_, eps_s[order]))
+                rec["textured_eps_at_phi_421"] = float(np.interp(
+                    421.0, phi_s_, eps_t[order]))
+            else:
+                rec["smooth_eps_at_phi_421"] = float("nan")
+                rec["textured_eps_at_phi_421"] = float("nan")
+        else:
+            rec["smooth_eps_at_phi_421"] = float("nan")
+            rec["textured_eps_at_phi_421"] = float("nan")
+        rec["delta_eps_at_phi_421"] = (
+            rec["textured_eps_at_phi_421"]
+            - rec["smooth_eps_at_phi_421"])
+        rec["smooth_auc_eps_360_480"] = _auc_eps_over_range(
+            phi_common, eps_s, auc_lo, auc_hi)
+        rec["textured_auc_eps_360_480"] = _auc_eps_over_range(
+            phi_common, eps_t, auc_lo, auc_hi)
+        rec["delta_auc_eps_360_480"] = (
+            rec["textured_auc_eps_360_480"]
+            - rec["smooth_auc_eps_360_480"])
+
+        # P_loss impulse / mean on common_no_clamp ∩ firing.
+        f_noc_pl = common_noc & firing_mask
+        Ps = np.asarray(P_loss_all[i_s, sl])[f_noc_pl]
+        Pt = np.asarray(P_loss_all[i_t, sl])[f_noc_pl]
+        phi_pl = phi_mod[f_noc_pl]
+        if int(f_noc_pl.sum()) >= 2:
+            order = np.argsort(phi_pl)
+            t_s = np.deg2rad(phi_pl[order]) / float(omega_rad_s)
+            rec["smooth_ploss_impulse_firing_J"] = float(_trapz(
+                Ps[order], t_s))
+            rec["textured_ploss_impulse_firing_J"] = float(_trapz(
+                Pt[order], t_s))
+        else:
+            rec["smooth_ploss_impulse_firing_J"] = float("nan")
+            rec["textured_ploss_impulse_firing_J"] = float("nan")
+        rec["delta_ploss_impulse_firing_J"] = (
+            rec["textured_ploss_impulse_firing_J"]
+            - rec["smooth_ploss_impulse_firing_J"])
+        rec["smooth_ploss_firing_mean_W"] = _safe_mean(Ps)
+        rec["textured_ploss_firing_mean_W"] = _safe_mean(Pt)
+        rec["delta_ploss_firing_mean_W"] = (
+            rec["textured_ploss_firing_mean_W"]
+            - rec["smooth_ploss_firing_mean_W"])
+
+        rec["firing_sector_deg"] = (float(firing_sector_deg[0]),
+                                      float(firing_sector_deg[1]))
+        out.append(rec)
+    return out
+
+
+def _global_phi_for_paired(eps_x_all, eps_y_all, last_start):
+    """phi_crank_deg slice we need is shared across configs; the
+    paired helper is given the last-cycle slice indirectly via the
+    array shapes. The runner passes in ``phi_crank_deg`` separately
+    elsewhere; here we just need the last-cycle phi which is the
+    second axis index. We rely on the runner already storing
+    phi_crank_deg in ``results``; this helper is only used internally
+    when we don't have that handle yet, so it computes a 0-based
+    crank angle from the second-axis size. Callers in
+    ``run_transient`` pass the real phi_crank_deg directly.
+    """
+    # Defensive fallback only — real callers pass phi_crank_deg.
+    n = eps_x_all.shape[1] - int(last_start)
+    return np.linspace(0.0, 720.0, max(n, 1), endpoint=False)
+
+
 def _compute_paired_transient(cfg_list, last_start, valid_dynamic,
                                valid_no_clamp, T_eff_used, eta_eff,
                                P_loss, hmin, pmax, F_tr):
@@ -456,7 +876,8 @@ def run_transient(F_max=None, debug=False,
                   d_phi_base_deg: Optional[float] = None,
                   d_phi_peak_deg: float = 0.25,
                   retry_config: Optional[SolverRetryConfig] = None,
-                  envelope_abort: Optional[EnvelopeAbortConfig] = None):
+                  envelope_abort: Optional[EnvelopeAbortConfig] = None,
+                  firing_sector_deg: Optional[Tuple[float, float]] = None):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -497,6 +918,10 @@ def run_transient(F_max=None, debug=False,
         retry_config = SolverRetryConfig()
     if envelope_abort is None:
         envelope_abort = EnvelopeAbortConfig()
+    if firing_sector_deg is None:
+        firing_sector_deg = DEFAULT_FIRING_SECTOR_DEG
+    firing_sector_deg = (float(firing_sector_deg[0]),
+                          float(firing_sector_deg[1]))
 
     N = int(n_grid) if n_grid is not None else int(params.N_grid_transient)
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N, N)
@@ -970,6 +1395,30 @@ def run_transient(F_max=None, debug=False,
         T_eff_used_all, eta_eff_all, P_loss_all, hmin_all, pmax_all,
         Ftr_all)
 
+    # Stage Diesel Transient Production Metrics — per-config + paired.
+    production_metrics = _compute_production_metrics(
+        cfg_list=cfg_list,
+        last_start=last_start,
+        phi_crank_deg=phi_crank_deg,
+        eps_x_all=eps_x_all,
+        eps_y_all=eps_y_all,
+        hmin_all=hmin_all,
+        pmax_all=pmax_all,
+        P_loss_all=P_loss_all,
+        valid_dynamic_all=valid_dynamic_all,
+        valid_no_clamp_all=valid_no_clamp_all,
+        omega_rad_s=float(omega),
+        firing_sector_deg=firing_sector_deg,
+    )
+    paired_extended = _compute_paired_extended(
+        cfg_list, paired, production_metrics,
+        last_start, valid_no_clamp_all, valid_dynamic_all,
+        eps_x_all, eps_y_all, hmin_all, pmax_all, P_loss_all,
+        omega_rad_s=float(omega),
+        firing_sector_deg=firing_sector_deg,
+        phi_crank_deg=phi_crank_deg,
+    )
+
     # Per-config envelope classification (Section 3 of the patch).
     for ic in range(n_cfg):
         n_completed = int(steps_completed_arr[ic])
@@ -1039,6 +1488,9 @@ def run_transient(F_max=None, debug=False,
         "thermal_cycle_delta": thermal_cycle_delta,
         "thermal_periodic_converged": thermal_periodic_converged,
         "paired_comparison": paired,
+        "production_metrics": production_metrics,
+        "paired_extended": paired_extended,
+        "firing_sector_deg": firing_sector_deg,
         "thermal_config": thermal.to_dict(),
         "retry_config": retry_config.to_dict(),
         # Stage Diesel Transient Load-Envelope-0 — per-config envelope.
