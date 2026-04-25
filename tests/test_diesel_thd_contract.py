@@ -68,7 +68,12 @@ def test_thermal_none_equals_off_equals_legacy():
     eta_d = MINERAL_OIL["eta_diesel"]
     np.testing.assert_allclose(res_off["eta_eff"], eta_d, rtol=1e-12)
     np.testing.assert_allclose(res_off["T_eff"], 105.0, rtol=0, atol=1e-12)
-    assert bool(res_off["thermal_converged"].all())
+    # Energy convergence is trivially True in mode="off" (no fixed-point
+    # iteration). The Stage THD-0B flag ``thermal_converged`` additionally
+    # requires ``valid_fullfilm``; on the small smoke grid F_max=850 kN
+    # outruns the 40x40 W-table so above_range angles legitimately fall
+    # out — that's the point of the redefined headline flag.
+    assert bool(res_off["thermal_energy_converged"].all())
     assert int(res_off["thermal_outer"].max()) == 0
 
 
@@ -108,7 +113,11 @@ def test_gamma_zero_equals_no_heating():
     # mineral config when T_in = 105 °C.
     np.testing.assert_allclose(res["eta_eff"], MINERAL_OIL["eta_diesel"],
                                  rtol=1e-9)
-    assert bool(res["thermal_converged"].all())
+    # gamma=0 collapses the energy balance: every angle, even
+    # load-mismatched ones, must be ``thermal_energy_converged``.
+    # ``thermal_converged`` (energy AND valid_fullfilm) may exclude
+    # above_range angles on the small smoke grid; that's expected.
+    assert bool(res["thermal_energy_converged"].all())
 
 
 # ─── Test 4 — fixed-H viscosity trend ─────────────────────────────
