@@ -36,7 +36,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
-from reynolds_solver.squeeze import squeeze_to_api_params
+# squeeze submodule layout differs between solver builds; some installs
+# expose ``squeeze_to_api_params`` directly from the top-level module.
+# Fall through both paths and raise only if a production run actually
+# tries to call it without the helper present.
+try:
+    from reynolds_solver.squeeze import squeeze_to_api_params
+except ImportError:
+    try:
+        from reynolds_solver import squeeze_to_api_params  # type: ignore
+    except ImportError:
+        def squeeze_to_api_params(*_a, **_kw):  # type: ignore
+            raise RuntimeError(
+                "reynolds_solver does not expose squeeze_to_api_params; "
+                "production transient runs need either "
+                "reynolds_solver.squeeze.squeeze_to_api_params or the "
+                "top-level alias. Pipeline contract tests don't depend "
+                "on this helper.")
 from models.bearing_model import (
     DEFAULT_CAVITATION, DEFAULT_CLOSURE,
     compute_axial_leakage_m3_s,
