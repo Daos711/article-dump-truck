@@ -75,6 +75,39 @@ Possible resolutions (not attempted in I-A):
 - `load_hodograph.png`, `wx_wy_vs_phi.png` — load cycle visualization
 - `anchor.json` — anchor diagnostic (after I-A anchor patch, see below)
 
+## Continuation basin fix
+
+**Status:** see `CONTINUATION_BASIN_PATCH_NOTE.md`. Summary:
+
+- The anchor patch unblocked the *entry* onto the branch but left the
+  cycle march vulnerable to wrong-basin lock-in, flat-eps plateaus, and
+  silent budget burn on hopeless nodes.
+- The basin patch replaces the single-shot continuation with **basin-aware
+  multi-shoot**:
+  1. Node status taxonomy: `metric_hard / metric_soft / bridge / failed /
+     timeout_failed / capacity_limited_fullfilm` — only metric statuses
+     count toward the matched-cycle headline.
+  2. Three plateau / wrong-basin detectors (fast 1-node, rolling 3-node,
+     rolling 4-node) plus an explicit cap-lock detector.
+  3. **Multi-start reseed** (load-aligned ε grid × attitude offsets,
+     gated `g_init` choice with mandatory `g=None` candidate) before
+     subdivision is allowed to recurse to its limit.
+  4. **Midpoint persistence**: a successful midpoint is now a real node,
+     added to history and to `continuation_debug.csv`.
+  5. **Multi-shoot anchor pool**: primary `[500, 250, 90, 630]` +
+     backup `[430, 160, 320, 610]`. Each anchor spawns a forward and
+     a backward segment; per-φ merge by status priority.
+  6. **Wall-clock caps** at node / midpoint / segment / geometry / full
+     run scopes; hard cap fires `timeout_failed` and unwinds.
+  7. **Honest reporting**: `summary.txt` separates metric, bridge, and
+     capacity-limited counts. The high-load peak appears as
+     `capacity_limited_fullfilm` rather than `failed` when it hits the
+     ε / h_min guards — this is the physical cap of cold isoviscous
+     full-film, not a solver defect.
+- New CLI / artifacts: `continuation_debug.csv`, `summary.txt`. Existing
+  `cycle_history.csv` now contains the per-φ best node after merge.
+- Pipeline-side logic covered by `tests/test_basin_patch.py` (24 tests).
+
 ## Anchor policy fix
 
 **Status:** see `ANCHOR_PATCH_NOTE.md` for the full pipeline-side patch

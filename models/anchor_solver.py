@@ -36,12 +36,15 @@ import numpy as np
 # accepted evaluations on purpose (Section 5.3 of the patch spec).
 
 PS_BUDGETS: Dict[str, Dict[str, int]] = {
-    "scout":               dict(ps_max_iter=12_000, hs_warmup_iter=1_000),
-    "trial":               dict(ps_max_iter=15_000, hs_warmup_iter=2_000),
+    # Section 11 of the basin patch — lighter trial / midpoint, anchor
+    # budgets unchanged (anchor was already meeting acceptance).
+    "scout":               dict(ps_max_iter=10_000, hs_warmup_iter=1_000),
+    "trial":               dict(ps_max_iter=6_000,  hs_warmup_iter=500),
     "anchor_stage_first":  dict(ps_max_iter=100_000, hs_warmup_iter=25_000),
     "anchor_stage_later":  dict(ps_max_iter=80_000,  hs_warmup_iter=5_000),
     "accepted_node":       dict(ps_max_iter=25_000, hs_warmup_iter=2_000),
-    "midpoint_rescue":     dict(ps_max_iter=50_000, hs_warmup_iter=10_000),
+    "bridge_node":         dict(ps_max_iter=20_000, hs_warmup_iter=2_000),
+    "midpoint_rescue":     dict(ps_max_iter=35_000, hs_warmup_iter=3_000),
 }
 
 

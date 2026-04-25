@@ -7,7 +7,7 @@ No squeeze, no thermal. Shell-fixed placement.
 from __future__ import annotations
 
 import argparse, csv, datetime, json, math, os, sys, time, warnings
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
@@ -39,7 +39,9 @@ from models.diesel_stage1_cycle import (
 )
 from models.continuation_runner import (
     ContinuationConfig,
+    SolvedNode,
     run_continuation_cycle,
+    run_continuation_segment,
 )
 from models.anchor_solver import (
     PS_BUDGETS,
@@ -49,6 +51,19 @@ from models.anchor_solver import (
     pick_anchor_phi,
     solve_anchor_smooth,
     solve_anchor_textured,
+)
+from models.basin_policy import (
+    DROP_STATUSES,
+    HMIN_GUARD_DEFAULT,
+    METRIC_STATUSES,
+    STATUS_BRIDGE,
+    STATUS_CAPACITY_LIMITED,
+    STATUS_FAILED,
+    STATUS_METRIC_HARD,
+    STATUS_METRIC_SOFT,
+    STATUS_TIMEOUT_FAILED,
+    USABLE_FOR_HISTORY,
+    WallClockCaps,
 )
 
 OMEGA = 2 * math.pi * n_rpm / 60.0
@@ -421,62 +436,306 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     if out_dir is not None:
         _dump_anchor_log(out_dir, rep_sm, rep_tx)
 
-    # ── 4. Cycle march from anchor (existing continuation_phi logic) ──
+    # ── 4. Multi-shoot continuation (Section 9 of basin patch) ──────
     cfg = ContinuationConfig(
         corrector_max_iter=10,
         corrector_tol=TOL_HARD,
         corrector_soft_tol=TOL_SOFT,
         step_cap=STEP_CAP,
         eps_max=EPS_MAX,
-        max_subdiv_depth=4,
+        max_subdiv_depth=2,
         min_dphi_deg=1.5)
+    caps = WallClockCaps()
 
-    geo_tasks = [("smooth", smooth_factory, smooth_anchor)]
+    # Anchor pool — primary defaults from Section 9.1 for the current
+    # surrogate_heavyduty_v1 case; first entry is always the anchor that
+    # solve_anchor_smooth has already accepted.
+    primary_pool = [phi_anchor, 250.0, 90.0, 630.0]
+    backup_pool = [430.0, 160.0, 320.0, 610.0]
+    anchor_pool = []
+    seen = set()
+    for p in primary_pool + backup_pool:
+        snap = float(min(phi_list, key=lambda q: abs(q - (p % 720.0))))
+        if snap not in seen:
+            seen.add(snap)
+            anchor_pool.append(snap)
+
+    debug_log: List[Dict] = []
+
+    def _emit_debug(nd: SolvedNode, geo_tag: str, segment_id: int,
+                     anchor_phi_seg: float, direction: str):
+        Wxn, Wyn = load_fn(nd.phi_deg)
+        Wnn = math.hypot(Wxn, Wyn)
+        debug_log.append(dict(
+            geometry=geo_tag,
+            segment_id=segment_id,
+            anchor_phi=anchor_phi_seg,
+            direction=direction,
+            phi=nd.phi_deg,
+            is_base_target=int(not nd.is_midpoint),
+            is_midpoint=int(nd.is_midpoint),
+            status=nd.status,
+            residual=nd.rel_residual,
+            eps=nd.eps,
+            hmin_um=nd.h_min * 1e6,
+            attitude_deg=nd.attitude_deg,
+            W_N=Wnn,
+            load_angle_deg=math.degrees(math.atan2(Wyn, Wxn)),
+            eps_expected=max(0.18, min(0.88, 0.4 * (Wnn / 1000.0) ** 0.25)),
+            detector_triggered=nd.detector_triggered,
+            reseed_used=int(nd.reseed_used),
+            reseed_candidate_rank=nd.reseed_candidate_rank,
+            g_source=nd.g_source,
+            ps_budget_mode=nd.ps_budget_mode,
+            node_elapsed_sec=nd.node_elapsed_sec,
+            reason_for_stop=nd.reason_for_stop,
+        ))
+
+    def _solve_geometry(geo_tag: str,
+                          factory,
+                          first_anchor_state: AnchorState,
+                          alt_anchor_solver: Callable[[float],
+                                                       Optional[AnchorState]],
+                          ) -> Tuple[Dict[float, SolvedNode], int, float]:
+        """Run multi-shoot for one geometry; merge per phi by best status."""
+        per_phi: Dict[float, SolvedNode] = {}
+        seg_id = 0
+        geo_t0 = time.time()
+        first = True
+        n_segments = 0
+        for anchor_phi_seg in anchor_pool:
+            if (time.time() - geo_t0) > caps.geometry_sec:
+                print(f"  [{geo_tag}] geometry wall-clock cap "
+                      f"({caps.geometry_sec:.0f}s) — stopping anchor pool",
+                      flush=True)
+                break
+            uncovered = [p for p in phi_list if p not in per_phi
+                          or per_phi[p].status not in METRIC_STATUSES]
+            if not uncovered:
+                print(f"  [{geo_tag}] full coverage reached — stopping",
+                      flush=True)
+                break
+
+            # Anchor: reuse first_anchor_state for first iteration; else solve.
+            if first and abs(anchor_phi_seg - first_anchor_state.phi_deg) < 1.0:
+                anchor_state_seg = first_anchor_state
+            else:
+                anchor_state_seg = alt_anchor_solver(anchor_phi_seg)
+            first = False
+            if anchor_state_seg is None:
+                print(f"  [{geo_tag}] anchor at {anchor_phi_seg:.1f}° "
+                      f"FAILED — skipping segment", flush=True)
+                continue
+
+            # Print streaming progress.
+            t_start = [time.time()]
+            def _on_node(nd, idx, n_total,
+                          _ts=t_start, _seg=seg_id,
+                          _aphi=anchor_phi_seg, _gt=geo_tag,
+                          _dir=None):
+                now = time.time()
+                dt_node = now - _ts[0]
+                _ts[0] = now
+                badge = {
+                    STATUS_METRIC_HARD: "✓",
+                    STATUS_METRIC_SOFT: "✓",
+                    STATUS_BRIDGE: "~",
+                    STATUS_CAPACITY_LIMITED: "↑",
+                    STATUS_TIMEOUT_FAILED: "T",
+                }.get(nd.status, "✗")
+                Wx_n, Wy_n = load_fn(nd.phi_deg)
+                Wn_n = math.hypot(Wx_n, Wy_n)
+                tag = "M" if nd.is_midpoint else " "
+                print(f"  [{badge}{tag}] s{_seg} {idx+1:3d}/{n_total} "
+                      f"φ={nd.phi_deg:6.1f}° W={Wn_n:7.0f}N "
+                      f"ε={nd.eps:.4f} h={nd.h_min*1e6:.1f}μm "
+                      f"res={nd.rel_residual:.1e} [{nd.status[:6]}] "
+                      f"pred={nd.predictor_type} {dt_node:.0f}s",
+                      flush=True)
+
+            for direction in ("forward", "backward"):
+                if (time.time() - geo_t0) > caps.geometry_sec:
+                    break
+                print(f"\n  [{geo_tag}] segment s{seg_id} "
+                      f"anchor={anchor_phi_seg:.1f}° direction={direction}",
+                      flush=True)
+                nodes = run_continuation_segment(
+                    phi_list, load_fn, factory, anchor_state_seg,
+                    cfg=cfg, caps=caps,
+                    direction=direction,
+                    eps_max=EPS_MAX,
+                    hmin_guard=HMIN_GUARD_DEFAULT,
+                    segment_id=seg_id,
+                    node_callback=_on_node,
+                )
+                # Merge per phi.
+                for nd in nodes:
+                    _emit_debug(nd, geo_tag, seg_id, anchor_phi_seg, direction)
+                    if nd.is_midpoint:
+                        # midpoints are written to debug only.
+                        continue
+                    cur = per_phi.get(nd.phi_deg)
+                    if cur is None or _node_priority(nd) > _node_priority(cur):
+                        per_phi[nd.phi_deg] = nd
+                seg_id += 1
+                n_segments += 1
+                # Coverage check.
+                covered = sum(1 for p in phi_list
+                              if p in per_phi
+                              and per_phi[p].status in METRIC_STATUSES)
+                print(f"  [{geo_tag}] segment done — "
+                      f"metric coverage {covered}/{len(phi_list)} "
+                      f"({covered/max(len(phi_list),1)*100:.0f}%)",
+                      flush=True)
+        return per_phi, n_segments, time.time() - geo_t0
+
+    def _alt_anchor_smooth(p: float) -> Optional[AnchorState]:
+        Wx, Wy = load_fn(p)
+        Wa_p = np.array([Wx, Wy], dtype=float)
+        st, _ = solve_anchor_smooth(p, Wa_p, smooth_factory,
+                                       eps_max=EPS_MAX, tol=TOL_HARD)
+        return st
+
+    def _alt_anchor_textured(p: float) -> Optional[AnchorState]:
+        sm = _alt_anchor_smooth(p)
+        if sm is None:
+            return None
+        Wx, Wy = load_fn(p)
+        Wa_p = np.array([Wx, Wy], dtype=float)
+        tx, _ = solve_anchor_textured(
+            p, Wa_p, tex_factory, sm,
+            geometry_factory=tex_geom_factory,
+            eps_max=EPS_MAX, tol=TOL_HARD)
+        return tx
+
+    geo_tasks = [("smooth", smooth_factory, smooth_anchor, _alt_anchor_smooth)]
     if tex_anchor is not None:
-        geo_tasks.append(("textured", tex_factory, tex_anchor))
+        geo_tasks.append(("textured", tex_factory, tex_anchor,
+                            _alt_anchor_textured))
 
-    for geo_tag, factory, anchor_state in geo_tasks:
+    geo_summaries: Dict[str, Dict[str, Any]] = {}
+    for geo_tag, factory, anchor_st, alt_solver in geo_tasks:
         print(f"\n{'='*60}")
-        print(f"  {geo_tag.upper()} (continuation_phi from anchor "
-              f"@ {anchor_state.phi_deg:.1f}°)", flush=True)
-
-        # Streaming progress callback: print as soon as each node is done,
-        # so the user can see actual progress instead of one big silent
-        # block until the whole cycle finishes.
-        t_start = [time.time()]
-        def _on_node(nd, idx, n_total, _ts=t_start, _gt=geo_tag):
-            now = time.time()
-            dt_node = now - _ts[0]
-            _ts[0] = now
-            st = "✓" if nd.status in ("hard_converged","soft_converged") else "✗"
-            Wx_n, Wy_n = load_fn(nd.phi_deg)
-            Wn_n = math.sqrt(Wx_n**2 + Wy_n**2)
-            print(f"  [{st}] {idx+1:3d}/{n_total} φ={nd.phi_deg:6.1f}° "
-                  f"W={Wn_n:7.0f}N ε={nd.eps:.4f} "
-                  f"h={nd.h_min*1e6:.1f}μm P={nd.Ploss:.1f}W "
-                  f"res={nd.rel_residual:.1e} [{nd.status[:4]}] "
-                  f"pred={nd.predictor_type} d={nd.subdiv_depth} "
-                  f"{dt_node:.0f}s",
-                  flush=True)
-
-        t0 = time.time()
-        nodes = run_continuation_cycle(
-            phi_list, load_fn, factory, cfg,
-            phi_anchor_deg=anchor_state.phi_deg,
-            anchor_state=anchor_state,
-            node_callback=_on_node)
-        dt_total = time.time() - t0
-
-        for nd in nodes:
-            row = _node_to_row(nd, geo_tag, load_fn, dt_total, len(nodes))
+        print(f"  {geo_tag.upper()} multi-shoot (anchor pool: "
+              f"{[round(p,1) for p in anchor_pool]})", flush=True)
+        per_phi, n_seg, dt_geo = _solve_geometry(
+            geo_tag, factory, anchor_st, alt_solver)
+        # Order results by phi.
+        for p in phi_list:
+            nd = per_phi.get(p)
+            if nd is None:
+                continue
+            row = _node_to_row(nd, geo_tag, load_fn, dt_geo, len(per_phi))
+            row["detector_triggered"] = nd.detector_triggered
+            row["reseed_used"] = int(nd.reseed_used)
             all_rows.append(row)
-
-        n_acc = sum(1 for nd in nodes if nd.status != "failed")
-        print(f"  {geo_tag}: {n_acc}/{len(nodes)} converged "
-              f"({n_acc/max(len(nodes),1)*100:.0f}%) in {dt_total:.0f}s",
+        # Per-geometry summary.
+        counts = {STATUS_METRIC_HARD: 0, STATUS_METRIC_SOFT: 0,
+                  STATUS_BRIDGE: 0, STATUS_FAILED: 0,
+                  STATUS_TIMEOUT_FAILED: 0,
+                  STATUS_CAPACITY_LIMITED: 0}
+        for p in phi_list:
+            nd = per_phi.get(p)
+            if nd is None:
+                counts[STATUS_FAILED] += 1
+            else:
+                counts[nd.status] = counts.get(nd.status, 0) + 1
+        worst_dt = max((nd.node_elapsed_sec for nd in per_phi.values()),
+                        default=0.0)
+        geo_summaries[geo_tag] = dict(
+            counts=counts, n_segments=n_seg, dt_geo=dt_geo,
+            anchors_used=anchor_pool[:n_seg if n_seg <= len(anchor_pool)
+                                       else len(anchor_pool)],
+            worst_node_sec=worst_dt,
+        )
+        n_metric = counts[STATUS_METRIC_HARD] + counts[STATUS_METRIC_SOFT]
+        print(f"  {geo_tag}: metric={n_metric} bridge={counts[STATUS_BRIDGE]} "
+              f"failed={counts[STATUS_FAILED]} "
+              f"timeout={counts[STATUS_TIMEOUT_FAILED]} "
+              f"capacity={counts[STATUS_CAPACITY_LIMITED]} "
+              f"in {dt_geo:.0f}s "
+              f"({n_seg} segments, worst node {worst_dt:.0f}s)",
               flush=True)
 
+    if out_dir is not None:
+        _dump_continuation_debug(out_dir, debug_log)
+        _dump_summary(out_dir, geo_summaries, anchor_pool, phi_list,
+                      smooth_anchor_dt, tex_anchor_dt)
+
     return all_rows
+
+
+def _node_priority(nd: SolvedNode) -> int:
+    """Higher = better. Used by per-phi merge (Section 9.4)."""
+    base = {STATUS_METRIC_HARD: 4000, STATUS_METRIC_SOFT: 3000,
+            STATUS_BRIDGE: 2000, STATUS_CAPACITY_LIMITED: 500,
+            STATUS_FAILED: 100, STATUS_TIMEOUT_FAILED: 50}.get(nd.status, 0)
+    # Tie-break by lower residual (subtract scaled residual).
+    return base - int(min(nd.rel_residual, 99.0) * 10)
+
+
+def _dump_continuation_debug(out_dir: str, debug_log: List[Dict]) -> None:
+    if not out_dir or not debug_log:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    flds = ["geometry", "segment_id", "anchor_phi", "direction", "phi",
+            "is_base_target", "is_midpoint", "status", "residual", "eps",
+            "hmin_um", "attitude_deg", "W_N", "load_angle_deg",
+            "eps_expected", "detector_triggered", "reseed_used",
+            "reseed_candidate_rank", "g_source", "ps_budget_mode",
+            "node_elapsed_sec", "reason_for_stop"]
+    with open(os.path.join(out_dir, "continuation_debug.csv"),
+              "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=flds)
+        w.writeheader()
+        for r in debug_log:
+            w.writerow({k: (f"{v:.8e}" if isinstance(v, float) else v)
+                        for k, v in r.items()})
+
+
+def _dump_summary(out_dir: str,
+                    geo_summaries: Dict[str, Dict[str, Any]],
+                    anchor_pool: List[float],
+                    phi_list: List[float],
+                    smooth_anchor_dt: float,
+                    tex_anchor_dt: float) -> None:
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    lines = [
+        "Stage I-A continuation basin summary",
+        f"  cycle points: {len(phi_list)}",
+        f"  anchor pool: {[round(p,1) for p in anchor_pool]}",
+        f"  smooth anchor wall-clock: {smooth_anchor_dt:.1f}s",
+        f"  textured anchor wall-clock: {tex_anchor_dt:.1f}s",
+        "",
+    ]
+    for geo, s in geo_summaries.items():
+        c = s["counts"]
+        n_metric = c.get(STATUS_METRIC_HARD, 0) + c.get(STATUS_METRIC_SOFT, 0)
+        n_bridge = c.get(STATUS_BRIDGE, 0)
+        n_total = len(phi_list)
+        lines.extend([
+            f"[{geo}]",
+            f"  metric_hard:               {c.get(STATUS_METRIC_HARD,0):3d}",
+            f"  metric_soft:               {c.get(STATUS_METRIC_SOFT,0):3d}",
+            f"  bridge:                    {n_bridge:3d}",
+            f"  failed:                    {c.get(STATUS_FAILED,0):3d}",
+            f"  timeout_failed:            {c.get(STATUS_TIMEOUT_FAILED,0):3d}",
+            f"  capacity_limited_fullfilm: {c.get(STATUS_CAPACITY_LIMITED,0):3d}",
+            f"  metric coverage: {n_metric}/{n_total} "
+            f"= {n_metric/max(n_total,1)*100:.0f}%",
+            f"  metric+bridge coverage (diagnostic): "
+            f"{n_metric+n_bridge}/{n_total} "
+            f"= {(n_metric+n_bridge)/max(n_total,1)*100:.0f}%",
+            f"  segments used: {s['n_segments']}",
+            f"  geometry wall-clock: {s['dt_geo']:.1f}s",
+            f"  worst node wall-clock: {s['worst_node_sec']:.1f}s",
+            "",
+        ])
+    with open(os.path.join(out_dir, "summary.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def _dump_anchor_log(out_dir: str,
