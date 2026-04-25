@@ -362,10 +362,13 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     # ── 2. Smooth anchor (load homotopy at fixed phi_a) ──────────
     print(f"\n  SMOOTH ANCHOR @ phi={phi_anchor:.1f}°")
     t0 = time.time()
+    # Anchor uses its own (looser) soft_tol = 5e-2 by default: anchor is
+    # a landing entry point, not a production residual. Step_cap is also
+    # the anchor-side default (0.20), not the in-branch STEP_CAP (0.05).
     smooth_anchor, smooth_log = solve_anchor_smooth(
         phi_anchor, Wa_anchor, smooth_factory,
-        eps_max=EPS_MAX, step_cap=STEP_CAP,
-        tol=TOL_HARD, soft_tol=TOL_SOFT,
+        eps_max=EPS_MAX,
+        tol=TOL_HARD,
     )
     smooth_anchor_dt = time.time() - t0
 
@@ -394,8 +397,8 @@ def _run_continuation(phi_arr, cycle, Phi, Zm, p1, z1, dp, dz, phi_bc,
     tex_anchor, tex_log = solve_anchor_textured(
         phi_anchor, Wa_anchor, tex_factory, smooth_anchor,
         geometry_factory=tex_geom_factory,
-        eps_max=EPS_MAX, step_cap=STEP_CAP,
-        tol=TOL_HARD, soft_tol=TOL_SOFT,
+        eps_max=EPS_MAX,
+        tol=TOL_HARD,
     )
     tex_anchor_dt = time.time() - t0
     rep_tx = AnchorReport(

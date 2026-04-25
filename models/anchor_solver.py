@@ -329,9 +329,9 @@ def solve_anchor_smooth(
     lambda_schedule: Sequence[float] = (0.4, 0.6, 0.8, 1.0),
     fallback_schedule: Sequence[float] = (0.5, 0.75, 1.0),
     eps_max: float = 0.92,
-    step_cap: float = 0.15,
+    step_cap: float = 0.20,
     tol: float = 5e-3,
-    soft_tol: float = 2e-2,
+    soft_tol: float = 5e-2,
     log: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[AnchorState], List[Dict[str, Any]]]:
     """Solve smooth anchor by ramping external load magnitude through lambda.
@@ -340,9 +340,11 @@ def solve_anchor_smooth(
     Lambda DOES NOT start from 0 (Section 3.2). Warm-start (X, Y, g) carried
     between stages (Section 3.4).
 
-    The default ``step_cap`` here (0.15) is intentionally larger than the
-    in-branch continuation step_cap (0.05): anchor solve has to land on
-    the branch from a moderate eps_seed and must do so in ≤ 8 NL iters.
+    Defaults reflect anchor's role as a *landing entry point* (not as a
+    production residual): step_cap=0.20 (vs 0.05 for in-branch continuation)
+    so 8 NL iters can cover the seed→target distance, soft_tol=5e-2 so a
+    landing within ~5% of the load magnitude is acceptable. Continuation
+    will then tighten the residual along φ.
 
     Returns (anchor_state_or_None, lambda_log).
     """
@@ -427,9 +429,9 @@ def solve_anchor_textured(
     geometry_factory: Optional[Callable[[float, str], Callable]] = None,
     alpha_tex_schedule: Sequence[float] = (0.33, 0.66, 1.0),
     eps_max: float = 0.92,
-    step_cap: float = 0.05,
+    step_cap: float = 0.20,
     tol: float = 5e-3,
-    soft_tol: float = 2e-2,
+    soft_tol: float = 5e-2,
     log: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Optional[AnchorState], List[Dict[str, Any]]]:
     """Solve textured anchor seeded by smooth anchor at the same phi_a.
