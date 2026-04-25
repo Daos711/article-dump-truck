@@ -123,48 +123,91 @@ def _solve_and_check(
     H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
     phi_1D, Z_1D, Phi_mesh, *, P_init=None,
     closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
+    closure_kw_retry: Optional[Dict[str, Any]] = None,
+    allow_cold_retry: bool = True,
 ):
     """Wrap solve_and_compute with SOR-warning capture + sanity check.
 
-    Returns ``(P, F, mu, Q, h_min, p_max, F_tr, ok)`` where ``ok`` is
-    False when the SOR warned non-convergence OR the sanity check
+    Returns ``(P, F, mu, Q, h_min, p_max, F_tr, ok, reason)`` where ``ok``
+    is False when the SOR warned non-convergence OR the sanity check
     rejected the magnitudes. On failure callers should reset their
     ``P_init`` warm-start to ``None`` and mark the angle as
     ``solver_failed``.
+
+    Stage Texture Stability Diesel: if the first attempt fails AND
+    ``allow_cold_retry`` is True AND ``P_init`` was non-None (i.e. we
+    were warm-starting), one cold-start retry is attempted with
+    ``P_init=None``. If ``closure_kw_retry`` is supplied it is forwarded
+    to ``solve_and_compute(closure_kw=...)`` on the retry only — the
+    intent is to plug in a more conservative SOR omega when the solver
+    API exposes one. ``reason`` carries ``retried_cold_start`` /
+    ``retried_with_kw`` annotations so the script can log retry usage.
     """
-    sor_diverged = False
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        try:
-            P, F, mu_v, Qv, hm, pm, F_tr, _, _, _ = solve_and_compute(
-                H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
-                phi_1D, Z_1D, Phi_mesh, P_init=P_init,
-                closure=closure, cavitation=cavitation,
-            )
-        except Exception as exc:
-            return (None, float("nan"), float("nan"), float("nan"),
+    def _attempt(*, p_init, closure_kw=None):
+        sor_diverged = False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                P, F, mu_v, Qv, hm, pm, F_tr, _, _, _ = solve_and_compute(
+                    H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
+                    phi_1D, Z_1D, Phi_mesh, P_init=p_init,
+                    closure=closure, cavitation=cavitation,
+                    closure_kw=closure_kw,
+                )
+            except TypeError:
+                # Older solver builds may not accept closure_kw=None.
+                P, F, mu_v, Qv, hm, pm, F_tr, _, _, _ = solve_and_compute(
+                    H, d_phi, d_Z, R_, L_, eta_eff, n_, c_,
+                    phi_1D, Z_1D, Phi_mesh, P_init=p_init,
+                    closure=closure, cavitation=cavitation,
+                )
+            except Exception as exc:
+                return (None, float("nan"), float("nan"), float("nan"),
+                        float("nan"), float("nan"), float("nan"), False,
+                        f"exception:{type(exc).__name__}:{exc}")
+            for w in caught:
+                if _SOR_WARN_FRAGMENT in str(w.message):
+                    sor_diverged = True
+                    break
+        if sor_diverged:
+            return (P, float("nan"), float("nan"), float("nan"),
                     float("nan"), float("nan"), float("nan"), False,
-                    f"exception:{type(exc).__name__}:{exc}")
-        for w in caught:
-            msg = str(w.message)
-            if _SOR_WARN_FRAGMENT in msg:
-                sor_diverged = True
-                break
+                    "SOR_did_not_converge")
+        if not _solver_result_is_sane(F, P):
+            F_repr = f"{float(F):.3e}" if np.isfinite(F) else repr(F)
+            P_repr = f"max|P|={float(np.max(np.abs(P))):.3e}"
+            return (P, float("nan"), float("nan"), float("nan"),
+                    float("nan"), float("nan"), float("nan"), False,
+                    f"non_physical:F={F_repr},{P_repr}")
+        return (P, float(F), float(mu_v), float(Qv), float(hm),
+                float(pm), float(F_tr), True, "ok")
 
-    if sor_diverged:
-        return (P, float("nan"), float("nan"), float("nan"),
-                float("nan"), float("nan"), float("nan"), False,
-                "SOR_did_not_converge")
+    res = _attempt(p_init=P_init, closure_kw=None)
+    if res[7]:
+        return res
 
-    if not _solver_result_is_sane(F, P):
-        F_repr = (f"{float(F):.3e}" if np.isfinite(F) else repr(F))
-        P_repr = f"max|P|={float(np.max(np.abs(P))):.3e}"
-        return (P, float("nan"), float("nan"), float("nan"),
-                float("nan"), float("nan"), float("nan"), False,
-                f"non_physical:F={F_repr},{P_repr}")
+    # Stage Texture Stability Diesel — conservative retry. Only retry if
+    # the first attempt was warm-started (cold start can't get worse by
+    # restarting cold). Never reuse pressure from the failed solve.
+    first_reason = res[8]
+    if not allow_cold_retry or P_init is None:
+        return res
 
-    return (P, float(F), float(mu_v), float(Qv), float(hm),
-            float(pm), float(F_tr), True, "ok")
+    res2 = _attempt(p_init=None, closure_kw=closure_kw_retry)
+    if res2[7]:
+        # Annotate the success so callers can count retries.
+        annotated = list(res2)
+        tag = "retried_cold_start"
+        if closure_kw_retry:
+            tag = "retried_with_kw"
+        annotated[8] = tag
+        return tuple(annotated)
+    # Both attempts failed. Combine reasons in the diagnostic string.
+    annotated = list(res2)
+    annotated[8] = (
+        f"first:{first_reason};retry_cold:{res2[8]}"
+    )
+    return tuple(annotated)
 
 
 def _eps_max_hydro(override: Optional[float] = None) -> float:
@@ -184,7 +227,9 @@ def _eps_max_hydro(override: Optional[float] = None) -> float:
 def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
                      oil, textured=False, phi_c=None, Z_c=None,
                      closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
-                     eps_max_hydro: Optional[float] = None):
+                     eps_max_hydro: Optional[float] = None,
+                     params_view=None,
+                     profile: str = "sqrt"):
     """Построить таблицу W(ε) для быстрой интерполяции.
 
     Reference viscosity is ``oil["eta_diesel"]``. THD path uses this same
@@ -216,16 +261,23 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
     ])
     W_table = np.full(len(eps_table), np.nan, dtype=float)
     P_prev = None
+    if params_view is None:
+        params_view = params
 
     n_failed = 0
+    n_retried = 0
     for i, eps in enumerate(eps_table):
-        H = make_H(eps, Phi_mesh, Z_mesh, params,
-                   textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
+        H = make_H(eps, Phi_mesh, Z_mesh, params_view,
+                   textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c,
+                   profile=profile)
         P, F, _, _, _, _, _, ok, reason = _solve_and_check(
             H, d_phi, d_Z, params.R, params.L, eta, params.n, params.c,
             phi_1D, Z_1D, Phi_mesh, P_init=P_prev,
             closure=closure, cavitation=cavitation,
+            allow_cold_retry=textured,  # retry only for textured
         )
+        if reason in ("retried_cold_start", "retried_with_kw"):
+            n_retried += 1
         if not ok:
             print(f"    [warn] W_table eps={eps:.3f} rejected: {reason}; "
                   f"resetting P_init")
@@ -238,12 +290,28 @@ def build_load_table(Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
 
     finite = np.isfinite(W_table)
     if finite.any():
-        print(f"    W_table: min={np.nanmin(W_table)/1000:.1f} кН, "
-              f"max={np.nanmax(W_table)/1000:.1f} кН, "
-              f"finite={int(finite.sum())}/{len(W_table)}")
+        msg = (f"    W_table: min={np.nanmin(W_table)/1000:.1f} кН, "
+               f"max={np.nanmax(W_table)/1000:.1f} кН, "
+               f"finite={int(finite.sum())}/{len(W_table)}")
+        if n_retried:
+            msg += f", cold_retry_recovered={n_retried}"
+        print(msg)
     else:
         print(f"    W_table: ALL ENTRIES FAILED ({n_failed}/{len(W_table)})")
-    return eps_table, W_table
+    # Diagnostic — non-monotone finite subset means the bracket
+    # localisation will use a sorted view (find_epsilon_for_load already
+    # sorts), but flag it so the caller can record the anomaly.
+    monotone = True
+    if finite.sum() >= 2:
+        W_finite = W_table[finite]
+        monotone = bool(np.all(np.diff(W_finite) >= 0))
+        if not monotone:
+            print(f"    [warn] W_table non-monotone after filter")
+    return eps_table, W_table, dict(
+        n_failed=int(n_failed),
+        n_retried_cold=int(n_retried),
+        monotone=monotone,
+    )
 
 
 def find_epsilon_for_load(F_target, eps_table, W_table,
@@ -251,7 +319,9 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
                           oil, textured=False, phi_c=None, Z_c=None,
                           closure=DEFAULT_CLOSURE, cavitation=DEFAULT_CAVITATION,
                           eta=None,
-                          eps_max_hydro: Optional[float] = None):
+                          eps_max_hydro: Optional[float] = None,
+                          params_view=None,
+                          profile: str = "sqrt"):
     """Найти ε для заданной нагрузки: локализация по таблице + 5 шагов бисекции.
 
     ``eta`` overrides the per-oil isothermal viscosity (Section 4 of the
@@ -282,6 +352,8 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
     eta_eff = float(eta) if eta is not None else float(eta_ref)
     F_target_ref = F_target * eta_ref / eta_eff
     eps_top = _eps_max_hydro(eps_max_hydro)
+    if params_view is None:
+        params_view = params
 
     finite_mask = np.isfinite(W_table)
     n_finite = int(finite_mask.sum())
@@ -317,14 +389,16 @@ def find_epsilon_for_load(F_target, eps_table, W_table,
         eps_mid = 0.5 * (eps_lo + eps_hi)
         # Clamp eps_mid to the hydro cap (relevant in above_range).
         eps_mid = min(eps_mid, eps_top)
-        H = make_H(eps_mid, Phi_mesh, Z_mesh, params,
-                   textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c)
+        H = make_H(eps_mid, Phi_mesh, Z_mesh, params_view,
+                   textured=textured, phi_c_flat=phi_c, Z_c_flat=Z_c,
+                   profile=profile)
         _, F_hyd, mu, Qv, h_min, p_max, F_tr, ok, reason = (
             _solve_and_check(
                 H, d_phi, d_Z, params.R, params.L, eta_eff,
                 params.n, params.c,
                 phi_1D, Z_1D, Phi_mesh,
                 closure=closure, cavitation=cavitation,
+                allow_cold_retry=textured,
             )
         )
         if not ok:
@@ -358,6 +432,8 @@ def _angle_thd_step(
     thermal: ThermalConfig,
     T_init_C: Optional[float] = None,
     eps_max_hydro: Optional[float] = None,
+    params_view=None,
+    profile: str = "sqrt",
 ):
     """Per-angle THD outer loop. Returns dict with all per-angle scalars.
 
@@ -401,6 +477,8 @@ def _angle_thd_step(
                 closure=closure, cavitation=cavitation,
                 eta=eta_eff,
                 eps_max_hydro=eps_max_hydro,
+                params_view=params_view,
+                profile=profile,
             )
         )
         if status in ("wtable_failed", "solver_failed"):
@@ -463,6 +541,26 @@ def _is_valid_fullfilm(*, status: str, F_hyd: float, F_tr: float,
     return load_match_ratio >= 0.95
 
 
+class _ParamsView:
+    """Lightweight view over ``config.diesel_params`` with selected
+    overrides — used to inject CLI-driven texture-depth / profile
+    diagnostics without touching the persistent module-level params.
+
+    The view forwards every attribute access to the underlying module
+    except the explicitly overridden ones.
+    """
+    __slots__ = ("_base", "_overrides")
+
+    def __init__(self, base, **overrides):
+        self._base = base
+        self._overrides = dict(overrides)
+
+    def __getattr__(self, name):
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._base, name)
+
+
 def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                           cavitation=DEFAULT_CAVITATION,
                           *,
@@ -472,7 +570,9 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                           n_z_grid=None,
                           configs=None,
                           F_max: Optional[float] = None,
-                          eps_max_hydro: Optional[float] = None):
+                          eps_max_hydro: Optional[float] = None,
+                          texture_h_p_m: Optional[float] = None,
+                          texture_profile: Optional[str] = None):
     """Выполнить квазистационарный расчёт ДВС для всех конфигураций.
 
     Parameters
@@ -522,8 +622,19 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
     Nz = int(n_z_grid) if n_z_grid is not None else Np
     eps_top = _eps_max_hydro(eps_max_hydro)
     F_max_used = float(F_max) if F_max is not None else float(params.F_max)
+    profile = (texture_profile or "sqrt").strip().lower()
+    if profile == "current":
+        profile = "sqrt"
+    if profile not in ("sqrt", "smoothcap"):
+        raise ValueError(f"unknown texture_profile {profile!r}")
 
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(Np, Nz)
+    # Build texture-params view if overridden so setup_texture uses the
+    # base layout (untouched) but make_H sees the new depth via H_p.
+    if texture_h_p_m is not None:
+        params_view = _ParamsView(params, h_p=float(texture_h_p_m))
+    else:
+        params_view = params
     phi_c, Z_c = setup_texture(params)
 
     F_ext = load_diesel(phi_crank, F_max=F_max_used)
@@ -553,6 +664,14 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
 
     W_table_max = np.full(n_cfg, np.nan)
     W_table_finite = np.zeros(n_cfg, dtype=bool)
+    W_table_n_failed = np.zeros(n_cfg, dtype=np.int32)
+    W_table_n_retried_cold = np.zeros(n_cfg, dtype=np.int32)
+    W_table_monotone = np.ones(n_cfg, dtype=bool)
+    n_above_arr = np.zeros(n_cfg, dtype=np.int32)
+    n_below_arr = np.zeros(n_cfg, dtype=np.int32)
+    n_solver_failed_arr = np.zeros(n_cfg, dtype=np.int32)
+    load_coverable_arr = np.full(n_cfg, n_phi, dtype=np.int32)
+    solver_success_on_coverable = np.full(n_cfg, np.nan)
 
     U = _omega_rad_s() * params.R
 
@@ -561,13 +680,18 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
 
         # Шаг 1: таблица W(ε) — построена один раз на reference η.
         print("    Построение таблицы W(ε)...")
-        eps_table, W_table = build_load_table(
+        eps_table, W_table, wtable_info = build_load_table(
             Phi_mesh, Z_mesh, phi_1D, Z_1D, d_phi, d_Z,
             oil=cfg["oil"], textured=cfg["textured"],
             phi_c=phi_c, Z_c=Z_c,
             closure=closure, cavitation=cavitation,
             eps_max_hydro=eps_top,
+            params_view=params_view,
+            profile=profile,
         )
+        W_table_n_failed[ic] = int(wtable_info.get("n_failed", 0))
+        W_table_n_retried_cold[ic] = int(wtable_info.get("n_retried_cold", 0))
+        W_table_monotone[ic] = bool(wtable_info.get("monotone", True))
         finite_mask = np.isfinite(W_table)
         n_finite = int(finite_mask.sum())
         if n_finite >= 1:
@@ -617,6 +741,8 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                         phi_c=phi_c, Z_c=Z_c,
                         closure=closure, cavitation=cavitation,
                         eps_max_hydro=eps_top,
+                        params_view=params_view,
+                        profile=profile,
                     )
                 )
                 eta_eff = float(cfg["oil"]["eta_diesel"])
@@ -644,6 +770,8 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                     thermal=thermal,
                     T_init_C=None,  # cold-start each angle, no thermal memory
                     eps_max_hydro=eps_top,
+                    params_view=params_view,
+                    profile=profile,
                 )
                 eps_mid = rec["eps"]; F_hyd = rec["F_hyd"]; mu = rec["mu"]
                 Qv = rec["Q"]; h_min = rec["h_min"]; p_max = rec["p_max"]
@@ -693,10 +821,26 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
             valid_fullfilm_arr[ic, ip] = valid
 
         n_valid = int(np.sum(valid_fullfilm_arr[ic]))
-        print(f"    Status: ok={int(np.sum(load_status_arr[ic] == 'ok'))} "
-              f"below={n_below} above={n_above} "
-              f"solver_failed={n_solver_failed}; "
-              f"valid_fullfilm={n_valid}/{n_phi}")
+        n_ok_status = int(np.sum(load_status_arr[ic] == "ok"))
+        # load-coverable = n_phi - above - below (capacity-feasible angles).
+        load_coverable = max(0, n_phi - n_above - n_below)
+        load_coverable_arr[ic] = load_coverable
+        if load_coverable > 0:
+            solver_success_on_coverable[ic] = (
+                n_ok_status / load_coverable
+            )
+        n_above_arr[ic] = n_above
+        n_below_arr[ic] = n_below
+        n_solver_failed_arr[ic] = n_solver_failed
+        succ_pct = (
+            f"{solver_success_on_coverable[ic]*100:.0f}%"
+            if load_coverable > 0 else "n/a"
+        )
+        print(f"    Status: ok={n_ok_status} below={n_below} "
+              f"above={n_above} solver_failed={n_solver_failed}; "
+              f"valid_fullfilm={n_valid}/{n_phi}; "
+              f"solver_success_on_coverable={succ_pct} "
+              f"({n_ok_status}/{load_coverable})")
         if not is_off:
             valid_mask = valid_fullfilm_arr[ic]
             if valid_mask.any():
@@ -716,11 +860,18 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
                 print(f"    [WARN] no valid_fullfilm angles for "
                       f"{cfg['label']!r} — THD metrics unavailable")
 
+    paired = _compute_paired(cfg_list, valid_fullfilm_arr,
+                              T_eff_arr, eta_eff_arr, P_loss_arr,
+                              hmin_arr, pmax_arr, eps_arr, F_tr_arr)
     return {
         "phi_crank": phi_crank,
         "F_ext": F_ext,
         "F_max_used": F_max_used,
         "eps_max_hydro": eps_top,
+        "texture_h_p_used_m": (float(texture_h_p_m)
+                                 if texture_h_p_m is not None
+                                 else float(params.h_p)),
+        "texture_profile_used": profile,
         "epsilon": eps_arr,
         "hmin": hmin_arr,
         "f": f_arr,
@@ -743,5 +894,80 @@ def run_diesel_analysis(closure=DEFAULT_CLOSURE,
         "valid_fullfilm": valid_fullfilm_arr,
         "W_table_max": W_table_max,
         "W_table_finite": W_table_finite,
+        "W_table_n_failed": W_table_n_failed,
+        "W_table_n_retried_cold": W_table_n_retried_cold,
+        "W_table_monotone": W_table_monotone,
+        "n_above_range": n_above_arr,
+        "n_below_range": n_below_arr,
+        "n_solver_failed": n_solver_failed_arr,
+        "load_coverable_count": load_coverable_arr,
+        "solver_success_on_coverable": solver_success_on_coverable,
+        "paired_comparison": paired,
         "thermal_config": thermal.to_dict(),
     }
+
+
+def _compute_paired(cfg_list, valid, T_eff, eta_eff, P_loss,
+                     hmin, pmax, eps, F_tr):
+    """Stage Texture Stability Diesel: paired smooth-vs-textured stats
+    on the **common_valid** mask only (Section 1 of the patch).
+
+    Returns a list of dicts, one per oil_key (mineral / rapeseed) for
+    which both a textured and a smooth config exist in ``cfg_list``.
+    Stats use textured - smooth (positive ΔP_loss = textured worse).
+    """
+    by_oil: Dict[str, Dict[str, int]] = {}
+    for ic, cfg in enumerate(cfg_list):
+        oil_key = (cfg.get("oil") or {}).get("name", "")
+        bucket = by_oil.setdefault(oil_key, {})
+        if cfg.get("textured"):
+            bucket["textured_idx"] = ic
+        else:
+            bucket["smooth_idx"] = ic
+    out = []
+    for oil_key, bucket in by_oil.items():
+        if "textured_idx" not in bucket or "smooth_idx" not in bucket:
+            continue
+        i_s = bucket["smooth_idx"]
+        i_t = bucket["textured_idx"]
+        common = (np.asarray(valid[i_s], dtype=bool)
+                   & np.asarray(valid[i_t], dtype=bool))
+        n_common = int(common.sum())
+        n_phi = int(common.size)
+        rec = dict(
+            oil_name=oil_key,
+            smooth_idx=i_s, smooth_label=cfg_list[i_s]["label"],
+            textured_idx=i_t, textured_label=cfg_list[i_t]["label"],
+            common_valid_count=n_common,
+            common_valid_fraction=(n_common / n_phi if n_phi else 0.0),
+            mean_dT_eff=float("nan"),
+            mean_dP_loss=float("nan"),
+            mean_deta_eff=float("nan"),
+            mean_dh_min=float("nan"),
+            min_dp_max=float("nan"),
+            max_dp_max=float("nan"),
+            mean_T_smooth=float("nan"),
+            mean_T_textured=float("nan"),
+            mean_P_loss_smooth=float("nan"),
+            mean_P_loss_textured=float("nan"),
+        )
+        if n_common > 0:
+            rec["mean_dT_eff"] = float(
+                np.mean(T_eff[i_t][common] - T_eff[i_s][common]))
+            rec["mean_dP_loss"] = float(
+                np.mean(P_loss[i_t][common] - P_loss[i_s][common]))
+            rec["mean_deta_eff"] = float(
+                np.mean(eta_eff[i_t][common] - eta_eff[i_s][common]))
+            rec["mean_dh_min"] = float(
+                np.mean(hmin[i_t][common] - hmin[i_s][common]))
+            dpmax = pmax[i_t][common] - pmax[i_s][common]
+            rec["min_dp_max"] = float(np.min(dpmax))
+            rec["max_dp_max"] = float(np.max(dpmax))
+            rec["mean_T_smooth"] = float(np.mean(T_eff[i_s][common]))
+            rec["mean_T_textured"] = float(np.mean(T_eff[i_t][common]))
+            rec["mean_P_loss_smooth"] = float(
+                np.mean(P_loss[i_s][common]))
+            rec["mean_P_loss_textured"] = float(
+                np.mean(P_loss[i_t][common]))
+        out.append(rec)
+    return out

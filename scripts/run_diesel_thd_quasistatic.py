@@ -67,10 +67,13 @@ def _select_configs(keys: Optional[List[str]]):
     return out
 
 
-def _make_run_dir(out_base: str, gamma: float) -> str:
+def _make_run_dir(out_base: str, gamma: float, *,
+                    extra_tag: str = "") -> str:
     tag = datetime.now().strftime("%y%m%d_%H%M%S")
     g_str = f"gamma{gamma:.2f}".replace(".", "p")
     name = f"{tag}_BelAZ_QS_static_{g_str}"
+    if extra_tag:
+        name += f"_{extra_tag}"
     d = os.path.join(out_base, name)
     os.makedirs(d, exist_ok=True)
     return d
@@ -212,7 +215,73 @@ def _write_summary(run_dir, results, thermal, configs, *,
         outer_arr_ic = np.asarray(results["thermal_outer"][ic])
         max_outer_hit = int(np.sum(outer_arr_ic >= thermal.max_outer))
         lines.append(f"    max_outer hit count: {max_outer_hit}")
+        # Stage Texture Stability Diesel — solver_success_on_coverable
+        # is the right acceptance metric for textured runs. valid/n_phi
+        # alone conflates physical above_range with numerical fail.
+        load_cov = int(results["load_coverable_count"][ic])
+        succ = float(results["solver_success_on_coverable"][ic])
+        succ_str = (f"{succ*100:.1f}%" if not np.isnan(succ) else "n/a")
+        ok_count = int(np.sum(np.asarray(results["load_status"][ic])
+                                == "ok"))
+        lines.append(
+            f"    load_coverable_count : {load_cov}/{n_phi}")
+        lines.append(
+            f"    solver_success_on_coverable: {succ_str} "
+            f"({ok_count}/{load_cov})")
+        # W_table diagnostics — including cold-retry recovery counter.
+        n_retry = int(results.get("W_table_n_retried_cold",
+                                     np.zeros(1))[ic])
+        n_wfail = int(results.get("W_table_n_failed",
+                                     np.zeros(1))[ic])
+        wmono = bool(results.get("W_table_monotone",
+                                    np.array([True]))[ic])
+        lines.append(
+            f"    W_table: n_failed={n_wfail}, "
+            f"cold_retry_recovered={n_retry}, monotone={wmono}")
         lines.append("")
+
+    # Paired comparison block (Section 1 of the patch).
+    lines.append("=" * 60)
+    lines.append(
+        "Paired smooth-vs-textured comparison "
+        "(common_valid mask only — same angles for both sides)"
+    )
+    lines.append("=" * 60)
+    paired = results.get("paired_comparison") or []
+    if not paired:
+        lines.append("  (no smooth/textured pair found in this run)")
+    for rec in paired:
+        ratio = (rec["common_valid_count"] / max(n_phi, 1)) * 100
+        lines.extend([
+            f"[{rec['oil_name']}]",
+            f"  smooth   : {rec['smooth_label']}",
+            f"  textured : {rec['textured_label']}",
+            f"  common_valid_count    : "
+            f"{rec['common_valid_count']}/{n_phi} ({ratio:.0f}%)",
+        ])
+        if rec["common_valid_count"] == 0:
+            lines.append("  no overlap — paired stats unavailable")
+            lines.append("")
+            continue
+        lines.extend([
+            f"  mean(T_eff)   smooth / textured : "
+            f"{rec['mean_T_smooth']:.2f} / "
+            f"{rec['mean_T_textured']:.2f}  (delta = "
+            f"{rec['mean_dT_eff']:+.2f} C)",
+            f"  mean(P_loss)  smooth / textured : "
+            f"{rec['mean_P_loss_smooth']:.1f} / "
+            f"{rec['mean_P_loss_textured']:.1f}  (delta = "
+            f"{rec['mean_dP_loss']:+.1f} W)",
+            f"  mean(d eta_eff)                 : "
+            f"{rec['mean_deta_eff']:+.4e} Pa*s",
+            f"  mean(d h_min)                   : "
+            f"{rec['mean_dh_min']*1e6:+.3f} um",
+            f"  d p_max range                   : "
+            f"[{rec['min_dp_max']/1e6:+.2f}, "
+            f"{rec['max_dp_max']/1e6:+.2f}] MPa",
+        ])
+        lines.append("")
+
     with open(os.path.join(run_dir, "summary.txt"), "w",
               encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -247,6 +316,26 @@ def _save_data(run_dir, results, thermal, grid):
         valid_fullfilm=results["valid_fullfilm"],
         W_table_max=results["W_table_max"],
         W_table_finite=results["W_table_finite"],
+        W_table_n_failed=results.get("W_table_n_failed",
+                                       np.zeros(0, dtype=np.int32)),
+        W_table_n_retried_cold=results.get(
+            "W_table_n_retried_cold", np.zeros(0, dtype=np.int32)),
+        W_table_monotone=results.get("W_table_monotone",
+                                       np.ones(0, dtype=bool)),
+        n_above_range=results.get("n_above_range",
+                                     np.zeros(0, dtype=np.int32)),
+        n_below_range=results.get("n_below_range",
+                                     np.zeros(0, dtype=np.int32)),
+        n_solver_failed=results.get("n_solver_failed",
+                                       np.zeros(0, dtype=np.int32)),
+        load_coverable_count=results.get(
+            "load_coverable_count", np.zeros(0, dtype=np.int32)),
+        solver_success_on_coverable=results.get(
+            "solver_success_on_coverable", np.zeros(0)),
+        texture_h_p_used_m=results.get("texture_h_p_used_m",
+                                         float("nan")),
+        texture_profile_used=results.get("texture_profile_used",
+                                            "sqrt"),
         thermal_mode=thermal.mode,
         gamma=thermal.gamma_mix,
         T_in_C=thermal.T_in_C,
@@ -257,12 +346,23 @@ def _save_data(run_dir, results, thermal, grid):
 
 
 def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
-    run_dir = _make_run_dir(out_base, thermal.gamma_mix)
     F_max_used = float(getattr(args, "F_max_resolved", 0.0)) or None
     F_max_source = getattr(args, "F_max_source", "")
     eps_max_hydro = getattr(args, "eps_max_hydro", None)
+    texture_h_p_m = getattr(args, "texture_h_p_m_resolved", None)
+    texture_profile = getattr(args, "texture_profile", "current")
+    extra_tag_parts = []
+    if texture_h_p_m is not None:
+        extra_tag_parts.append(f"texdepth{int(round(texture_h_p_m*1e6))}um")
+    if texture_profile not in ("current", "sqrt"):
+        extra_tag_parts.append(f"profile_{texture_profile}")
+    if getattr(args, "F_max_debug", False):
+        extra_tag_parts.append("Fmaxdebug")
+    extra_tag = "_".join(extra_tag_parts)
+    run_dir = _make_run_dir(out_base, thermal.gamma_mix,
+                              extra_tag=extra_tag)
     print("=" * 60)
-    print(f"  Stage THD-0B run -> {run_dir}")
+    print(f"  Stage Texture-Stability run -> {run_dir}")
     print(f"  mode={thermal.mode} gamma={thermal.gamma_mix:.3f} "
           f"T_in={thermal.T_in_C:.1f}°C n_crank={args.n_crank} "
           f"grid={args.n_phi_grid}x{args.n_z_grid}")
@@ -270,6 +370,10 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
         print(f"  F_max: {F_max_source}")
     if eps_max_hydro is not None:
         print(f"  eps_max_hydro override: {eps_max_hydro}")
+    if texture_h_p_m is not None:
+        print(f"  texture depth override: {texture_h_p_m*1e6:.1f} um")
+    if texture_profile not in ("current", "sqrt"):
+        print(f"  texture profile override: {texture_profile}")
     print("=" * 60)
 
     phi = np.linspace(0.0, 720.0, int(args.n_crank), endpoint=False)
@@ -283,6 +387,8 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
         configs=configs,
         F_max=F_max_used,
         eps_max_hydro=eps_max_hydro,
+        texture_h_p_m=texture_h_p_m,
+        texture_profile=texture_profile,
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -323,9 +429,40 @@ def _run_one(thermal: ThermalConfig, args, configs, out_base) -> str:
                      "pmax_vs_phi.png",
                      "Peak pressure",
                      cfg_for_plot, run_dir)
+    _plot_load_status(phi, results["load_status"], cfg_for_plot, run_dir)
 
     print(f"  done in {dt:.1f}s")
     return run_dir
+
+
+def _plot_load_status(phi, load_status, configs, run_dir):
+    """One row per config; categorical y for each angle's load_status."""
+    cats = ["wtable_failed", "solver_failed", "below_range",
+            "above_range", "ok"]
+    cat_to_y = {c: i for i, c in enumerate(cats)}
+    n_cfg = len(configs)
+    fig, ax = plt.subplots(figsize=(11, 1.2 * max(n_cfg, 1) + 1.5))
+    for ic, cfg in enumerate(configs):
+        statuses = np.asarray(load_status[ic])
+        ys = np.array([cat_to_y.get(s, len(cats)) for s in statuses])
+        ax.scatter(phi, ys + ic * (len(cats) + 1),
+                   color=cfg["color"], marker="s", s=22,
+                   label=cfg["label"])
+    ax.set_xlabel("Crank angle phi (deg)", fontsize=12)
+    yticks = []
+    yticklabels = []
+    for ic in range(n_cfg):
+        for j, c in enumerate(cats):
+            yticks.append(j + ic * (len(cats) + 1))
+            yticklabels.append(c if ic == 0 else "")
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(yticklabels, fontsize=8)
+    ax.set_title("Per-angle load_status by config", fontsize=12)
+    ax.grid(True, axis="x", alpha=0.3)
+    ax.legend(fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(os.path.join(run_dir, "valid_status_vs_phi.png"), dpi=150)
+    plt.close(fig)
 
 
 def main(argv=None):
@@ -367,6 +504,20 @@ def main(argv=None):
                     type=float, default=None,
                     help="High-eps cap for the hydrodynamic load matcher. "
                          "Default uses params.eps_max (0.95).")
+    pa.add_argument("--texture-depth-um", dest="texture_depth_um",
+                    type=float, default=None,
+                    help="Override texture pocket depth in micrometres. "
+                         "Default uses params.h_p (production geometry).")
+    pa.add_argument("--texture-depth-sweep", dest="texture_depth_sweep",
+                    default=None,
+                    help="Diagnostic sweep over texture depth in um, "
+                         "comma-separated. Spawns one run per depth.")
+    pa.add_argument("--texture-profile", dest="texture_profile",
+                    choices=["current", "sqrt", "smoothcap"],
+                    default="current",
+                    help="Texture profile shape. 'current' / 'sqrt' uses "
+                         "the historical ellipsoidal profile; "
+                         "'smoothcap' uses the (1-r^2)^2 cap shape.")
     args = pa.parse_args(argv)
 
     # Resolve F_max precedence: explicit --F-max > --F-max-debug > default;
@@ -397,19 +548,32 @@ def main(argv=None):
     else:
         gammas = [float(args.gamma)]
 
+    if args.texture_depth_sweep:
+        texture_depths_um = [float(x) for x in
+                              args.texture_depth_sweep.split(",")]
+    elif args.texture_depth_um is not None:
+        texture_depths_um = [float(args.texture_depth_um)]
+    else:
+        texture_depths_um = [None]   # use params default
+
     out_dirs = []
-    for g in gammas:
-        thermal = ThermalConfig(
-            mode=args.mode,
-            T_in_C=args.T_in,
-            gamma_mix=g,
-            cp_J_kgK=args.cp,
-            mdot_floor_kg_s=args.mdot_floor,
-            tol_T_C=args.tol_T,
-            max_outer=args.max_outer,
-            underrelax_T=args.underrelax_T,
+    for tex_depth_um in texture_depths_um:
+        args.texture_h_p_m_resolved = (
+            float(tex_depth_um) * 1e-6 if tex_depth_um is not None else None
         )
-        out_dirs.append(_run_one(thermal, args, configs, args.out_base))
+        for g in gammas:
+            thermal = ThermalConfig(
+                mode=args.mode,
+                T_in_C=args.T_in,
+                gamma_mix=g,
+                cp_J_kgK=args.cp,
+                mdot_floor_kg_s=args.mdot_floor,
+                tol_T_C=args.tol_T,
+                max_outer=args.max_outer,
+                underrelax_T=args.underrelax_T,
+            )
+            out_dirs.append(
+                _run_one(thermal, args, configs, args.out_base))
 
     print("\nFinished runs:")
     for d in out_dirs:
