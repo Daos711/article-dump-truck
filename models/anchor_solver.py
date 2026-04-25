@@ -204,12 +204,12 @@ def _local_corrector(
     X0: float, Y0: float,
     g_init: Optional[np.ndarray],
     *,
-    max_iter: int = 6,
+    max_iter: int = 8,
     hard_cap: int = 8,
     tol: float = 5e-3,
     soft_tol: float = 2e-2,
     eps_max: float = 0.92,
-    step_cap: float = 0.05,
+    step_cap: float = 0.15,
 ) -> Tuple[Dict[str, Any], Optional[np.ndarray], int]:
     """Short-budget damped Newton with LM safeguard.
 
@@ -217,7 +217,10 @@ def _local_corrector(
     (cheap PS budget). The accepted-step evaluation that updates state uses
     eval_full (anchor-stage PS budget).
 
-    Hard cap: ``hard_cap`` nonlinear iterations. No 30-iter marathon.
+    Hard cap: ``hard_cap`` = 8 NL iterations (Section 6.1 of the patch spec).
+    Default ``step_cap`` is intentionally larger here (0.15) than in the
+    in-branch continuation runner (0.05): anchor solve has to *land on the
+    branch*, often from a moderate eps_seed, in ≤ 8 iterations.
     """
     Wn = float(np.linalg.norm(Wa))
     dXY = 1e-4
@@ -264,7 +267,7 @@ def _local_corrector(
             ddX *= cap
             ddY *= cap
         ok = False
-        for alpha in (1.0, 0.5, 0.25):
+        for alpha in (1.0, 0.5, 0.25, 0.125):
             Xt = X + alpha * ddX
             Yt = Y + alpha * ddY
             if math.hypot(Xt, Yt) >= eps_max:
@@ -326,7 +329,7 @@ def solve_anchor_smooth(
     lambda_schedule: Sequence[float] = (0.4, 0.6, 0.8, 1.0),
     fallback_schedule: Sequence[float] = (0.5, 0.75, 1.0),
     eps_max: float = 0.92,
-    step_cap: float = 0.05,
+    step_cap: float = 0.15,
     tol: float = 5e-3,
     soft_tol: float = 2e-2,
     log: Optional[List[Dict[str, Any]]] = None,
@@ -337,13 +340,20 @@ def solve_anchor_smooth(
     Lambda DOES NOT start from 0 (Section 3.2). Warm-start (X, Y, g) carried
     between stages (Section 3.4).
 
+    The default ``step_cap`` here (0.15) is intentionally larger than the
+    in-branch continuation step_cap (0.05): anchor solve has to land on
+    the branch from a moderate eps_seed and must do so in ≤ 8 NL iters.
+
     Returns (anchor_state_or_None, lambda_log).
     """
     if log is None:
         log = []
     Wn = float(np.linalg.norm(Wa))
     if Y_seed is None:
-        eps_s = min(0.7, 0.4 * (Wn / 1000.0) ** 0.25)
+        # Section 3.6: cap epsilon_seed to moderate range; lambda=0.4 does
+        # not need a high-eps seed. Empirically ~0.20-0.30 lands the first
+        # lambda-stage in 3-5 NL iters at moderate loads (1-5 kN).
+        eps_s = min(0.30, 0.20 * (Wn / 1000.0) ** 0.25)
         Y_seed = -eps_s
     Wa = np.asarray(Wa, dtype=float)
 
@@ -362,7 +372,7 @@ def solve_anchor_smooth(
             t0 = time.time()
             d, g_out, nit = _local_corrector(
                 lam * Wa, eval_full, eval_trial, X, Y, g_cur,
-                max_iter=6, hard_cap=8,
+                max_iter=8, hard_cap=8,
                 tol=tol, soft_tol=soft_tol,
                 eps_max=eps_max, step_cap=step_cap,
             )
