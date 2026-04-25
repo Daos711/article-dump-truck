@@ -63,11 +63,20 @@ def setup_texture(params):
 
 
 def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
-           phi_c_flat=None, Z_c_flat=None, profile="sqrt"):
+           phi_c_flat=None, Z_c_flat=None, profile="sqrt",
+           bore_profile_fn=None):
     """Построить безразмерный зазор H (гладкий или текстурированный).
 
-    H0 = 1 + ε·cos(φ)  — гладкий профиль
+    H0 = 1 + ε·cos(φ) + ΔH_bore(φ)   — гладкий профиль
     profile : "sqrt" (эллипсоид) или "smoothcap" ((1-r²)²)
+
+    Parameters
+    ----------
+    bore_profile_fn : callable(phi_rad) → ΔH_bore or None
+        При None поведение бит-в-бит совпадает с цилиндрическим
+        base-case (используется контракт T1 из coexp_v1 test suite).
+        Функция вызывается на Phi_mesh и добавляется до регуляризации
+        шероховатости и до наложения текстуры.
 
     Угловая конвенция (проверено 2026-04):
         H_min при φ = π (180°),  H_max при φ = 0.
@@ -77,6 +86,8 @@ def make_H(epsilon, Phi_mesh, Z_mesh, params, textured=False,
         Текстуру для повышения W размещать в дивергентной зоне (180°–360°).
     """
     H0 = 1.0 + epsilon * np.cos(Phi_mesh)
+    if bore_profile_fn is not None:
+        H0 = H0 + bore_profile_fn(Phi_mesh)
     H0 = np.sqrt(H0**2 + (params.sigma / params.c)**2)  # регуляризация шероховатости
     if not textured:
         return H0

@@ -1,8 +1,20 @@
 #!/usr/bin/env python3
 """Textured vs smooth сравнение с магнитной разгрузкой.
 
-Только на accepted targets из smooth run. Использует тот же shared
-driver (models/magnetic_equilibrium) — идентичный NR и acceptance.
+Работает ИСКЛЮЧИТЕЛЬНО с accepted smooth-точками из manifest.json
+(schema magnetic_v4). Smooth solve повторно НЕ запускается — это было
+главной ошибкой прошлой версии (разные smooth states при сравнении).
+
+Pipeline (см. ТЗ §3.3, §3.6):
+    load manifest.json
+    accepted = manifest["smooth_accepted"]
+    for sref in accepted:
+        K_mag := sref["K_mag"]
+        X0_tex, Y0_tex := sref["X"], sref["Y"]
+        rt := find_equilibrium(textured, ... tol_accept from manifest)
+        store pair = {smooth_ref: sref (byte-identical copy),
+                      textured: rt,
+                      accepted: is_accepted(rt, tol_accept)}
 """
 import sys
 import os
@@ -10,6 +22,7 @@ import csv
 import json
 import time
 import argparse
+import copy
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -25,15 +38,15 @@ from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 
 from models.magnetic_force import (
     RadialUnloadForceModel, sanity_checks,
-    calibrate_Kmag_from_baseline_projection,
 )
-from models.magnetic_equilibrium import find_equilibrium
+from models.magnetic_equilibrium import (
+    find_equilibrium, is_accepted, result_to_dict,
+)
 from config import pump_params as params
 from config.oil_properties import MINERAL_OIL
 
 # ─── Config ──────────────────────────────────────────────────────
-N_PHI = 800
-N_Z = 200
+SCHEMA_VERSION = "magnetic_v4"
 ETA = MINERAL_OIL["eta_pump"]
 OMEGA = 2 * np.pi * params.n / 60.0
 P_SCALE = 6 * ETA * OMEGA * (params.R / params.c) ** 2
@@ -92,19 +105,19 @@ def setup_texture(Phi, Zm):
     return pg.ravel(), zg.ravel(), a_phi, a_Z, depth
 
 
-def make_H_and_force_factory(Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
-                              textured=False, tex=None):
-    """Замыкание: build_H(X,Y) [+ texture] + PS solve + metrics."""
+def make_H_and_force_textured(Phi, Zm, phi_1D, Z_1D, d_phi, d_Z, tex):
+    """Замыкание: build_H(X,Y) + texture + PS solve + metrics.
+
+    Namespaced "textured only" — чтобы compare точно не умел решать
+    smooth случай. Это инвариант (см. ТЗ §3.3).
+    """
 
     def H_and_force(X, Y):
         H0 = make_smooth_H0(X, Y, Phi)
-        if textured and tex is not None:
-            H = create_H_with_ellipsoidal_depressions(
-                H0, tex["depth"], Phi, Zm,
-                tex["phi_c"], tex["Z_c"],
-                tex["a_Z"], tex["a_phi"], profile=TEX_PROFILE)
-        else:
-            H = H0
+        H = create_H_with_ellipsoidal_depressions(
+            H0, tex["depth"], Phi, Zm,
+            tex["phi_c"], tex["Z_c"],
+            tex["a_Z"], tex["a_phi"], profile=TEX_PROFILE)
         P, theta, _, _ = _ps_solver(
             H, d_phi, d_Z, params.R, params.L,
             tol=1e-6, max_iter=10_000_000)
@@ -129,168 +142,176 @@ def make_H_and_force_factory(Phi, Zm, phi_1D, Z_1D, d_phi, d_Z,
     return H_and_force
 
 
-def result_to_dict(r, case=""):
-    d = dict(
-        case=case,
-        X=r.X, Y=r.Y, eps=r.eps, attitude_deg=r.attitude_deg,
-        Fx_hydro=r.Fx_hydro, Fy_hydro=r.Fy_hydro,
-        Fx_mag=r.Fx_mag, Fy_mag=r.Fy_mag,
-        h_min=r.h_min, p_max=r.p_max, cav_frac=r.cav_frac,
-        friction=r.friction,
-        rel_residual=r.rel_residual, n_iter=r.n_iter,
-        converged=bool(r.converged),
-        unload_share_target=r.unload_share_target,
-        unload_share_actual=r.unload_share_actual,
-        hydro_share_actual=r.hydro_share_actual,
-        K_mag=r.K_mag,
-    )
-    return d
+def resolve_manifest(args):
+    """Локализация manifest.json: explicit --manifest > --run-id > latest."""
+    base = os.path.join(os.path.dirname(__file__), "..",
+                        "results", "magnetic_pump")
+    if args.manifest:
+        return os.path.abspath(args.manifest)
+    if args.run_id:
+        return os.path.join(base, args.run_id, "manifest.json")
+    latest = os.path.join(base, "latest_run.txt")
+    if os.path.exists(latest):
+        with open(latest, "r", encoding="utf-8") as f:
+            run_id = f.read().strip()
+        return os.path.join(base, run_id, "manifest.json")
+    return None
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-phi", type=int, default=N_PHI)
-    parser.add_argument("--n-z", type=int, default=N_Z)
+    parser.add_argument("--manifest", type=str, default=None,
+                        help="path to manifest.json")
+    parser.add_argument("--run-id", type=str, default=None,
+                        help="run_id under results/magnetic_pump/")
     args = parser.parse_args()
 
-    out_dir = os.path.join(os.path.dirname(__file__), "..",
-                           "results", "magnetic_pump")
-    # Загрузить smooth summary
-    smooth_json = os.path.join(out_dir, "mag_smooth_summary.json")
-    if not os.path.exists(smooth_json):
-        print(f"Сначала запусти run_mag_smooth_continuation.py "
-              f"(нет {smooth_json})")
+    manifest_path = resolve_manifest(args)
+    if manifest_path is None or not os.path.exists(manifest_path):
+        print("Нет manifest.json. Запусти run_mag_smooth_continuation.py "
+              "или передай --manifest / --run-id.")
         sys.exit(1)
-    with open(smooth_json, "r", encoding="utf-8") as f:
-        sm = json.load(f)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    # Schema check (ТЗ §3.4): несовпадение — FAIL, а не silent downgrade.
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        print(f"FAIL: manifest schema_version="
+              f"{manifest.get('schema_version')!r}, "
+              f"expected {SCHEMA_VERSION!r}. Перегенерируй smooth run.")
+        sys.exit(1)
+
+    run_dir = os.path.dirname(manifest_path)
+    run_id = manifest["run_id"]
+    cfg = manifest["config"]
+    tol_accept = float(cfg["tol_accept"])
+    step_cap = float(cfg["step_cap"])
+    eps_max = float(cfg["eps_max"])
+    N_phi = int(cfg["N_phi"])
+    N_Z = int(cfg["N_Z"])
+    W_applied = np.array(cfg["W_applied_N"], dtype=float)
+
+    accepted_smooth = manifest["smooth_accepted"]
+    if not accepted_smooth:
+        print("В manifest нет smooth_accepted точек")
+        sys.exit(1)
+
+    print(f"Manifest: {manifest_path}")
+    print(f"Run ID: {run_id}")
+    print(f"tol_accept={tol_accept}, step_cap={step_cap}, eps_max={eps_max}")
 
     ok, _ = sanity_checks(verbose=True)
     if not ok:
         print("FAIL sanity")
         sys.exit(1)
 
-    # Accepted smooth points
-    accepted = sm["continuation"]
-    if not accepted:
-        print("В smooth нет accepted targets")
-        sys.exit(1)
-
-    W_applied = np.array(sm["config"]["W_applied_N"])
-    baseline_X = sm["baseline"]["X"]
-    baseline_Y = sm["baseline"]["Y"]
-
     print("\n" + "=" * 72)
-    print("TEXTURED vs SMOOTH + MAGNETIC UNLOAD (accepted targets only)")
-    acc_str = ", ".join(f"{r['unload_share_target']*100:.1f}%"
-                         for r in accepted)
-    print(f"Accepted: [{acc_str}]")
+    print("TEXTURED vs SMOOTH + MAGNETIC UNLOAD (accepted smooth only)")
+    acc_str = ", ".join(f"{s['unload_share_target']*100:.1f}%"
+                         for s in accepted_smooth)
+    print(f"Accepted targets: [{acc_str}]")
     print("=" * 72)
 
-    phi, Z, Phi, Zm, dp, dz = make_grid(args.n_phi, args.n_z)
+    phi, Z, Phi, Zm, dp, dz = make_grid(N_phi, N_Z)
     phi_c, Z_c, a_phi, a_Z, depth = setup_texture(Phi, Zm)
-    n_dimples = len(phi_c)
+    n_dimples = int(len(phi_c))
     tex = dict(phi_c=phi_c, Z_c=Z_c, a_phi=a_phi, a_Z=a_Z, depth=depth)
     print(f"Texture: {n_dimples} лунок, zone "
           f"{TEX_PHI_START}-{TEX_PHI_END}°")
 
-    H_and_force_smooth = make_H_and_force_factory(
-        Phi, Zm, phi, Z, dp, dz, textured=False)
-    H_and_force_tex = make_H_and_force_factory(
-        Phi, Zm, phi, Z, dp, dz, textured=True, tex=tex)
+    H_and_force_tex = make_H_and_force_textured(
+        Phi, Zm, phi, Z, dp, dz, tex)
 
-    results = []  # list of dict
-    X_prev_s, Y_prev_s = baseline_X, baseline_Y
-    X_prev_t, Y_prev_t = baseline_X, baseline_Y
+    # Одна textured-template модель, которую мы клонируем с K_mag из smooth.
+    mag_template = RadialUnloadForceModel(
+        n_mag=3, H_reg=0.05, H_floor=0.02)
 
-    for sm_entry in accepted:
-        target = sm_entry["unload_share_target"]
-        # Калибровка K_mag на baseline (smooth)
-        if target == 0.0:
-            m_smooth = RadialUnloadForceModel(K_mag=0.0)
-            m_tex = RadialUnloadForceModel(K_mag=0.0)
-        else:
-            template = RadialUnloadForceModel(
-                n_mag=3, H_reg=0.05, H_floor=0.02)
-            m_smooth = calibrate_Kmag_from_baseline_projection(
-                template, baseline_X, baseline_Y, W_applied, target)
-            m_tex = calibrate_Kmag_from_baseline_projection(
-                template, baseline_X, baseline_Y, W_applied, target)
+    # Fallback seed: предыдущий accepted textured (см. ТЗ §3.6 optional).
+    prev_tex_X, prev_tex_Y = None, None
 
-        # Smooth solve (для consistency, хотя уже есть в JSON)
+    pairs = []
+    for sref in accepted_smooth:
+        target = float(sref["unload_share_target"])
+        K_mag = float(sref["K_mag"])
+        X0_tex = float(sref["X"])
+        Y0_tex = float(sref["Y"])
+
+        m_tex = copy.copy(mag_template)
+        m_tex.scale = K_mag
+
+        # First try: seed = smooth accepted point (ТЗ §3.6 required).
         t0 = time.time()
-        rs = find_equilibrium(
-            H_and_force_smooth, m_smooth, W_applied,
-            X0=X_prev_s, Y0=Y_prev_s,
-            tol=1e-3, step_cap=0.10, eps_max=0.90)
-        dt_s = time.time() - t0
-        rs.unload_share_target = target
+        rt = find_equilibrium(
+            H_and_force_tex, m_tex, W_applied,
+            X0=X0_tex, Y0=Y0_tex,
+            tol=tol_accept, step_cap=step_cap, eps_max=eps_max,
+            tol_accept=tol_accept)
+        rt.unload_share_target = target
 
-        # Textured solve только если smooth сошёлся
-        if rs.converged and rs.rel_residual < 1e-3:
-            t0 = time.time()
-            rt = find_equilibrium(
-                H_and_force_tex, m_tex, W_applied,
-                X0=X_prev_t, Y0=Y_prev_t,
-                tol=1e-3, step_cap=0.10, eps_max=0.90)
-            dt_t = time.time() - t0
-            rt.unload_share_target = target
-            accepted_flag = (rt.converged and rt.rel_residual < 1e-3)
-            X_prev_s, Y_prev_s = rs.X, rs.Y
-            if accepted_flag:
-                X_prev_t, Y_prev_t = rt.X, rt.Y
-        else:
-            rt = None
-            accepted_flag = False
-            dt_t = 0.0
+        # Optional fallback: previous accepted textured seed.
+        if not is_accepted(rt, tol_accept) and prev_tex_X is not None:
+            m_tex2 = copy.copy(mag_template)
+            m_tex2.scale = K_mag
+            rt_fb = find_equilibrium(
+                H_and_force_tex, m_tex2, W_applied,
+                X0=prev_tex_X, Y0=prev_tex_Y,
+                tol=tol_accept, step_cap=step_cap, eps_max=eps_max,
+                tol_accept=tol_accept)
+            rt_fb.unload_share_target = target
+            if is_accepted(rt_fb, tol_accept):
+                rt = rt_fb
 
-        ds = result_to_dict(rs, "smooth")
-        dt_d = result_to_dict(rt, "textured") if rt is not None else None
+        dt_t = time.time() - t0
+        accepted_flag = is_accepted(rt, tol_accept)
+        if accepted_flag:
+            prev_tex_X, prev_tex_Y = rt.X, rt.Y
 
-        hr = rt.h_min / max(rs.h_min, 1e-12) if rt else None
-        pr = rt.p_max / max(rs.p_max, 1e-12) if rt else None
-        fr_r = rt.friction / max(rs.friction, 1e-12) if rt else None
-        dcav = rt.cav_frac - rs.cav_frac if rt else None
-        deps = rt.eps - rs.eps if rt else None
+        # Ratios (smooth_ref берётся как reference — НЕ пересчитывается).
+        hr = rt.h_min / max(sref["h_min"], 1e-12)
+        pr = rt.p_max / max(sref["p_max"], 1e-12)
+        fr_r = rt.friction / max(sref["friction"], 1e-12)
+        dcav = rt.cav_frac - sref["cav_frac"]
+        deps = rt.eps - sref["eps"]
 
         print(f"  target={target*100:5.2f}%: "
-              f"smooth ε={rs.eps:.4f} (res={rs.rel_residual:.1e}), "
-              f"{'tex ε=' + f'{rt.eps:.4f}' if rt else 'tex SKIPPED'} "
-              f"({dt_s+dt_t:.1f}с) "
+              f"smooth_ref ε={sref['eps']:.4f}, "
+              f"tex ε={rt.eps:.4f} (res={rt.rel_residual:.1e}), "
+              f"K_mag={K_mag:.3e}, "
+              f"{dt_t:.1f}с "
               f"{'✓' if accepted_flag else '✗'}")
-        if rt:
-            print(f"    h_t/h_s={hr:.4f}, p_t/p_s={pr:.4f}, "
-                  f"fr_t/fr_s={fr_r:.4f}, Δcav={dcav:+.4f}, "
-                  f"Δε={deps:+.4f}")
+        print(f"    h_t/h_s={hr:.4f}, p_t/p_s={pr:.4f}, "
+              f"fr_t/fr_s={fr_r:.4f}, Δcav={dcav:+.4f}, "
+              f"Δε={deps:+.4f}")
 
-        results.append(dict(
+        # smooth_ref — бит-в-бит копия accepted-entry из manifest.
+        pairs.append(dict(
             unload_share_target=target,
-            smooth=ds,
-            textured=dt_d,
+            smooth_ref=copy.deepcopy(sref),
+            textured=result_to_dict(rt),
+            accepted=bool(accepted_flag),
             ratios=dict(
-                h_ratio=float(hr) if hr is not None else None,
-                p_ratio=float(pr) if pr is not None else None,
-                f_ratio=float(fr_r) if fr_r is not None else None,
-                delta_cav=float(dcav) if dcav is not None else None,
-                delta_eps=float(deps) if deps is not None else None,
+                h_ratio=float(hr),
+                p_ratio=float(pr),
+                f_ratio=float(fr_r),
+                delta_cav=float(dcav),
+                delta_eps=float(deps),
             ),
-            accepted=accepted_flag,
         ))
 
-    # CSV: flatten
-    csv_path = os.path.join(out_dir, "mag_textured_equilibrium.csv")
+    # ── CSV dump ──────────────────────────────────────────────────
+    csv_path = os.path.join(run_dir, "mag_textured_equilibrium.csv")
     rows = []
-    for r in results:
-        base = dict(unload_share_target=r["unload_share_target"],
-                     accepted=r["accepted"])
-        if r["smooth"]:
-            for k, v in r["smooth"].items():
-                base[f"s_{k}"] = v
-        if r["textured"]:
-            for k, v in r["textured"].items():
-                base[f"t_{k}"] = v
-        for k, v in r["ratios"].items():
-            base[k] = v if v is not None else ""
-        rows.append(base)
+    for p in pairs:
+        row = dict(unload_share_target=p["unload_share_target"],
+                   accepted=p["accepted"])
+        for k, v in p["smooth_ref"].items():
+            row[f"s_{k}"] = v
+        if p["textured"]:
+            for k, v in p["textured"].items():
+                row[f"t_{k}"] = v
+        for k, v in p["ratios"].items():
+            row[k] = v if v is not None else ""
+        rows.append(row)
     fieldnames = sorted({k for row in rows for k in row.keys()})
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -300,21 +321,33 @@ def main():
                         for k, v in row.items()})
     print(f"\nCSV: {csv_path}")
 
-    json_path = os.path.join(out_dir, "mag_textured_summary.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "config": {
-                "N_phi": args.n_phi, "N_Z": args.n_z,
-                "W_applied_N": [float(w_) for w_ in W_applied],
-                "texture": dict(
-                    zone_deg=[TEX_PHI_START, TEX_PHI_END],
-                    a_mm=TEX_A_MM, b_mm=TEX_B_MM,
-                    hp_um=TEX_HP_UM, sf=TEX_SF, profile=TEX_PROFILE,
-                    n_dimples=int(n_dimples)),
-            },
-            "pairs": results,
-        }, f, indent=2, ensure_ascii=False)
-    print(f"JSON: {json_path}")
+    # ── textured_compare.json ─────────────────────────────────────
+    out = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": run_id,
+        "source_manifest": os.path.abspath(manifest_path),
+        "config_ref": {
+            "tol_accept": tol_accept,
+            "step_cap": step_cap,
+            "eps_max": eps_max,
+            "N_phi": N_phi,
+            "N_Z": N_Z,
+            "W_applied_N": [float(w_) for w_ in W_applied],
+        },
+        "texture": dict(
+            zone_deg=[TEX_PHI_START, TEX_PHI_END],
+            a_mm=TEX_A_MM, b_mm=TEX_B_MM,
+            hp_um=TEX_HP_UM, sf=TEX_SF, profile=TEX_PROFILE,
+            n_dimples=n_dimples),
+        "pairs": pairs,
+    }
+    out_json = os.path.join(run_dir, "textured_compare.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f"JSON: {out_json}")
+
+    accepted_count = sum(1 for p in pairs if p["accepted"])
+    print(f"\nAccepted textured pairs: {accepted_count}/{len(pairs)}")
 
 
 if __name__ == "__main__":

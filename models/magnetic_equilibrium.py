@@ -47,6 +47,75 @@ class EquilibriumResult:
     unload_share_actual: float = 0.0
     hydro_share_actual: float = 0.0
     K_mag: float = 0.0
+    status: str = "failed"
+
+
+# ─── Acceptance helpers (single source of truth) ────────────────────
+#
+# converged=True один НЕ означает accepted. Accepted определяется только
+# через is_accepted(..., tol_accept). Эти helpers обязаны использоваться
+# во всех scripts (smooth continuation, textured compare, plot/report).
+# Никаких локальных hardcode-порогов (`< 1e-3` здесь, `< 5e-3` там).
+
+
+def is_accepted(result, tol_accept):
+    """Единый acceptance-критерий для всех downstream-скриптов.
+
+    Parameters
+    ----------
+    result : EquilibriumResult or None
+    tol_accept : float
+        Absolute relative-residual threshold. Точка accepted если
+        converged=True и rel_residual < tol_accept.
+    """
+    if result is None:
+        return False
+    return bool(result.converged and result.rel_residual < float(tol_accept))
+
+
+def result_status(result, tol_accept):
+    """Classify equilibrium result into {accepted, soft_converged, failed}.
+
+    * "accepted"       — is_accepted(...) == True
+    * "soft_converged" — converged=True but rel_residual >= tol_accept
+                         (например, stagnation fallback)
+    * "failed"         — всё остальное (нет сходимости, или result is None)
+    """
+    if result is None:
+        return "failed"
+    if is_accepted(result, tol_accept):
+        return "accepted"
+    if bool(result.converged):
+        return "soft_converged"
+    return "failed"
+
+
+def result_to_dict(result):
+    """Serializable-dict репрезентация EquilibriumResult.
+
+    Используется одинаково в smooth-continuation manifest и в textured
+    compare JSON — гарантирует, что smooth_ref в compare бит-в-бит
+    совпадает с accepted smooth entry.
+    """
+    if result is None:
+        return None
+    return dict(
+        X=float(result.X), Y=float(result.Y),
+        eps=float(result.eps),
+        attitude_deg=float(result.attitude_deg),
+        Fx_hydro=float(result.Fx_hydro), Fy_hydro=float(result.Fy_hydro),
+        Fx_mag=float(result.Fx_mag), Fy_mag=float(result.Fy_mag),
+        h_min=float(result.h_min), p_max=float(result.p_max),
+        cav_frac=float(result.cav_frac), friction=float(result.friction),
+        rel_residual=float(result.rel_residual),
+        n_iter=int(result.n_iter),
+        converged=bool(result.converged),
+        unload_share_target=float(result.unload_share_target),
+        unload_share_actual=float(result.unload_share_actual),
+        hydro_share_actual=float(result.hydro_share_actual),
+        K_mag=float(result.K_mag),
+        status=str(result.status),
+    )
 
 
 def _line_search(X, Y, dX, dY, mag_model, W_applied,
@@ -90,7 +159,8 @@ def _line_search(X, Y, dX, dY, mag_model, W_applied,
 def find_equilibrium(H_and_force, mag_model, W_applied,
                       X0=0.0, Y0=-0.4,
                       max_iter=80, tol=1e-4,
-                      step_cap=0.10, eps_max=0.90):
+                      step_cap=0.10, eps_max=0.90,
+                      tol_accept=None):
     """Newton-Raphson 2D с line search.
 
     Parameters
@@ -100,6 +170,12 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
         Пользовательская функция (делает make_H + PS solve + metrics).
     mag_model : BaseMagneticForceModel
     W_applied : np.ndarray shape (2,)
+    tol : float
+        Target residual tolerance for NR inner loop.
+    tol_accept : float or None
+        Acceptance threshold used to populate result.status. Если None —
+        используется tol (backward-compatible). Никаких hardcode-порогов
+        в downstream-скриптах; передавайте manifest[config][tol_accept].
 
     Returns
     -------
@@ -182,6 +258,8 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
             stall_count = 0
         rel_R_prev = rel_R
 
+    tol_accept_eff = float(tol if tol_accept is None else tol_accept)
+
     eps = float(np.sqrt(X**2 + Y**2))
     attitude = float(np.rad2deg(np.arctan2(Y, X)))
     e_resist = -W_applied / max(Wa_norm, 1e-20)
@@ -201,7 +279,7 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
     unload = float((Fx_m * e_resist[0] + Fy_m * e_resist[1]) / max(Wa_norm, 1e-20))
     hydro_share = float(-(Fx_h * e_resist[0] + Fy_h * e_resist[1]) / max(Wa_norm, 1e-20))
 
-    return EquilibriumResult(
+    result = EquilibriumResult(
         X=float(X), Y=float(Y), eps=eps, attitude_deg=attitude,
         Fx_hydro=float(Fx_h), Fy_hydro=float(Fy_h),
         Fx_mag=float(Fx_m), Fy_mag=float(Fy_m),
@@ -213,6 +291,8 @@ def find_equilibrium(H_and_force, mag_model, W_applied,
         hydro_share_actual=hydro_share,
         K_mag=float(mag_model.scale),
     )
+    result.status = result_status(result, tol_accept_eff)
+    return result
 
 
 def run_continuation(targets, baseline_X, baseline_Y, W_applied,
@@ -220,18 +300,29 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
                       X0_seed=None, Y0_seed=None,
                       min_substep=0.01, tol=1e-3,
                       step_cap=0.10, eps_max=0.90,
+                      tol_accept=None,
                       verbose=True):
     """Continuation по списку unload_share_target.
 
     Правила:
-      * continuation seed — последняя успешно сошедшаяся точка
-      * если target не сходится до rel_residual<tol, substeps по
-        середине между prev_target и target, пока шаг >= min_substep
+      * continuation seed — последняя accepted точка
+      * если target не проходит acceptance (rel_residual < tol_accept),
+        substeps по середине между prev_target и target, пока шаг
+        >= min_substep
       * при failure — вернуть список с accepted меткой False для
         оставшихся targets, continuation прекращается.
 
+    Parameters
+    ----------
+    tol_accept : float or None
+        Единый acceptance threshold (is_accepted). Если None — берётся
+        равным tol. Этот параметр определяет, попадёт ли точка в
+        accepted-список, и пробрасывается в find_equilibrium, чтобы
+        result.status формировался согласованно.
+
     Returns: list of (target, EquilibriumResult, accepted_bool)
     """
+    tol_accept_eff = float(tol if tol_accept is None else tol_accept)
     out = []
     X_seed = X0_seed if X0_seed is not None else baseline_X
     Y_seed = Y0_seed if Y0_seed is not None else baseline_Y
@@ -248,8 +339,10 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
                 W_applied, tg)
         r = find_equilibrium(H_and_force, m, W_applied,
                               X0=X_start, Y0=Y_start,
-                              tol=tol, step_cap=step_cap, eps_max=eps_max)
+                              tol=tol, step_cap=step_cap, eps_max=eps_max,
+                              tol_accept=tol_accept_eff)
         r.unload_share_target = float(tg)
+        r.status = result_status(r, tol_accept_eff)
         return r, m
 
     accept_chain_broken = False
@@ -262,7 +355,7 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
 
         r, m_used = solve_at_target(target, X_seed, Y_seed)
 
-        if r.converged and r.rel_residual < tol:
+        if is_accepted(r, tol_accept_eff):
             out.append((target, r, True))
             X_seed, Y_seed = r.X, r.Y
             prev_target = target
@@ -275,7 +368,7 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
                       f"hydro={r.hydro_share_actual:+.4f}")
             continue
 
-        # Не сошёлся → substep refinement
+        # Не accepted → substep refinement
         if verbose:
             print(f"  target={target*100:5.2f}%: ✗ "
                   f"(ε={r.eps:.4f}, res={r.rel_residual:.1e}) → substeps")
@@ -289,7 +382,7 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
             mid = 0.5 * (sub_lo + sub_hi)
             r_mid, _ = solve_at_target(mid, X_seed, Y_seed)
             n_subs += 1
-            if r_mid.converged and r_mid.rel_residual < tol:
+            if is_accepted(r_mid, tol_accept_eff):
                 if verbose:
                     print(f"    sub {mid*100:5.2f}%: ✓ ε={r_mid.eps:.4f}, "
                           f"res={r_mid.rel_residual:.1e}")
@@ -297,7 +390,7 @@ def run_continuation(targets, baseline_X, baseline_Y, W_applied,
                 X_seed, Y_seed = r_mid.X, r_mid.Y
                 # Попробовать target с нового seed
                 r_try, _ = solve_at_target(target, X_seed, Y_seed)
-                if r_try.converged and r_try.rel_residual < tol:
+                if is_accepted(r_try, tol_accept_eff):
                     out.append((target, r_try, True))
                     X_seed, Y_seed = r_try.X, r_try.Y
                     prev_target = target
