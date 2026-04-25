@@ -20,6 +20,7 @@ THD outer loop is owned by ``models/diesel_quasistatic.run_diesel_analysis``
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -138,6 +139,7 @@ def build_oil_walther(
 
     # Try the modern OilModel signature first; fall back kwarg-by-kwarg
     # if the installed solver is older / takes a narrower signature.
+    fit: Any = None
     last_err: Optional[Exception] = None
     for trial in (
         {**base, **extras},
@@ -145,11 +147,38 @@ def build_oil_walther(
         base,
     ):
         try:
-            return _fit_walther_two_point(**trial)
+            fit = _fit_walther_two_point(**trial)
+            break
         except TypeError as e:
             last_err = e
             continue
-    raise last_err  # type: ignore[misc]
+    if fit is None:
+        raise last_err  # type: ignore[misc]
+
+    # The solver's ``fit_walther_two_point`` may silently drop kwargs
+    # it doesn't accept and populate the returned OilModel with its
+    # built-in defaults (e.g. rho_kg_m3=860). That makes the
+    # mu_at_T_C(105) == eta_diesel round-trip drift by exactly
+    # rho_default / oil["rho"]. Override the populated dataclass fields
+    # so the OilModel matches the actual oil dictionary.
+    overrides: Dict[str, Any] = {}
+    for fld_name, value in (("rho_kg_m3", rho),
+                              ("alpha_pv_base", alpha_pv),
+                              ("cp_J_kgK", cp_J_kgK),
+                              ("gamma_mix", gamma_mix)):
+        if value is None:
+            continue
+        if dataclasses.is_dataclass(fit) and hasattr(fit, fld_name):
+            current = getattr(fit, fld_name)
+            if abs(float(current) - float(value)) > 1e-12:
+                overrides[fld_name] = float(value)
+    if overrides and dataclasses.is_dataclass(fit):
+        try:
+            fit = dataclasses.replace(fit, **overrides)
+        except (TypeError, ValueError):
+            # Frozen-replace failed (e.g. unknown field) — leave as-is.
+            pass
+    return fit
 
 
 def viscosity_at_T_C(walther_fit: Any, T_C: float) -> float:
