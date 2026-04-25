@@ -62,9 +62,10 @@ def pack_g(P, theta):
     return np.ascontiguousarray(g, dtype=np.float64)
 
 
-def _ps(H, dp, dz, phi_bc, g_init=None, d_mask=None, g_bc=None):
-    kw = dict(tol=1e-6, max_iter=3_000_000,
-              hs_warmup_iter=200_000, hs_warmup_tol=1e-5,
+def _ps(H, dp, dz, phi_bc, g_init=None, d_mask=None, g_bc=None,
+        max_iter=50_000, hs_warmup_iter=20_000):
+    kw = dict(tol=1e-5, max_iter=max_iter,
+              hs_warmup_iter=hs_warmup_iter, hs_warmup_tol=1e-5,
               phi_bc=phi_bc)
     if g_init is not None:
         kw["g_init"] = g_init
