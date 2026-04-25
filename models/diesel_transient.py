@@ -580,8 +580,11 @@ def run_transient(F_max=None, debug=False,
                 P_prev = P
 
                 Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
-                Fx_ext = float(Fx_ext)
-                Fy_ext = float(Fy_ext)
+                # load_diesel always returns (1,)-shape arrays for a
+                # scalar phi; ``.item()`` extracts the scalar without
+                # the np.float(array) DeprecationWarning.
+                Fx_ext = float(np.asarray(Fx_ext).item())
+                Fy_ext = float(np.asarray(Fy_ext).item())
                 ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
                 ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
                 vx_corr = vx_n + 0.5 * (ax_prev + ax_new) * dt_step

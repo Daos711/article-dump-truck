@@ -293,7 +293,10 @@ def test_transient_does_not_use_quasistatic_load_matcher():
     """Section 16 red line: transient THD must not import or use the
     quasistatic load-matching machinery."""
     import models.diesel_transient as dt
-    src = open(dt.__file__).read()
+    # Force utf-8 — Windows defaults to cp1251 which can't decode the
+    # cyrillic comments in this module.
+    with open(dt.__file__, encoding="utf-8") as f:
+        src = f.read()
     assert "build_load_table" not in src
     assert "find_epsilon_for_load" not in src
     assert "_eps_max_hydro" not in src
