@@ -155,17 +155,113 @@ ENVELOPE_THRESHOLDS = dict(
 )
 
 
+def _angle_weighted_zero_record() -> Dict[str, float]:
+    """Empty record used when no completed steps are available."""
+    nan = float("nan")
+    return dict(
+        cycle_angle_deg=0.0,
+        valid_no_clamp_angle_deg=0.0,
+        valid_no_clamp_angle_frac=nan,
+        contact_angle_deg=0.0,
+        contact_angle_frac=nan,
+        firing_angle_deg=0.0,
+        valid_no_clamp_angle_firing_deg=0.0,
+        valid_no_clamp_angle_firing_frac=nan,
+        contact_angle_firing_deg=0.0,
+        contact_angle_firing_frac=nan,
+    )
+
+
+def compute_angle_weighted_envelope(
+    *,
+    dphi: np.ndarray,
+    valid_no_clamp: np.ndarray,
+    contact_clamp: np.ndarray,
+    valid_dynamic: np.ndarray,
+    solver_success: np.ndarray,
+    phi_mod: np.ndarray,
+    n_completed: int,
+    firing_sector_deg: Tuple[float, float],
+    last_cycle_mask: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Stage Diesel Transient AngleWeighted Metrics.
+
+    Re-weight envelope statistics by the per-step angular increment
+    Δφ so adaptive temporal grids (d_phi_peak ≪ d_phi_base near
+    firing) do not over-represent clamp incidence in the firing
+    sector. Existing count-based fields are kept verbatim — this
+    helper layers angle-weighted fractions on top.
+
+    Arrays are indexed [0:n_completed]; ``last_cycle_mask`` (bool)
+    is intersected when supplied so callers can request last-cycle
+    only statistics. ``firing_sector_deg`` is closed-interval
+    [lo, hi] inclusive on phi_mod (= phi_crank_deg % 720).
+    """
+    if n_completed <= 0:
+        return _angle_weighted_zero_record()
+    n = int(n_completed)
+    dphi_n = np.asarray(dphi[:n], dtype=float)
+    vnc_n = np.asarray(valid_no_clamp[:n], dtype=bool)
+    cc_n = np.asarray(contact_clamp[:n], dtype=bool)
+    phi_n = np.asarray(phi_mod[:n], dtype=float)
+    if last_cycle_mask is not None:
+        keep = np.asarray(last_cycle_mask[:n], dtype=bool)
+        dphi_n = dphi_n[keep]
+        vnc_n = vnc_n[keep]
+        cc_n = cc_n[keep]
+        phi_n = phi_n[keep]
+    cycle_angle = float(np.sum(dphi_n))
+    vnc_angle = float(np.sum(dphi_n * vnc_n))
+    cc_angle = float(np.sum(dphi_n * cc_n))
+    lo, hi = float(firing_sector_deg[0]), float(firing_sector_deg[1])
+    firing = (phi_n >= lo) & (phi_n <= hi)
+    firing_angle = float(np.sum(dphi_n[firing]))
+    vnc_firing = float(np.sum(dphi_n[firing] * vnc_n[firing]))
+    cc_firing = float(np.sum(dphi_n[firing] * cc_n[firing]))
+
+    def _safe_div(num: float, den: float) -> float:
+        return (num / den) if den > 0 else float("nan")
+
+    return dict(
+        cycle_angle_deg=cycle_angle,
+        valid_no_clamp_angle_deg=vnc_angle,
+        valid_no_clamp_angle_frac=_safe_div(vnc_angle, cycle_angle),
+        contact_angle_deg=cc_angle,
+        contact_angle_frac=_safe_div(cc_angle, cycle_angle),
+        firing_angle_deg=firing_angle,
+        valid_no_clamp_angle_firing_deg=vnc_firing,
+        valid_no_clamp_angle_firing_frac=_safe_div(vnc_firing,
+                                                       firing_angle),
+        contact_angle_firing_deg=cc_firing,
+        contact_angle_firing_frac=_safe_div(cc_firing, firing_angle),
+    )
+
+
 def classify_envelope_per_config(*,
                                     n_completed: int,
                                     solver_success_count: int,
                                     valid_dynamic_count: int,
                                     valid_no_clamp_count: int,
                                     retry_exhausted_count: int,
-                                    aborted: bool) -> Tuple[bool, str]:
+                                    aborted: bool,
+                                    angle_weighted_full: Optional[
+                                        Dict[str, float]] = None,
+                                    use_angle_weighted: bool = True,
+                                    ) -> Tuple[bool, str]:
     """Per-config applicable gate.
 
     Returns ``(applicable, reason)`` where ``reason`` is "ok" on
     success or a human-readable failure string.
+
+    Stage Diesel Transient AngleWeighted Metrics — when
+    ``use_angle_weighted`` is True (default) and
+    ``angle_weighted_full`` is supplied, the
+    ``valid_no_clamp_frac_min`` gate is evaluated on the angle-
+    weighted fraction (Δφ-weighted) instead of the count-based one.
+    Solver-success and valid-dynamic gates remain count-based — the
+    abort policy is unchanged. Setting ``use_angle_weighted=False``
+    restores the legacy purely count-based contract for callers
+    that still want the old behaviour.
     """
     if aborted:
         return False, "aborted_outside_envelope"
@@ -173,7 +269,6 @@ def classify_envelope_per_config(*,
         return False, "no_steps_completed"
     sf = float(solver_success_count) / float(n_completed)
     vd = float(valid_dynamic_count) / float(n_completed)
-    vnc = float(valid_no_clamp_count) / float(n_completed)
     th = ENVELOPE_THRESHOLDS
     if sf < th["solver_success_frac_min"]:
         return False, (
@@ -183,9 +278,20 @@ def classify_envelope_per_config(*,
         return False, (
             f"valid_dynamic_frac={vd:.2f} < "
             f"{th['valid_dynamic_frac_min']:.2f}")
-    if vnc < th["valid_no_clamp_frac_min"]:
+    use_angle = bool(use_angle_weighted) and (
+        angle_weighted_full is not None)
+    if use_angle:
+        vnc_frac = float(angle_weighted_full.get(
+            "valid_no_clamp_angle_frac", float("nan")))
+        vnc_label = "valid_no_clamp_angle_frac"
+    else:
+        vnc_frac = float(valid_no_clamp_count) / float(n_completed)
+        vnc_label = "valid_no_clamp_frac"
+    if not np.isfinite(vnc_frac):
+        return False, f"{vnc_label}_unknown"
+    if vnc_frac < th["valid_no_clamp_frac_min"]:
         return False, (
-            f"valid_no_clamp_frac={vnc:.2f} < "
+            f"{vnc_label}={vnc_frac:.2f} < "
             f"{th['valid_no_clamp_frac_min']:.2f}")
     if retry_exhausted_count > 0:
         return False, f"retry_exhausted={retry_exhausted_count} > 0"
@@ -1062,6 +1168,13 @@ def run_transient(F_max=None, debug=False,
     # the only source for envelope abort fractions.
     contact_clamp_event_count_all = np.zeros((n_cfg, n_steps),
                                                 dtype=np.int32)
+    # Stage Diesel Transient AngleWeighted Metrics — per-step angular
+    # increment (deg) and crank position (mod 720°) so envelope and
+    # firing-sector statistics can be re-weighted by Δφ on the
+    # adaptive temporal grid (count-based fractions over-state clamp
+    # share when d_phi_peak << d_phi_base).
+    d_phi_per_step_all = np.zeros((n_cfg, n_steps), dtype=float)
+    phi_mod_per_step_all = np.zeros((n_cfg, n_steps), dtype=float)
     retry_used_all = np.zeros((n_cfg, n_steps), dtype=bool)
     retry_omega_used_all = np.zeros((n_cfg, n_steps), dtype=float)
     cfg_times: List[float] = []
@@ -1126,13 +1239,16 @@ def run_transient(F_max=None, debug=False,
 
         for step in range(n_steps):
             phi_deg = phi_crank_deg[step] % 720.0
-            dt_step = np.deg2rad(get_step_deg(
+            d_phi_step_deg = float(get_step_deg(
                 phi_crank_deg[step],
                 d_phi_base_deg=d_phi_base_deg,
                 d_phi_peak_deg=d_phi_peak_deg,
                 peak_lo_deg=peak_lo_deg,
                 peak_hi_deg=peak_hi_deg,
-            )) / omega
+            ))
+            dt_step = np.deg2rad(d_phi_step_deg) / omega
+            d_phi_per_step_all[ic, step] = d_phi_step_deg
+            phi_mod_per_step_all[ic, step] = float(phi_deg)
 
             # Per-step thermal: η fixed for the whole Verlet substep.
             T_used_C = float(T_state_C if not is_off else thermal.T_in_C)
@@ -1529,6 +1645,12 @@ def run_transient(F_max=None, debug=False,
     )
 
     # Per-config envelope classification (Section 3 of the patch).
+    # Stage Diesel Transient AngleWeighted Metrics — also build the
+    # angle-weighted envelope dicts (full / last-cycle) so the
+    # applicable gate can be evaluated on Δφ-weighted fractions, and
+    # surface them in the results for the summary writer.
+    angle_weighted_full_per_cfg: List[Dict[str, float]] = []
+    angle_weighted_last_per_cfg: List[Dict[str, float]] = []
     for ic in range(n_cfg):
         n_completed = int(steps_completed_arr[ic])
         # Solver_success / valid counts use the COMPLETED steps only —
@@ -1541,6 +1663,36 @@ def run_transient(F_max=None, debug=False,
             vnc_count = int(np.sum(valid_no_clamp_all[ic, sl]))
         else:
             ss_count = vd_count = vnc_count = 0
+        # Build the full-run + last-cycle angle-weighted statistics.
+        full_aw = compute_angle_weighted_envelope(
+            dphi=d_phi_per_step_all[ic, :],
+            valid_no_clamp=valid_no_clamp_all[ic, :],
+            contact_clamp=contact_clamp_all[ic, :],
+            valid_dynamic=valid_dynamic_all[ic, :],
+            solver_success=solver_success_all[ic, :],
+            phi_mod=phi_mod_per_step_all[ic, :],
+            n_completed=n_completed,
+            firing_sector_deg=firing_sector_deg,
+            last_cycle_mask=None,
+        )
+        if n_completed > 0:
+            last_mask_full = np.zeros(n_steps, dtype=bool)
+            last_mask_full[last_start:n_completed] = True
+        else:
+            last_mask_full = np.zeros(n_steps, dtype=bool)
+        last_aw = compute_angle_weighted_envelope(
+            dphi=d_phi_per_step_all[ic, :],
+            valid_no_clamp=valid_no_clamp_all[ic, :],
+            contact_clamp=contact_clamp_all[ic, :],
+            valid_dynamic=valid_dynamic_all[ic, :],
+            solver_success=solver_success_all[ic, :],
+            phi_mod=phi_mod_per_step_all[ic, :],
+            n_completed=n_completed,
+            firing_sector_deg=firing_sector_deg,
+            last_cycle_mask=last_mask_full,
+        )
+        angle_weighted_full_per_cfg.append(full_aw)
+        angle_weighted_last_per_cfg.append(last_aw)
         ok, reason = classify_envelope_per_config(
             n_completed=n_completed,
             solver_success_count=ss_count,
@@ -1548,6 +1700,8 @@ def run_transient(F_max=None, debug=False,
             valid_no_clamp_count=vnc_count,
             retry_exhausted_count=int(retry_exhausted_count[ic]),
             aborted=bool(aborted_arr[ic]),
+            angle_weighted_full=full_aw,
+            use_angle_weighted=True,
         )
         applicable_arr[ic] = ok
         applicable_reason_arr[ic] = reason
@@ -1617,6 +1771,11 @@ def run_transient(F_max=None, debug=False,
         "steps_completed": steps_completed_arr,
         "applicable": applicable_arr,
         "applicable_reason": applicable_reason_arr,
+        # Stage Diesel Transient AngleWeighted Metrics.
+        "d_phi_per_step": d_phi_per_step_all,
+        "phi_mod_per_step": phi_mod_per_step_all,
+        "angle_weighted_full": angle_weighted_full_per_cfg,
+        "angle_weighted_last_cycle": angle_weighted_last_per_cfg,
         # Stage Diesel Transient PeakWindow GridDiagnostic.
         "peak_lo_deg": float(peak_lo_deg),
         "peak_hi_deg": float(peak_hi_deg),

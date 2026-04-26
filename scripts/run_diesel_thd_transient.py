@@ -303,6 +303,19 @@ def _save_data(run_dir, results, thermal, retry_cfg):
         contact_clamp_event_count=results.get(
             "contact_clamp_event_count",
             np.zeros_like(results["contact_clamp"], dtype=np.int32)),
+        # Stage Diesel Transient AngleWeighted Metrics — per-step
+        # angular increment + crank position, plus the angle-
+        # weighted dicts (object arrays) for regenerate-summary.
+        d_phi_per_step=results.get(
+            "d_phi_per_step",
+            np.zeros_like(results["contact_clamp"], dtype=float)),
+        phi_mod_per_step=results.get(
+            "phi_mod_per_step",
+            np.zeros_like(results["contact_clamp"], dtype=float)),
+        angle_weighted_full=np.array(
+            results.get("angle_weighted_full", []), dtype=object),
+        angle_weighted_last_cycle=np.array(
+            results.get("angle_weighted_last_cycle", []), dtype=object),
         retry_used=results["retry_used"],
         retry_omega_used=results["retry_omega_used"],
         contact_clamp_count=results["contact_clamp_count"],
@@ -348,6 +361,9 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         header = "Stage Diesel Transient THD-0 run — PRODUCTION RESULT"
     elif global_status == "aborted_outside_envelope":
         header = "Stage Diesel Transient THD-0 run — ABORTED OUTSIDE ENVELOPE"
+    elif global_status == "completed_boundary_limited_result":
+        header = ("Stage Diesel Transient THD-0 run — "
+                   "COMPLETED BOUNDARY-LIMITED RESULT")
     else:
         header = "Stage Diesel Transient THD-0 run — PARTIAL PRODUCTION RESULT"
     # Stage Diesel Transient PeakWindow GridDiagnostic — prefer per-
@@ -430,12 +446,46 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                 "This is a load-envelope diagnostic, not a THD result.",
                 "",
             ])
+    elif global_status == "completed_boundary_limited_result":
+        # Stage Diesel Transient AngleWeighted Metrics — every config
+        # ran to completion but every config sits outside the
+        # applicability gate (firing-sector clamp saturation).
+        lines.extend([
+            "Global status: completed_boundary_limited_result",
+            "",
+            "Per-config:",
+        ])
+        for ic, cfg in enumerate(cfgs):
+            vnc = np.asarray(
+                results["valid_no_clamp"][ic, sl], dtype=bool)
+            frac = (float(vnc.sum()) / float(n_steps_last)
+                     if n_steps_last > 0 else float("nan"))
+            tag = per_config_status_line(env_records[ic], frac)
+            lines.append(f"  {cfg['label']:<32}  {tag}")
+        lines.extend([
+            "",
+            "Interpretation:",
+            "  All configurations completed the full transient cycle, "
+            "but every",
+            "  configuration is outside the full-film applicability "
+            "gate. The firing",
+            "  sector contains a boundary-limited regime where epsilon "
+            "reaches the",
+            "  clamp cap and h_min approaches the clamp floor. This is "
+            "reported as a",
+            "  boundary-limited diagnostic, not as a clean full-film "
+            "paired comparison.",
+            "  Texture mitigation in the firing peak is not separable "
+            "from clamp",
+            "  saturation.",
+            "",
+        ])
     elif global_status == "partial_production_result":
         # Mixed: some configs full, some aborted. Report per-config
         # status + an interpretation note so the downstream reader
         # doesn't conflate the two regimes (Section 2 of the patch).
         lines.extend([
-            "Global status: partial_outside_envelope",
+            "Global status: partial_production_result",
             "",
             "Per-config:",
         ])
@@ -553,6 +603,72 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             f"    status              : {status}",
             f"    abort_reason        : {abort_reason or '-'}",
             f"    steps_completed     : {n_completed}/{n_attempted}",
+        ])
+        # Stage Diesel Transient AngleWeighted Metrics — print both
+        # count-based (legacy diagnostic) and angle-weighted (the
+        # gate now keys on these) statistics so the reader sees both
+        # views and can locate the count-vs-angle delta directly.
+        vnc_count_last_frac = (float(valid_noc.sum()) / float(n_steps_last)
+                                if n_steps_last > 0 else float("nan"))
+        cc_count_last_frac = (float(contact.sum()) / float(n_steps_last)
+                               if n_steps_last > 0 else float("nan"))
+        lines.extend([
+            "    count-based (legacy diagnostic, last cycle):",
+            f"      valid_no_clamp_count_frac : "
+            f"{vnc_count_last_frac:.3f} "
+            f"({int(valid_noc.sum())}/{n_steps_last})",
+            f"      contact_clamp_count_frac  : "
+            f"{cc_count_last_frac:.3f} "
+            f"({int(contact.sum())}/{n_steps_last})",
+        ])
+        aw_full_list = results.get("angle_weighted_full") or []
+        aw_last_list = results.get("angle_weighted_last_cycle") or []
+        aw_full = aw_full_list[ic] if ic < len(aw_full_list) else {}
+        aw_last = aw_last_list[ic] if ic < len(aw_last_list) else {}
+        if aw_full:
+            lines.extend([
+                "    angle-weighted (full run):",
+                f"      cycle_angle_deg              : "
+                f"{aw_full.get('cycle_angle_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_deg     : "
+                f"{aw_full.get('valid_no_clamp_angle_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_frac    : "
+                f"{aw_full.get('valid_no_clamp_angle_frac', float('nan')):.3f}",
+                f"      contact_angle_deg            : "
+                f"{aw_full.get('contact_angle_deg', float('nan')):.2f}",
+                f"      contact_angle_frac           : "
+                f"{aw_full.get('contact_angle_frac', float('nan')):.3f}",
+            ])
+        if aw_last:
+            lines.extend([
+                "    angle-weighted (last cycle):",
+                f"      cycle_angle_deg              : "
+                f"{aw_last.get('cycle_angle_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_deg     : "
+                f"{aw_last.get('valid_no_clamp_angle_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_frac    : "
+                f"{aw_last.get('valid_no_clamp_angle_frac', float('nan')):.3f}",
+                f"      contact_angle_deg            : "
+                f"{aw_last.get('contact_angle_deg', float('nan')):.2f}",
+                f"      contact_angle_frac           : "
+                f"{aw_last.get('contact_angle_frac', float('nan')):.3f}",
+            ])
+            fs = results.get("firing_sector_deg", (340.0, 480.0))
+            lines.extend([
+                f"    angle-weighted (firing sector "
+                f"{fs[0]:.1f}-{fs[1]:.1f}°, last cycle):",
+                f"      firing_angle_deg               : "
+                f"{aw_last.get('firing_angle_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_firing_deg: "
+                f"{aw_last.get('valid_no_clamp_angle_firing_deg', float('nan')):.2f}",
+                f"      valid_no_clamp_angle_frac      : "
+                f"{aw_last.get('valid_no_clamp_angle_firing_frac', float('nan')):.3f}",
+                f"      contact_angle_firing_deg       : "
+                f"{aw_last.get('contact_angle_firing_deg', float('nan')):.2f}",
+                f"      contact_angle_frac             : "
+                f"{aw_last.get('contact_angle_firing_frac', float('nan')):.3f}",
+            ])
+        lines.extend([
             f"    first_clamp_phi     : "
             f"{first_clamp if np.isfinite(first_clamp) else float('nan'):.1f} deg",
             f"    first_invalid_phi   : "
@@ -565,10 +681,24 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     # Paired comparison block.
     paired = results.get("paired_comparison") or []
     lines.append("=" * 60)
-    lines.append(
-        "Paired smooth-vs-textured comparison "
-        "(common_valid_no_clamp mask only — same time steps both sides)"
-    )
+    if global_status == "completed_boundary_limited_result":
+        # Stage Diesel Transient AngleWeighted Metrics — when every
+        # config is outside the applicability gate, the smooth-vs-
+        # textured numbers below are conditional diagnostics, not a
+        # clean full-film paired comparison. Make this explicit in
+        # the block header so downstream readers don't conflate the
+        # regimes.
+        lines.append(
+            "Conditional paired diagnostics "
+            "(common_valid_no_clamp mask only — same time steps both "
+            "sides; boundary-limited regime, not clean full-film "
+            "comparison)"
+        )
+    else:
+        lines.append(
+            "Paired smooth-vs-textured comparison "
+            "(common_valid_no_clamp mask only — same time steps both sides)"
+        )
     lines.append("=" * 60)
     if not paired:
         lines.append("  (no smooth/textured pair found in this run)")
@@ -940,6 +1070,14 @@ def _regenerate_summary_from_dir(run_dir: str) -> None:
         valid_no_clamp=_arr("valid_no_clamp"),
         contact_clamp=_arr("contact_clamp"),
         contact_clamp_event_count=_arr("contact_clamp_event_count"),
+        d_phi_per_step=_arr("d_phi_per_step"),
+        phi_mod_per_step=_arr("phi_mod_per_step"),
+        angle_weighted_full=(
+            list(_arr("angle_weighted_full", []))
+            if _arr("angle_weighted_full") is not None else []),
+        angle_weighted_last_cycle=(
+            list(_arr("angle_weighted_last_cycle", []))
+            if _arr("angle_weighted_last_cycle") is not None else []),
         retry_used=_arr("retry_used"),
         retry_omega_used=_arr("retry_omega_used"),
         contact_clamp_count=_arr("contact_clamp_count"),
@@ -997,47 +1135,52 @@ def _regenerate_summary_from_dir(run_dir: str) -> None:
 
 
 def classify_global_status(envelope_records) -> str:
-    """Stage Transient Summary Wording Fix + Stage Diesel Transient
-    ClampAccounting Fix.
+    """Stage Transient Summary Wording Fix + ClampAccounting Fix +
+    Stage Diesel Transient AngleWeighted Metrics.
 
     ``envelope_records``: list of per-config dicts with at least a
     ``status`` and ``applicable`` field. Returns one of:
 
-      * ``production_result``         — every config applicable=True
-      * ``aborted_outside_envelope``  — every config aborted
-      * ``partial_production_result`` — any other mixture (incl. a
-        config that ran to completion but failed the applicability
-        gate, e.g. valid_no_clamp_frac < 0.85)
-
-    The previous implementation keyed only on ``status`` so a config
-    that completed all steps but tripped the applicability gate
-    (status=="ok", applicable=False) was misclassified as part of a
-    production_result header — this fix uses ``applicable`` so the
-    header agrees with the per-config envelope block.
+      * ``production_result``                — every config applicable=True
+      * ``aborted_outside_envelope``         — every config aborted
+      * ``completed_boundary_limited_result`` — every config ran to
+        completion but every config is outside the applicability gate
+        (e.g. valid_no_clamp_angle_frac < 0.85). Distinguishes the
+        boundary-limited regime from a clean production_result so
+        the header does not over-promise.
+      * ``partial_production_result``        — any other mixture
+        (some applicable, some aborted/outside)
     """
     if not envelope_records:
         return "production_result"
     n_total = len(envelope_records)
 
+    def _aborted(rec) -> bool:
+        return (str(rec.get("status", "unknown"))
+                == "aborted_outside_envelope")
+
     def _applicable(rec) -> bool:
         # An aborted config is never applicable, regardless of any
-        # ``applicable`` field the caller may have left over from a
-        # legacy record.
-        if str(rec.get("status", "unknown")) == "aborted_outside_envelope":
+        # ``applicable`` field the caller may have left over.
+        if _aborted(rec):
             return False
         # Otherwise default to True for backward-compat with legacy
         # records that only carry ``status``.
         return bool(rec.get("applicable", True))
 
+    def _completed_outside_gate(rec) -> bool:
+        return (not _aborted(rec)) and (not _applicable(rec))
+
     n_applicable = sum(1 for rec in envelope_records if _applicable(rec))
-    n_aborted = sum(
-        1 for rec in envelope_records
-        if str(rec.get("status", "unknown")) == "aborted_outside_envelope"
-    )
+    n_aborted = sum(1 for rec in envelope_records if _aborted(rec))
+    n_completed_outside = sum(
+        1 for rec in envelope_records if _completed_outside_gate(rec))
     if n_applicable == n_total:
         return "production_result"
     if n_aborted == n_total:
         return "aborted_outside_envelope"
+    if n_completed_outside == n_total:
+        return "completed_boundary_limited_result"
     return "partial_production_result"
 
 
