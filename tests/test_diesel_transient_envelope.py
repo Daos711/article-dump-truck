@@ -308,6 +308,57 @@ def test_save_partial_on_abort_writes_partial_file(tmp_path):
     assert "data.npz" not in files
 
 
+# ─── 5. Stage Transient Summary Wording Fix ────────────────────────
+
+
+def test_global_status_all_ok_is_production_result():
+    from scripts.run_diesel_thd_transient import classify_global_status
+    recs = [{"status": "ok"}, {"status": "ok"}, {"status": "ok"}]
+    assert classify_global_status(recs) == "production_result"
+
+
+def test_global_status_all_aborted_is_aborted():
+    from scripts.run_diesel_thd_transient import classify_global_status
+    recs = [{"status": "aborted_outside_envelope"},
+            {"status": "aborted_outside_envelope"}]
+    assert classify_global_status(recs) == "aborted_outside_envelope"
+
+
+def test_global_status_mixed_is_partial():
+    from scripts.run_diesel_thd_transient import classify_global_status
+    recs = [
+        {"status": "ok"},
+        {"status": "aborted_outside_envelope"},
+        {"status": "ok"},
+        {"status": "ok"},
+    ]
+    assert classify_global_status(recs) == "partial_production_result"
+
+
+def test_per_config_status_line_full_applicable():
+    from scripts.run_diesel_thd_transient import per_config_status_line
+    rec = {"status": "ok"}
+    assert per_config_status_line(rec, 1.0) == "full / applicable"
+    assert per_config_status_line(rec, 0.96) == "full / applicable"
+
+
+def test_per_config_status_line_near_edge():
+    from scripts.run_diesel_thd_transient import per_config_status_line
+    rec = {"status": "ok"}
+    assert per_config_status_line(rec, 0.83) \
+        == "full / near-edge applicable"
+    assert per_config_status_line(rec, 0.94) \
+        == "full / near-edge applicable"
+
+
+def test_per_config_status_line_aborted_overrides_frac():
+    from scripts.run_diesel_thd_transient import per_config_status_line
+    rec = {"status": "aborted_outside_envelope"}
+    # Even with frac=1.0 the aborted status wins.
+    assert per_config_status_line(rec, 1.0) \
+        == "aborted_outside_envelope"
+
+
 def test_sweep_handles_aborted_scale_cleanly():
     """Sweep loop must not stop after an aborted scale — the next
     config / next scale runs anyway. We simulate by running two

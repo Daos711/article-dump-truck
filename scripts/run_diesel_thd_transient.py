@@ -322,7 +322,10 @@ def _save_data(run_dir, results, thermal, retry_cfg):
         tau_th_s=thermal.tau_th_s,
         T_in_C=thermal.T_in_C,
         cp_J_kgK=thermal.cp_J_kgK,
+        mdot_floor_kg_s=thermal.mdot_floor_kg_s,
         labels=[c["label"] for c in results["configs"]],
+        textured_flags=[bool(c.get("textured", False))
+                         for c in results["configs"]],
     )
 
 
@@ -334,10 +337,14 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     sl = _last_cycle_slice(results)
     n_steps_last = int(results["n_steps_per_cycle"])
     cfgs = results["configs"]
-    any_aborted = bool(np.any(np.asarray(results.get("aborted", False))))
-    header = "Stage Diesel Transient THD-0 BelAZ run"
-    if any_aborted:
+    env_records = _build_envelope_records_from_results(results)
+    global_status = classify_global_status(env_records)
+    if global_status == "production_result":
+        header = "Stage Diesel Transient THD-0 run — PRODUCTION RESULT"
+    elif global_status == "aborted_outside_envelope":
         header = "Stage Diesel Transient THD-0 run — ABORTED OUTSIDE ENVELOPE"
+    else:
+        header = "Stage Diesel Transient THD-0 run — PARTIAL PRODUCTION RESULT"
     lines = [
         header,
         f"  thermal mode    : {thermal.mode}",
@@ -364,10 +371,8 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     ]
     lines = [ln for ln in lines if ln != ""] + [""]
 
-    if any_aborted:
-        # Make the condition unambiguous in the summary header for any
-        # downstream reader: this run is a load-envelope diagnostic,
-        # not a THD result.
+    if global_status == "aborted_outside_envelope":
+        # All configs aborted — the legacy diagnostic header.
         first_aborted = next(
             (ic for ic, c in enumerate(cfgs)
              if bool(results["aborted"][ic])), None)
@@ -380,6 +385,52 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                 "This is a load-envelope diagnostic, not a THD result.",
                 "",
             ])
+    elif global_status == "partial_production_result":
+        # Mixed: some configs full, some aborted. Report per-config
+        # status + an interpretation note so the downstream reader
+        # doesn't conflate the two regimes (Section 2 of the patch).
+        lines.extend([
+            "Global status: partial_outside_envelope",
+            "",
+            "Per-config:",
+        ])
+        for ic, cfg in enumerate(cfgs):
+            vnc = np.asarray(
+                results["valid_no_clamp"][ic, sl], dtype=bool)
+            frac = (float(vnc.sum()) / float(n_steps_last)
+                     if n_steps_last > 0 else float("nan"))
+            tag = per_config_status_line(env_records[ic], frac)
+            lines.append(f"  {cfg['label']:<32}  {tag}")
+        lines.extend([
+            "",
+            "Interpretation:",
+            "  Some configurations completed the full transient cycle "
+            "and support",
+            "  paired smooth-vs-textured comparison. Other "
+            "configurations exited",
+            "  the full-film transient envelope and are reported as "
+            "failure-boundary",
+            "  diagnostics rather than paired metrics.",
+            f"  All-config paired comparison is unavailable at "
+            f"F={float(results['F_max'])/1e3:.1f} kN.",
+            "",
+        ])
+    else:
+        # production_result: everyone OK. List per-config status so
+        # the reader sees the near-edge band visibly.
+        lines.extend([
+            "Global status: production_result",
+            "",
+            "Per-config:",
+        ])
+        for ic, cfg in enumerate(cfgs):
+            vnc = np.asarray(
+                results["valid_no_clamp"][ic, sl], dtype=bool)
+            frac = (float(vnc.sum()) / float(n_steps_last)
+                     if n_steps_last > 0 else float("nan"))
+            tag = per_config_status_line(env_records[ic], frac)
+            lines.append(f"  {cfg['label']:<32}  {tag}")
+        lines.append("")
 
     for ic, cfg in enumerate(cfgs):
         valid_dyn = np.asarray(results["valid_dynamic"][ic, sl], dtype=bool)
@@ -756,6 +807,194 @@ def _write_envelope_csv(sweep_root: str,
             w.writerow({k: r.get(k, "") for k in _ENVELOPE_CSV_COLUMNS})
 
 
+def _regenerate_summary_from_dir(run_dir: str) -> None:
+    """Rewrite summary.txt from an existing data.npz / data_partial.npz
+    in ``run_dir``. Does NOT recompute physics or touch the npz file.
+
+    Used by ``--regenerate-summary`` to refresh wording (e.g. after a
+    summary writer change like Stage Transient Summary Wording Fix)
+    without re-running the solver.
+    """
+    if not os.path.isdir(run_dir):
+        raise SystemExit(f"--regenerate-summary: directory not found: "
+                          f"{run_dir!r}")
+    npz_full = os.path.join(run_dir, "data.npz")
+    npz_part = os.path.join(run_dir, "data_partial.npz")
+    if os.path.isfile(npz_full):
+        npz_path = npz_full
+    elif os.path.isfile(npz_part):
+        npz_path = npz_part
+    else:
+        raise SystemExit(
+            f"--regenerate-summary: no data.npz or data_partial.npz "
+            f"found in {run_dir!r}")
+    with np.load(npz_path, allow_pickle=True) as d:
+        data = {k: d[k] for k in d.files}
+    labels = list(data.get("labels", []))
+    textured_flags = list(data.get("textured_flags",
+                                       [False] * len(labels)))
+    # Rebuild a thin configs list — only label / textured / oil-name
+    # are needed by the summary writer + classifier; oil dict is
+    # only used for paired_extended which already lives in npz when
+    # present (we don't recompute it).
+    cfgs = []
+    for ic, lbl in enumerate(labels):
+        textured = bool(textured_flags[ic]
+                          if ic < len(textured_flags) else False)
+        # Heuristic oil name: derive from label substring so paired
+        # smooth-vs-textured grouping still works for legacy npz.
+        oil_name = ("rapeseed" if "рапс" in str(lbl).lower()
+                                  or "rapeseed" in str(lbl).lower()
+                                  else "mineral")
+        cfgs.append({
+            "label": str(lbl), "textured": textured,
+            "color": "blue" if not textured else "red",
+            "ls": "-" if not textured else "--",
+            "oil": {"name": oil_name},
+        })
+
+    # Reconstruct a results dict that _write_summary can consume.
+    # Per-step arrays live in npz directly.
+    def _arr(name, default=None):
+        if name in data:
+            return data[name]
+        return default
+
+    results = dict(
+        configs=cfgs,
+        phi_crank_deg=_arr("phi_crank_deg"),
+        phi_last=_arr("phi_last"),
+        last_start=int(np.asarray(_arr("last_start", 0)).item()),
+        n_steps_per_cycle=int(
+            np.asarray(_arr("n_steps_per_cycle", 0)).item()),
+        eps_x=_arr("eps_x"), eps_y=_arr("eps_y"),
+        hmin=_arr("hmin"), pmax=_arr("pmax"),
+        f=_arr("f"), F_tr=_arr("F_tr"),
+        N_loss=_arr("N_loss"),
+        T_eff_used=_arr("T_eff_used"), T_eff=_arr("T_eff"),
+        T_target=_arr("T_target"),
+        eta_eff=_arr("eta_eff"),
+        P_loss=_arr("P_loss"), Q=_arr("Q"), mdot=_arr("mdot"),
+        mdot_floor_hit=_arr("mdot_floor_hit"),
+        solver_success=_arr("solver_success"),
+        valid_dynamic=_arr("valid_dynamic"),
+        valid_no_clamp=_arr("valid_no_clamp"),
+        contact_clamp=_arr("contact_clamp"),
+        retry_used=_arr("retry_used"),
+        retry_omega_used=_arr("retry_omega_used"),
+        contact_clamp_count=_arr("contact_clamp_count"),
+        solver_failed_count=_arr("solver_failed_count"),
+        retry_recovered_count=_arr("retry_recovered_count"),
+        retry_exhausted_count=_arr("retry_exhausted_count"),
+        thermal_cycle_delta=_arr("thermal_cycle_delta"),
+        thermal_periodic_converged=_arr("thermal_periodic_converged"),
+        aborted=_arr("aborted"),
+        abort_reason=_arr("abort_reason"),
+        first_clamp_phi=_arr("first_clamp_phi"),
+        first_solver_failed_phi=_arr("first_solver_failed_phi"),
+        first_invalid_phi=_arr("first_invalid_phi"),
+        steps_attempted=_arr("steps_attempted"),
+        steps_completed=_arr("steps_completed"),
+        applicable=_arr("applicable"),
+        applicable_reason=_arr("applicable_reason"),
+        F_max=float(np.asarray(_arr("F_max", 0.0)).item()),
+        # Production metrics + paired_extended are not stored in
+        # legacy npz; if absent, the writer skips those blocks.
+        production_metrics=[],
+        paired_extended=[],
+        paired_comparison=[],
+        firing_sector_deg=(340.0, 480.0),
+        envelope_abort_config={"save_partial_on_abort": True},
+    )
+
+    # Reconstruct minimal thermal + retry stubs.
+    from models.thermal_coupling import ThermalConfig
+    from models.diesel_quasistatic import SolverRetryConfig
+    thermal = ThermalConfig(
+        mode=str(np.asarray(_arr("thermal_mode", "global_relax")).item()),
+        T_in_C=float(np.asarray(_arr("T_in_C", 105.0)).item()),
+        gamma_mix=float(np.asarray(_arr("gamma", 0.7)).item()),
+        cp_J_kgK=float(np.asarray(_arr("cp_J_kgK", 2000.0)).item()),
+        mdot_floor_kg_s=float(
+            np.asarray(_arr("mdot_floor_kg_s", 1e-4)).item()),
+        tau_th_s=float(np.asarray(_arr("tau_th_s", 0.5)).item()),
+    )
+    retry_cfg = SolverRetryConfig()  # exact retry settings unrecorded
+    grid_arr = _arr("grid")
+    grid = (int(np.asarray(grid_arr).ravel()[0])
+             if grid_arr is not None else 0)
+    _write_summary(
+        run_dir, results, thermal, retry_cfg,
+        grid=grid, n_cycles=0,
+        d_phi_base=float("nan"), d_phi_peak=float("nan"),
+        runtime_s=float("nan"),
+        cli_args="(regenerated from data.npz)",
+        F_max_source="(regenerated)",
+    )
+    print(f"summary.txt regenerated in {run_dir}")
+
+
+def classify_global_status(envelope_records) -> str:
+    """Stage Transient Summary Wording Fix.
+
+    ``envelope_records``: list of per-config dicts with at least a
+    ``status`` field. Returns one of:
+
+      * ``production_result``         — every config status == "ok"
+      * ``aborted_outside_envelope``  — every config aborted
+      * ``partial_production_result`` — mixed (default for any other case)
+    """
+    if not envelope_records:
+        return "production_result"
+    statuses = [str(rec.get("status", "unknown")) for rec in envelope_records]
+    n_total = len(statuses)
+    n_aborted = sum(1 for s in statuses
+                     if s == "aborted_outside_envelope")
+    n_ok = sum(1 for s in statuses if s == "ok")
+    if n_aborted == 0 and n_ok == n_total:
+        return "production_result"
+    if n_aborted == n_total:
+        return "aborted_outside_envelope"
+    return "partial_production_result"
+
+
+def per_config_status_line(env_record,
+                             valid_no_clamp_frac: float) -> str:
+    """One-line per-config envelope status string for the global
+    header (Section 3 of the patch).
+
+    * ``aborted_outside_envelope`` if the config aborted.
+    * ``full / applicable`` if status=="ok" and
+      valid_no_clamp_frac >= 0.95.
+    * ``full / near-edge applicable`` if status=="ok" but
+      valid_no_clamp_frac < 0.95.
+    """
+    status = str(env_record.get("status", "unknown"))
+    if status == "aborted_outside_envelope":
+        return "aborted_outside_envelope"
+    if not np.isfinite(valid_no_clamp_frac):
+        return "full / unknown"
+    if float(valid_no_clamp_frac) < 0.95:
+        return "full / near-edge applicable"
+    return "full / applicable"
+
+
+def _build_envelope_records_from_results(results) -> List[Dict[str, Any]]:
+    """Adapter: produce the list of dicts ``classify_global_status``
+    expects from a ``run_transient`` results dict."""
+    cfgs = results.get("configs", [])
+    aborted = np.asarray(results.get("aborted",
+                                         np.zeros(len(cfgs), dtype=bool)))
+    out = []
+    for ic, cfg in enumerate(cfgs):
+        is_ab = bool(aborted[ic])
+        out.append({
+            "config": cfg.get("label", f"cfg_{ic}"),
+            "status": ("aborted_outside_envelope" if is_ab else "ok"),
+        })
+    return out
+
+
 def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
               args, configs, out_base,
               *,
@@ -961,7 +1200,17 @@ def main(argv=None):
                     help="Firing sector in crank-angle degrees, "
                          "comma-separated 'lo,hi'. Default uses the "
                          "BelAZ-class window (340.0,480.0).")
+    pa.add_argument("--regenerate-summary", dest="regenerate_summary",
+                    default=None,
+                    help="Path to an existing run dir containing "
+                         "data.npz / data_partial.npz. Rewrite "
+                         "summary.txt from that data with the current "
+                         "wording rules — does NOT recompute physics, "
+                         "does NOT touch data.npz.")
     args = pa.parse_args(argv)
+
+    if args.regenerate_summary:
+        return _regenerate_summary_from_dir(args.regenerate_summary)
 
     # Resolve base F_max (without scale).
     if args.F_max is not None:
