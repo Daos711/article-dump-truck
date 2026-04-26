@@ -300,6 +300,9 @@ def _save_data(run_dir, results, thermal, retry_cfg):
         valid_dynamic=results["valid_dynamic"],
         valid_no_clamp=results["valid_no_clamp"],
         contact_clamp=results["contact_clamp"],
+        contact_clamp_event_count=results.get(
+            "contact_clamp_event_count",
+            np.zeros_like(results["contact_clamp"], dtype=np.int32)),
         retry_used=results["retry_used"],
         retry_omega_used=results["retry_omega_used"],
         contact_clamp_count=results["contact_clamp_count"],
@@ -503,11 +506,25 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         omega_str = (", ".join(f"{t}={n}" for t, n
                                   in sorted(omega_hits.items()))
                        or "(none)")
+        # Stage Diesel Transient ClampAccounting Fix — show
+        # ``Contact steps`` (unique-step mask) and ``Contact events``
+        # (predictor + substep + final, up to ~3 per step) on
+        # separate lines so the legacy "events / steps" output
+        # cannot be misread as a clamp-step fraction.
+        ev_arr = results.get("contact_clamp_event_count")
+        if ev_arr is not None:
+            ev = np.asarray(ev_arr[ic, sl])
+            n_clamp_events_last = int(np.nansum(ev))
+        else:
+            n_clamp_events_last = 0
         lines.extend([
             f"  solver_success     : {int(solver_ok.sum())}/{n_steps_last}",
             f"  valid_dynamic      : {int(valid_dyn.sum())}/{n_steps_last}",
             f"  valid_no_clamp     : {int(valid_noc.sum())}/{n_steps_last}",
-            f"  contact_clamp      : {int(contact.sum())}/{n_steps_last}",
+            f"  Contact steps      : {int(contact.sum())}/{n_steps_last} "
+            f"(unique-step mask)",
+            f"  Contact events     : {n_clamp_events_last} "
+            f"(predictor + substep + final, up to ~3/step)",
             f"  mdot_floor_hit     : {int(floor.sum())}/{n_steps_last}",
             f"  retry_recovered    : {int(retry_used.sum())}/{n_steps_last}",
             f"  retry_exhausted    : "
@@ -922,6 +939,7 @@ def _regenerate_summary_from_dir(run_dir: str) -> None:
         valid_dynamic=_arr("valid_dynamic"),
         valid_no_clamp=_arr("valid_no_clamp"),
         contact_clamp=_arr("contact_clamp"),
+        contact_clamp_event_count=_arr("contact_clamp_event_count"),
         retry_used=_arr("retry_used"),
         retry_omega_used=_arr("retry_omega_used"),
         contact_clamp_count=_arr("contact_clamp_count"),
@@ -979,23 +997,44 @@ def _regenerate_summary_from_dir(run_dir: str) -> None:
 
 
 def classify_global_status(envelope_records) -> str:
-    """Stage Transient Summary Wording Fix.
+    """Stage Transient Summary Wording Fix + Stage Diesel Transient
+    ClampAccounting Fix.
 
     ``envelope_records``: list of per-config dicts with at least a
-    ``status`` field. Returns one of:
+    ``status`` and ``applicable`` field. Returns one of:
 
-      * ``production_result``         — every config status == "ok"
+      * ``production_result``         — every config applicable=True
       * ``aborted_outside_envelope``  — every config aborted
-      * ``partial_production_result`` — mixed (default for any other case)
+      * ``partial_production_result`` — any other mixture (incl. a
+        config that ran to completion but failed the applicability
+        gate, e.g. valid_no_clamp_frac < 0.85)
+
+    The previous implementation keyed only on ``status`` so a config
+    that completed all steps but tripped the applicability gate
+    (status=="ok", applicable=False) was misclassified as part of a
+    production_result header — this fix uses ``applicable`` so the
+    header agrees with the per-config envelope block.
     """
     if not envelope_records:
         return "production_result"
-    statuses = [str(rec.get("status", "unknown")) for rec in envelope_records]
-    n_total = len(statuses)
-    n_aborted = sum(1 for s in statuses
-                     if s == "aborted_outside_envelope")
-    n_ok = sum(1 for s in statuses if s == "ok")
-    if n_aborted == 0 and n_ok == n_total:
+    n_total = len(envelope_records)
+
+    def _applicable(rec) -> bool:
+        # An aborted config is never applicable, regardless of any
+        # ``applicable`` field the caller may have left over from a
+        # legacy record.
+        if str(rec.get("status", "unknown")) == "aborted_outside_envelope":
+            return False
+        # Otherwise default to True for backward-compat with legacy
+        # records that only carry ``status``.
+        return bool(rec.get("applicable", True))
+
+    n_applicable = sum(1 for rec in envelope_records if _applicable(rec))
+    n_aborted = sum(
+        1 for rec in envelope_records
+        if str(rec.get("status", "unknown")) == "aborted_outside_envelope"
+    )
+    if n_applicable == n_total:
         return "production_result"
     if n_aborted == n_total:
         return "aborted_outside_envelope"
@@ -1005,17 +1044,25 @@ def classify_global_status(envelope_records) -> str:
 def per_config_status_line(env_record,
                              valid_no_clamp_frac: float) -> str:
     """One-line per-config envelope status string for the global
-    header (Section 3 of the patch).
+    header.
 
-    * ``aborted_outside_envelope`` if the config aborted.
-    * ``full / applicable`` if status=="ok" and
+    * ``aborted_outside_envelope`` if the config aborted (overrides
+      everything else).
+    * ``full / outside applicability gate`` if status=="ok" but the
+      envelope's ``applicable`` flag is False (Stage Diesel Transient
+      ClampAccounting Fix — distinguishes a completed-but-not-
+      applicable run from a near-edge applicable one).
+    * ``full / applicable`` if status=="ok", applicable=True and
       valid_no_clamp_frac >= 0.95.
-    * ``full / near-edge applicable`` if status=="ok" but
-      valid_no_clamp_frac < 0.95.
+    * ``full / near-edge applicable`` if status=="ok",
+      applicable=True but valid_no_clamp_frac < 0.95.
     """
     status = str(env_record.get("status", "unknown"))
     if status == "aborted_outside_envelope":
         return "aborted_outside_envelope"
+    applicable = bool(env_record.get("applicable", True))
+    if not applicable:
+        return "full / outside applicability gate"
     if not np.isfinite(valid_no_clamp_frac):
         return "full / unknown"
     if float(valid_no_clamp_frac) < 0.95:
@@ -1025,16 +1072,26 @@ def per_config_status_line(env_record,
 
 def _build_envelope_records_from_results(results) -> List[Dict[str, Any]]:
     """Adapter: produce the list of dicts ``classify_global_status``
-    expects from a ``run_transient`` results dict."""
+    expects from a ``run_transient`` results dict.
+
+    Stage Diesel Transient ClampAccounting Fix — also surfaces the
+    per-config ``applicable`` boolean so the global classifier can
+    distinguish "completed but outside applicability gate" from a
+    full production result.
+    """
     cfgs = results.get("configs", [])
+    n_cfg = len(cfgs)
     aborted = np.asarray(results.get("aborted",
-                                         np.zeros(len(cfgs), dtype=bool)))
+                                         np.zeros(n_cfg, dtype=bool)))
+    applicable_arr = np.asarray(
+        results.get("applicable", np.ones(n_cfg, dtype=bool)))
     out = []
     for ic, cfg in enumerate(cfgs):
         is_ab = bool(aborted[ic])
         out.append({
             "config": cfg.get("label", f"cfg_{ic}"),
             "status": ("aborted_outside_envelope" if is_ab else "ok"),
+            "applicable": (False if is_ab else bool(applicable_arr[ic])),
         })
     return out
 

@@ -1054,6 +1054,14 @@ def run_transient(F_max=None, debug=False,
     mdot_floor_hit_all = np.zeros((n_cfg, n_steps), dtype=bool)
     solver_success_all = np.zeros((n_cfg, n_steps), dtype=bool)
     contact_clamp_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    # Stage Diesel Transient ClampAccounting Fix — distinct from
+    # ``contact_clamp_all`` (step-mask): per-step *event* count
+    # accumulating predictor + N_SUB substep + final clamp events
+    # (so a single step can carry up to 1 + (N_SUB - 1) + 1 events).
+    # ``contact_clamp_all`` keeps its existing semantics and remains
+    # the only source for envelope abort fractions.
+    contact_clamp_event_count_all = np.zeros((n_cfg, n_steps),
+                                                dtype=np.int32)
     retry_used_all = np.zeros((n_cfg, n_steps), dtype=bool)
     retry_omega_used_all = np.zeros((n_cfg, n_steps), dtype=float)
     cfg_times: List[float] = []
@@ -1144,8 +1152,15 @@ def run_transient(F_max=None, debug=False,
             ey_pred = ey_n + vy_n * dt_step + 0.5 * ay_prev * dt_step**2
             ex_pred, ey_pred, _, _, clamped_p = _clamp(
                 ex_pred, ey_pred, vx_n, vy_n)
+            # Stage Diesel Transient ClampAccounting Fix — track
+            # per-step events separately from the existing aggregate
+            # ``contact_count`` so summary can show "Contact steps"
+            # (unique stepped) vs "Contact events" (predictor +
+            # substep + final, up to ~3 per step).
+            step_event_count = 0
             if clamped_p:
                 contact_count += 1
+                step_event_count += 1
                 P_prev = None
 
             vx_corr, vy_corr = vx_n, vy_n
@@ -1220,6 +1235,7 @@ def run_transient(F_max=None, debug=False,
                         ex_pred, ey_pred, vx_corr, vy_corr)
                     if cl:
                         contact_count += 1
+                        step_event_count += 1
                         P_prev = None
 
             # Accept (even if solver failed — keep mechanical state
@@ -1231,6 +1247,7 @@ def run_transient(F_max=None, debug=False,
             ex, ey, vx, vy, clamped_final = _clamp(ex, ey, vx, vy)
             if clamped_final:
                 contact_count += 1
+                step_event_count += 1
                 P_prev = None
             step_clamped = bool(clamped_p or clamped_final)
 
@@ -1316,6 +1333,7 @@ def run_transient(F_max=None, debug=False,
             mdot_floor_hit_all[ic, step] = mdot_floor
             solver_success_all[ic, step] = bool(solve_ok)
             contact_clamp_all[ic, step] = step_clamped
+            contact_clamp_event_count_all[ic, step] = int(step_event_count)
             retry_used_all[ic, step] = bool(retry_recovered_step)
             if retry_recovered_step:
                 retry_recovered_count[ic] += 1
@@ -1419,7 +1437,21 @@ def run_transient(F_max=None, debug=False,
         n_solver_fail = int(solver_failed_count[ic])
         n_retry_rec = int(retry_recovered_count[ic])
         n_retry_exh = int(retry_exhausted_count[ic])
-        print(f"    Контакт (clamp): {contact_count} / {n_steps} шагов")
+        # Stage Diesel Transient ClampAccounting Fix — print steps
+        # and events on separate lines so the "95.8% шагов в clamp"
+        # misreading from earlier runs (which actually counted up to
+        # 3 events per step) cannot recur.
+        n_completed_for_print = int(steps_completed_arr[ic])
+        n_step_clamped = int(np.sum(
+            contact_clamp_all[ic, :n_completed_for_print]))
+        n_clamp_events = int(np.sum(
+            contact_clamp_event_count_all[ic, :n_completed_for_print]))
+        denom = max(n_completed_for_print, 1)
+        print(f"    Contact steps : {n_step_clamped} / "
+              f"{n_completed_for_print} steps "
+              f"({100.0 * n_step_clamped / denom:.1f}%)")
+        print(f"    Contact events: {n_clamp_events} total "
+              f"(predictor + substep + final, up to ~3 events/step)")
         print(f"    Solver: failed={n_solver_fail}, "
               f"retry_recovered={n_retry_rec}, "
               f"retry_exhausted={n_retry_exh}")
@@ -1555,6 +1587,10 @@ def run_transient(F_max=None, debug=False,
         "valid_dynamic": valid_dynamic_all,
         "valid_no_clamp": valid_no_clamp_all,
         "contact_clamp": contact_clamp_all,
+        # Stage Diesel Transient ClampAccounting Fix — per-step
+        # event count (int, may exceed 1 per step). Distinct from
+        # ``contact_clamp`` (boolean step-mask).
+        "contact_clamp_event_count": contact_clamp_event_count_all,
         "retry_used": retry_used_all,
         "retry_omega_used": retry_omega_used_all,
         "contact_clamp_count": contact_clamp_count,
