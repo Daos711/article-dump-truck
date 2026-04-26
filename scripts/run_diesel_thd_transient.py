@@ -316,6 +316,44 @@ def _save_data(run_dir, results, thermal, retry_cfg):
             results.get("angle_weighted_full", []), dtype=object),
         angle_weighted_last_cycle=np.array(
             results.get("angle_weighted_last_cycle", []), dtype=object),
+        # Stage J — persist cavitation/texture/Ausas fields so
+        # ``--regenerate-summary`` can rebuild the Stage J block from
+        # an existing data.npz without rerunning the solver.
+        cavitation_model=str(results.get("cavitation_model",
+                                              "half_sommerfeld")),
+        texture_kind=str(results.get("texture_kind", "dimple")),
+        groove_preset=str(results.get("groove_preset") or "N/A"),
+        groove_preset_resolved=np.asarray(
+            [results.get("groove_preset_resolved") or {}], dtype=object),
+        groove_relief_stats=np.asarray(
+            [results.get("groove_relief_stats") or {}], dtype=object),
+        fidelity=str(results.get("fidelity") or "custom"),
+        ausas_options=np.asarray(
+            [results.get("ausas_options") or {}], dtype=object),
+        ausas_converged=results.get(
+            "ausas_converged",
+            np.zeros_like(results["contact_clamp"], dtype=bool)),
+        ausas_n_inner=results.get(
+            "ausas_n_inner",
+            np.zeros_like(results["contact_clamp"], dtype=np.int32)),
+        ausas_cav_frac=results.get(
+            "ausas_cav_frac",
+            np.zeros_like(results["contact_clamp"], dtype=float)),
+        ausas_theta_min=results.get(
+            "ausas_theta_min",
+            np.ones_like(results["contact_clamp"], dtype=float)),
+        ausas_theta_max=results.get(
+            "ausas_theta_max",
+            np.ones_like(results["contact_clamp"], dtype=float)),
+        ausas_state_reset_count=results.get(
+            "ausas_state_reset_count",
+            np.zeros(len(results["configs"]), dtype=np.int32)),
+        ausas_failed_step_count=results.get(
+            "ausas_failed_step_count",
+            np.zeros(len(results["configs"]), dtype=np.int32)),
+        ausas_rejected_commit_count=results.get(
+            "ausas_rejected_commit_count",
+            np.zeros(len(results["configs"]), dtype=np.int32)),
         retry_used=results["retry_used"],
         retry_omega_used=results["retry_omega_used"],
         contact_clamp_count=results["contact_clamp_count"],
@@ -430,6 +468,92 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                 f"(cells_per_pocket_phi={cpp_phi:.2f} < 4); "
                 f"increase --n-phi to >= {rec_n_phi}."
             )
+        lines.append("")
+
+    # Stage J — Ausas + groove block (echoed regardless of cavitation
+    # path so a half-Sommerfeld run still tells the reader that
+    # Ausas is *not* in use).
+    cav_model = str(results.get("cavitation_model", "half_sommerfeld"))
+    tex_kind = str(results.get("texture_kind", "dimple"))
+    groove_preset_name = results.get("groove_preset")
+    groove_preset_resolved = results.get("groove_preset_resolved") or {}
+    groove_relief_stats_dict = results.get("groove_relief_stats") or {}
+    ausas_opts = results.get("ausas_options") or {}
+    fidelity_used = results.get("fidelity")
+    lines.append("Stage J: Ausas dynamic + grooves")
+    lines.append(f"  cavitation model      : {cav_model}")
+    lines.append(f"  texture kind          : {tex_kind}")
+    lines.append(
+        "  groove preset         : "
+        f"{groove_preset_name if groove_preset_name else 'N/A'}"
+    )
+    if fidelity_used:
+        lines.append(f"  fidelity preset       : {fidelity_used}")
+    if cav_model == "ausas_dynamic":
+        lines.append(
+            "  Ausas scheme          : "
+            f"{ausas_opts.get('scheme', 'rb')}")
+        lines.append(
+            "  Ausas omega_p/theta   : "
+            f"{ausas_opts.get('omega_p', 'default')} / "
+            f"{ausas_opts.get('omega_theta', 'default')}")
+        lines.append(
+            "  Ausas tol/max_inner   : "
+            f"{ausas_opts.get('tol', 'default')} / "
+            f"{ausas_opts.get('max_inner', 'default')}")
+        lines.append(
+            "  Ausas check_every     : "
+            f"{ausas_opts.get('check_every', 'default')}")
+    lines.append("")
+
+    # Groove geometry block — only emitted when the run actually
+    # uses grooves so half-Sommerfeld dimple regressions stay quiet.
+    if tex_kind == "groove" and groove_preset_resolved:
+        gpr = groove_preset_resolved
+        rs = groove_relief_stats_dict
+        lines.append("groove geometry:")
+        lines.append(
+            "  N_branch_per_side : "
+            f"{int(gpr.get('N_branch_per_side', 0))}")
+        lines.append(
+            f"  beta_deg          : {float(gpr.get('beta_deg', 0.0)):.1f}")
+        lines.append(
+            f"  d_g_um            : {float(gpr.get('d_g_um', 0.0)):.2f}")
+        lines.append(
+            f"  d_g_over_c        : {float(gpr.get('d_g_over_c', 0.0)):.4f}")
+        lines.append(
+            f"  w_g_mm            : {float(gpr.get('w_g_mm', 0.0)):.2f}")
+        lines.append(
+            f"  w_g_over_D        : {float(gpr.get('w_g_over_D', 0.0)):.4f}")
+        lines.append(
+            f"  belt_half         : {float(gpr.get('belt_half_nondim', 0.0)):.3f}")
+        lines.append(
+            f"  taper_ratio       : {float(gpr.get('taper_ratio', 0.0)):.3f}")
+        lines.append(
+            f"  ramp_frac         : {float(gpr.get('ramp_frac', 0.0)):.3f}")
+        lines.append(
+            f"  chirality         : {gpr.get('chirality', '?')}")
+        lines.append(
+            f"  coverage_mode     : {gpr.get('coverage_mode', '?')}")
+        if rs:
+            lines.append(
+                "  relief_min/max    : "
+                f"{rs.get('relief_min', float('nan')):.4e} / "
+                f"{rs.get('relief_max', float('nan')):.4e}")
+            lines.append(
+                "  relief nonzero %  : "
+                f"{100.0 * float(rs.get('relief_nonzero_frac', 0.0)):.1f}%")
+        warns = []
+        if rs.get("has_nan"):
+            warns.append("NaN in relief")
+        if rs.get("has_inf"):
+            warns.append("inf in relief")
+        if rs.get("relief_min", 0.0) < 0.0:
+            warns.append(
+                f"min < 0 ({rs['relief_min']:.3e})")
+        lines.append(
+            "  geometry warnings : "
+            f"{', '.join(warns) if warns else 'none'}")
         lines.append("")
 
     if global_status == "aborted_outside_envelope":
@@ -677,6 +801,73 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             f"{first_solver_fail if np.isfinite(first_solver_fail) else float('nan'):.1f} deg",
             "",
         ])
+
+        # Stage J — per-config Ausas diagnostics. Quiet on the
+        # legacy half-Sommerfeld path (zero-filled arrays render as
+        # 100% converged with cav_frac=0; we suppress them so the
+        # block stays meaningful).
+        if cav_model == "ausas_dynamic":
+            ausas_conv = np.asarray(
+                results.get("ausas_converged",
+                                np.zeros_like(valid_dyn))[ic, sl],
+                dtype=bool)
+            ausas_n_inner_arr = np.asarray(
+                results.get("ausas_n_inner",
+                                np.zeros_like(valid_dyn,
+                                                  dtype=np.int32))[ic, sl])
+            ausas_cav_arr = np.asarray(
+                results.get("ausas_cav_frac",
+                                np.zeros_like(valid_dyn,
+                                                  dtype=float))[ic, sl])
+            ausas_tmin_arr = np.asarray(
+                results.get("ausas_theta_min",
+                                np.ones_like(valid_dyn,
+                                                 dtype=float))[ic, sl])
+            ausas_tmax_arr = np.asarray(
+                results.get("ausas_theta_max",
+                                np.ones_like(valid_dyn,
+                                                 dtype=float))[ic, sl])
+            n_attempted_ic = max(int(ausas_conv.size), 1)
+            conv_frac = (float(ausas_conv.sum())
+                         / float(n_attempted_ic))
+            n_inner_finite = ausas_n_inner_arr[
+                np.isfinite(ausas_n_inner_arr)]
+            p50 = float(np.percentile(n_inner_finite, 50)) \
+                if n_inner_finite.size else float("nan")
+            p95 = float(np.percentile(n_inner_finite, 95)) \
+                if n_inner_finite.size else float("nan")
+            p_max_inner = (float(np.max(n_inner_finite))
+                            if n_inner_finite.size else float("nan"))
+            cav_finite = ausas_cav_arr[np.isfinite(ausas_cav_arr)]
+            cav_mean = float(np.mean(cav_finite)) \
+                if cav_finite.size else float("nan")
+            cav_max = float(np.max(cav_finite)) \
+                if cav_finite.size else float("nan")
+            tmin_arr_finite = ausas_tmin_arr[
+                np.isfinite(ausas_tmin_arr)]
+            tmax_arr_finite = ausas_tmax_arr[
+                np.isfinite(ausas_tmax_arr)]
+            theta_min = (float(np.min(tmin_arr_finite))
+                         if tmin_arr_finite.size else float("nan"))
+            theta_max = (float(np.max(tmax_arr_finite))
+                         if tmax_arr_finite.size else float("nan"))
+            lines.extend([
+                "  Ausas diagnostics:",
+                f"    converged fraction       : {conv_frac:.3f}",
+                f"    n_inner p50/p95/max      : "
+                f"{p50:.0f} / {p95:.0f} / {p_max_inner:.0f}",
+                f"    cav_frac mean/max        : "
+                f"{cav_mean:.3f} / {cav_max:.3f}",
+                f"    theta min/max            : "
+                f"{theta_min:.3f} / {theta_max:.3f}",
+                f"    state_reset_count        : "
+                f"{int(results.get('ausas_state_reset_count', np.zeros(len(cfgs)))[ic])}",
+                f"    failed_step_count        : "
+                f"{int(results.get('ausas_failed_step_count', np.zeros(len(cfgs)))[ic])}",
+                f"    rejected_commit_count    : "
+                f"{int(results.get('ausas_rejected_commit_count', np.zeros(len(cfgs)))[ic])}",
+                "",
+            ])
 
     # Paired comparison block.
     paired = results.get("paired_comparison") or []
@@ -1278,11 +1469,25 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
     print("=" * 60)
 
     t0 = time.time()
+    # Stage J — assemble ausas_options from any --ausas-* CLI flags.
+    ausas_options: Dict[str, Any] = {}
+    for src_attr, kw in (
+        ("ausas_omega_p", "omega_p"),
+        ("ausas_omega_theta", "omega_theta"),
+        ("ausas_tol", "tol"),
+        ("ausas_max_inner", "max_inner"),
+        ("ausas_check_every", "check_every"),
+        ("ausas_scheme", "scheme"),
+    ):
+        v = getattr(args, src_attr, None)
+        if v is not None:
+            ausas_options[kw] = v
     results = run_transient(
         F_max=F_max_used,
         debug=False,
         thermal=thermal,
         configs=configs,
+        cavitation=str(args.cavitation),
         n_grid=args.n_grid,
         n_cycles=args.n_cycles,
         d_phi_base_deg=args.d_phi_base,
@@ -1294,6 +1499,11 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         retry_config=retry_cfg,
         envelope_abort=envelope_abort,
         firing_sector_deg=getattr(args, "firing_sector_resolved", None),
+        texture_kind=str(args.texture_kind),
+        groove_preset=args.groove_preset,
+        fidelity=args.fidelity,
+        ausas_options=(ausas_options if ausas_options else None),
+        save_field_checkpoints=bool(args.save_field_checkpoints),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -1403,7 +1613,48 @@ def main(argv=None):
     pa.add_argument("--n-z", dest="n_z", type=int, default=None,
                     help="Axial grid resolution N_Z. If unspecified, "
                          "falls back to --n-grid (legacy isotropic).")
-    pa.add_argument("--cavitation", default="half_sommerfeld")
+    pa.add_argument("--cavitation", default="half_sommerfeld",
+                    choices=["half_sommerfeld", "ausas_dynamic"],
+                    help="Cavitation closure. 'half_sommerfeld' "
+                         "(default, legacy) goes through "
+                         "solve_reynolds; 'ausas_dynamic' (Stage J) "
+                         "wires the dynamic Ausas JFO solver via "
+                         "the per-config DieselAusasState adapter.")
+    # Stage J — texture / groove / fidelity / ausas-options.
+    pa.add_argument("--texture-kind", dest="texture_kind",
+                    default="dimple",
+                    choices=["dimple", "groove", "none"],
+                    help="Texture family: 'dimple' (legacy default), "
+                         "'groove' (Stage J ramped/tapered "
+                         "herringbone), or 'none' (smooth even "
+                         "for textured configs).")
+    pa.add_argument("--groove-preset", dest="groove_preset",
+                    default=None,
+                    help="Named groove preset (Stage J). Required "
+                         "when --texture-kind=groove. See "
+                         "config.diesel_groove_presets.GROOVE_PRESETS.")
+    pa.add_argument("--fidelity", dest="fidelity", default=None,
+                    choices=["low", "medium", "high", "custom"],
+                    help="Stage J fidelity preset. Sets defaults "
+                         "for n-phi/n-z/n-cycles/d-phi-base/peak. "
+                         "Explicit CLI flags override the preset.")
+    pa.add_argument("--ausas-omega-p", dest="ausas_omega_p",
+                    type=float, default=None)
+    pa.add_argument("--ausas-omega-theta", dest="ausas_omega_theta",
+                    type=float, default=None)
+    pa.add_argument("--ausas-tol", dest="ausas_tol",
+                    type=float, default=None)
+    pa.add_argument("--ausas-max-inner", dest="ausas_max_inner",
+                    type=int, default=None)
+    pa.add_argument("--ausas-check-every", dest="ausas_check_every",
+                    type=int, default=None)
+    pa.add_argument("--ausas-scheme", dest="ausas_scheme",
+                    choices=["rb", "jacobi"], default=None)
+    pa.add_argument("--save-field-checkpoints",
+                    dest="save_field_checkpoints",
+                    action="store_true", default=False,
+                    help="Save peak-pressure / min-hmin / max-eps "
+                         "field checkpoints (Stage J).")
     pa.add_argument("--configs", default=None,
                     help="comma-separated keys: "
                          + ", ".join(sorted(CONFIG_KEYS)))
@@ -1480,6 +1731,42 @@ def main(argv=None):
 
     if args.regenerate_summary:
         return _regenerate_summary_from_dir(args.regenerate_summary)
+
+    # Stage J — fidelity preset resolution. Only fills slots that
+    # were not explicitly overridden on the command line. Default
+    # (None) leaves every CLI default unchanged so legacy invocations
+    # continue to behave bit-for-bit.
+    _FIDELITY_PRESETS = {
+        "low": dict(n_phi=160, n_z=60, n_cycles=2,
+                    d_phi_base=4.0, d_phi_peak=1.0),
+        "medium": dict(n_phi=320, n_z=120, n_cycles=2,
+                       d_phi_base=2.0, d_phi_peak=0.5),
+        "high": dict(n_phi=480, n_z=160, n_cycles=2,
+                     d_phi_base=1.0, d_phi_peak=0.1),
+    }
+    if args.fidelity in _FIDELITY_PRESETS:
+        preset = _FIDELITY_PRESETS[args.fidelity]
+        # n-phi / n-z fall back to the preset if the user did not
+        # explicitly pass --n-phi / --n-z (they default to None).
+        if args.n_phi is None:
+            args.n_phi = preset["n_phi"]
+        if args.n_z is None:
+            args.n_z = preset["n_z"]
+        # n-cycles / d-phi defaults are integer/float so we can't
+        # distinguish "user passed default" from "user explicit". The
+        # safe rule: only override the script-level defaults
+        # (n_cycles=2, d_phi_base=10.0, d_phi_peak=2.0). Other values
+        # were explicitly chosen by the user.
+        if args.n_cycles == 2:
+            args.n_cycles = preset["n_cycles"]
+        if args.d_phi_base == 10.0:
+            args.d_phi_base = preset["d_phi_base"]
+        if args.d_phi_peak == 2.0:
+            args.d_phi_peak = preset["d_phi_peak"]
+    if args.texture_kind == "groove" and not args.groove_preset:
+        raise SystemExit(
+            "--texture-kind=groove requires --groove-preset (see "
+            "config.diesel_groove_presets.GROOVE_PRESETS).")
 
     # Resolve base F_max (without scale).
     if args.F_max is not None:

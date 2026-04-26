@@ -83,6 +83,14 @@ from models.thermal_coupling import (
 from config import diesel_params as params
 from config.oil_properties import MINERAL_OIL, RAPESEED_OIL
 
+# Stage J — per-config Ausas dynamic state owner (lives in the
+# transient runner, not in solve_and_compute). The actual GPU
+# backend is resolved lazily inside the adapter.
+from models.diesel_ausas_adapter import (
+    DieselAusasState,
+    ausas_one_step_with_state,
+)
+
 CONFIGS = [
     {"label": "Гладкий + минеральное", "textured": False,
      "oil": MINERAL_OIL, "color": "blue", "ls": "-"},
@@ -338,12 +346,38 @@ def load_diesel(phi_deg, F_max=None):
 
 
 def build_H_2d(eps_x, eps_y, Phi_mesh, Z_mesh, p,
-               textured=False, phi_c_flat=None, Z_c_flat=None):
-    """Зазор для 2D-эксцентриситета: H = 1 − εx·cos(θ) − εy·sin(θ) [+ текстура]."""
+               textured=False, phi_c_flat=None, Z_c_flat=None,
+               texture_kind: str = "dimple",
+               groove_relief: Optional[np.ndarray] = None):
+    """Зазор для 2D-эксцентриситета: H = 1 − εx·cos(θ) − εy·sin(θ) [+ текстура].
+
+    Stage J — ``texture_kind`` selects between the legacy
+    ellipsoidal-dimple texture (``"dimple"``, the historical default
+    so ``textured=True`` keeps its meaning) and a precomputed
+    additive groove relief (``"groove"``, with ``groove_relief``
+    supplied by ``models.groove_geometry``). When
+    ``texture_kind="none"`` the smooth base film is returned even if
+    ``textured=True`` — this lets the runner explicitly disable
+    texture without changing the ``cfg`` registry.
+    """
     H0 = 1.0 - eps_x * np.cos(Phi_mesh) - eps_y * np.sin(Phi_mesh)
     H0 = np.sqrt(H0**2 + (p.sigma / p.c)**2)  # регуляризация шероховатости
-    if not textured:
+    if (not textured) or texture_kind == "none":
         return H0
+    if texture_kind == "groove":
+        if groove_relief is None:
+            raise ValueError(
+                "build_H_2d(texture_kind='groove') requires a "
+                "groove_relief array (use "
+                "models.groove_geometry.build_herringbone_groove_relief"
+                " or pass texture_kind='dimple' for the legacy path)."
+            )
+        return H0 + np.asarray(groove_relief, dtype=H0.dtype)
+    if texture_kind != "dimple":
+        raise ValueError(
+            f"build_H_2d: unknown texture_kind {texture_kind!r}; "
+            "valid values are 'dimple', 'groove', 'none'."
+        )
     A = 2 * p.a_dim / p.L
     B = p.b_dim / p.R
     H_p = p.h_p / p.c
@@ -1030,7 +1064,12 @@ def run_transient(F_max=None, debug=False,
                   peak_lo_deg: float = 330.0,
                   peak_hi_deg: float = 480.0,
                   n_phi_grid: Optional[int] = None,
-                  n_z_grid: Optional[int] = None):
+                  n_z_grid: Optional[int] = None,
+                  texture_kind: str = "dimple",
+                  groove_preset: Optional[str] = None,
+                  fidelity: Optional[str] = None,
+                  ausas_options: Optional[Dict[str, Any]] = None,
+                  save_field_checkpoints: bool = False):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -1064,6 +1103,19 @@ def run_transient(F_max=None, debug=False,
     if thermal is None:
         thermal = ThermalConfig(mode="off")
     is_off = thermal.is_off()
+    # Stage J — cavitation routing. ``half_sommerfeld`` (the
+    # historical default) goes through the existing ``solve_reynolds``
+    # path bit-for-bit. ``ausas_dynamic`` activates the per-config
+    # ``DieselAusasState`` and the one-step adapter wired below.
+    # Any unknown name is rejected loudly so silent fallback to the
+    # legacy path cannot mask a typo.
+    cavitation_str = str(cavitation)
+    if cavitation_str not in ("half_sommerfeld", "ausas_dynamic"):
+        raise ValueError(
+            f"run_transient: unsupported cavitation {cavitation_str!r}; "
+            "valid values are 'half_sommerfeld' (default, legacy) "
+            "and 'ausas_dynamic' (Stage J).")
+    use_ausas_dynamic = (cavitation_str == "ausas_dynamic")
     cfg_list = list(configs) if configs is not None else CONFIGS
     n_cycles_eff = int(n_cycles) if n_cycles is not None else int(
         params.n_cycles)
@@ -1087,6 +1139,54 @@ def run_transient(F_max=None, debug=False,
     phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(
         N_phi_eff, N_z_eff)
     phi_c, Z_c = setup_texture(params)
+
+    # Stage J — herringbone groove relief (built once per run on the
+    # fixed grid; the relief is additive on top of the eccentricity-
+    # driven base film). When ``texture_kind != "groove"`` the
+    # relief stays None and ``build_H_2d`` falls back to either the
+    # legacy dimple texture or the smooth base film.
+    groove_relief: Optional[np.ndarray] = None
+    groove_preset_resolved: Optional[Dict[str, Any]] = None
+    groove_relief_stats: Optional[Dict[str, Any]] = None
+    if texture_kind == "groove":
+        if groove_preset is None:
+            raise ValueError(
+                "run_transient(texture_kind='groove') requires a "
+                "groove_preset name (see config.diesel_groove_presets"
+                ".GROOVE_PRESETS).")
+        from config.diesel_groove_presets import resolve_groove_preset
+        from models.groove_geometry import (
+            build_herringbone_groove_relief, relief_stats,
+        )
+        groove_preset_resolved = resolve_groove_preset(
+            str(groove_preset),
+            R_m=float(params.R), L_m=float(params.L),
+            c_m=float(params.c),
+        )
+        builder_kwargs = {
+            k: groove_preset_resolved[k] for k in (
+                "variant", "depth_nondim", "N_branch_per_side",
+                "w_branch_nondim", "belt_half_nondim", "beta_deg",
+                "ramp_frac", "taper_ratio", "apex_radius_frac",
+                "chirality", "coverage_mode",
+                "protected_lo_deg", "protected_hi_deg",
+            )
+        }
+        groove_relief = build_herringbone_groove_relief(
+            Phi_mesh, Z_mesh, **builder_kwargs)
+        groove_relief_stats = relief_stats(groove_relief)
+        if (groove_relief_stats["has_nan"]
+                or groove_relief_stats["has_inf"]):
+            raise ValueError(
+                "groove relief contains NaN/inf — refusing to "
+                "proceed (preset="
+                f"{groove_preset!r}).")
+        if groove_relief_stats["relief_min"] < -1e-12:
+            raise ValueError(
+                "groove relief contains negative values — grooves "
+                "must increase H, not reduce it (preset="
+                f"{groove_preset!r}, min="
+                f"{groove_relief_stats['relief_min']:.3e}).")
 
     # Stage Diesel Transient PeakWindow GridDiagnostic — diagnose
     # whether the chosen Nφ × N_Z grid resolves the elliptical
@@ -1175,6 +1275,17 @@ def run_transient(F_max=None, debug=False,
     # share when d_phi_peak << d_phi_base).
     d_phi_per_step_all = np.zeros((n_cfg, n_steps), dtype=float)
     phi_mod_per_step_all = np.zeros((n_cfg, n_steps), dtype=float)
+    # Stage J — per-config Ausas dynamic diagnostics. Default-zero
+    # so the legacy half-Sommerfeld path produces a result dict with
+    # zero-filled Ausas fields rather than missing keys.
+    ausas_converged_all = np.zeros((n_cfg, n_steps), dtype=bool)
+    ausas_n_inner_all = np.zeros((n_cfg, n_steps), dtype=np.int32)
+    ausas_cav_frac_all = np.zeros((n_cfg, n_steps), dtype=float)
+    ausas_theta_min_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
+    ausas_theta_max_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
+    ausas_state_reset_count = np.zeros(n_cfg, dtype=np.int32)
+    ausas_failed_step_count = np.zeros(n_cfg, dtype=np.int32)
+    ausas_rejected_commit_count = np.zeros(n_cfg, dtype=np.int32)
     retry_used_all = np.zeros((n_cfg, n_steps), dtype=bool)
     retry_omega_used_all = np.zeros((n_cfg, n_steps), dtype=float)
     cfg_times: List[float] = []
@@ -1218,6 +1329,15 @@ def run_transient(F_max=None, debug=False,
         ax_prev, ay_prev = 0.0, 0.0
         P_prev = None
         contact_count = 0
+
+        # Stage J — per-config Ausas state (cold-start). Created
+        # unconditionally so legacy paths that read ``ausas_state``
+        # downstream don't crash; the legacy half-Sommerfeld branch
+        # never advances it.
+        ausas_state: Optional[DieselAusasState] = None
+        if use_ausas_dynamic:
+            ausas_state = DieselAusasState.cold_start(
+                N_phi=N_phi_eff, N_z=N_z_eff)
 
         def _clamp(ex_, ey_, vx_, vy_):
             clamped = False
@@ -1295,23 +1415,60 @@ def run_transient(F_max=None, debug=False,
                 eps_y_ = ey_pred / params.c
                 H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
                                  textured=cfg["textured"],
-                                 phi_c_flat=phi_c, Z_c_flat=Z_c)
+                                 phi_c_flat=phi_c, Z_c_flat=Z_c,
+                                 texture_kind=texture_kind,
+                                 groove_relief=groove_relief)
                 xp_, yp_, bt_ = squeeze_to_api_params(
                     -vx_corr, -vy_corr, params.c, omega, d_phi)
-                base_kw = dict(
-                    closure=closure, cavitation=cavitation,
-                    tol=1e-5, max_iter=50000,
-                    P_init=P_prev,
-                    xprime=xp_, yprime=yp_, beta=bt_,
-                )
-                P_, Fx_, Fy_, _, ok_, reason_ = _solve_dynamic_with_retry(
-                    H_, d_phi, d_Z, params.R, params.L,
-                    base_kw=base_kw,
-                    p_scale=p_scale_step,
-                    Phi_mesh=Phi_mesh, phi_1D=phi_1D, Z_1D=Z_1D,
-                    retry_config=retry_config,
-                    textured=bool(cfg["textured"]),
-                )
+                if use_ausas_dynamic:
+                    # Stage J — dynamic Ausas trial solve. The state
+                    # is NOT mutated (commit=False); the runner
+                    # commits once at the end of the mechanical
+                    # step using the final accepted H.
+                    aw = ausas_one_step_with_state(
+                        ausas_state,
+                        H_curr_phys=H_,
+                        dt_s=float(dt_step),
+                        d_phi=float(d_phi),
+                        d_Z=float(d_Z),
+                        R=float(params.R), L=float(params.L),
+                        eta=float(eta_step),
+                        omega=float(omega),
+                        extra_options=ausas_options or None,
+                        commit=False,
+                    )
+                    if aw["ok"] and aw["P_phys"] is not None:
+                        # Non-dim P matches solver-side units (P*p_scale
+                        # = dimensional Pa) so existing
+                        # ``compute_hydro_forces`` and
+                        # ``compute_friction`` apply unchanged.
+                        P_ = np.asarray(aw["P_phys"])
+                        Fx_, Fy_ = compute_hydro_forces(
+                            P_, p_scale_step, Phi_mesh,
+                            phi_1D, Z_1D, params.R, params.L)
+                        ok_ = True
+                        reason_ = "ok_ausas_trial"
+                    else:
+                        P_ = np.full_like(H_, np.nan)
+                        Fx_ = float("nan")
+                        Fy_ = float("nan")
+                        ok_ = False
+                        reason_ = aw.get("reason", "ausas_failed")
+                else:
+                    base_kw = dict(
+                        closure=closure, cavitation=cavitation,
+                        tol=1e-5, max_iter=50000,
+                        P_init=P_prev,
+                        xprime=xp_, yprime=yp_, beta=bt_,
+                    )
+                    P_, Fx_, Fy_, _, ok_, reason_ = _solve_dynamic_with_retry(
+                        H_, d_phi, d_Z, params.R, params.L,
+                        base_kw=base_kw,
+                        p_scale=p_scale_step,
+                        Phi_mesh=Phi_mesh, phi_1D=phi_1D, Z_1D=Z_1D,
+                        retry_config=retry_config,
+                        textured=bool(cfg["textured"]),
+                    )
                 outcome = _parse_retry_outcome(reason_)
                 if outcome["retry_recovered"]:
                     retry_recovered_step = True
@@ -1366,6 +1523,55 @@ def run_transient(F_max=None, debug=False,
                 step_event_count += 1
                 P_prev = None
             step_clamped = bool(clamped_p or clamped_final)
+
+            # Stage J — Ausas state commits once per accepted step.
+            # If the final clamp moved (ex, ey) past the last trial,
+            # rebuild H from the accepted (ex, ey) before the commit
+            # so the state's ``H_prev`` matches the orbit truth.
+            if use_ausas_dynamic and ausas_state is not None:
+                if solve_ok and not step_clamped:
+                    H_committed = H
+                else:
+                    H_committed = build_H_2d(
+                        ex / params.c, ey / params.c,
+                        Phi_mesh, Z_mesh, params,
+                        textured=cfg["textured"],
+                        phi_c_flat=phi_c, Z_c_flat=Z_c,
+                        texture_kind=texture_kind,
+                        groove_relief=groove_relief)
+                aw_commit = ausas_one_step_with_state(
+                    ausas_state,
+                    H_curr_phys=H_committed,
+                    dt_s=float(dt_step),
+                    d_phi=float(d_phi),
+                    d_Z=float(d_Z),
+                    R=float(params.R), L=float(params.L),
+                    eta=float(eta_step),
+                    omega=float(omega),
+                    extra_options=ausas_options or None,
+                    commit=True,
+                )
+                ausas_converged_all[ic, step] = bool(aw_commit["ok"])
+                ausas_n_inner_all[ic, step] = int(aw_commit["n_inner"])
+                ausas_cav_frac_all[ic, step] = float(
+                    aw_commit["cav_frac"])
+                ausas_theta_min_all[ic, step] = float(
+                    aw_commit["theta_min"])
+                ausas_theta_max_all[ic, step] = float(
+                    aw_commit["theta_max"])
+                # If the commit succeeded, the step's pressure /
+                # forces should reflect the COMMITTED solve, not the
+                # last trial — preserves Ausas mass conservation in
+                # the post-step diagnostic block below.
+                if aw_commit["ok"] and aw_commit["P_phys"] is not None:
+                    P = np.asarray(aw_commit["P_phys"])
+                    H = H_committed
+                    Fx_committed, Fy_committed = compute_hydro_forces(
+                        P, p_scale_step, Phi_mesh,
+                        phi_1D, Z_1D, params.R, params.L)
+                    Fx_hyd, Fy_hyd = float(Fx_committed), float(
+                        Fy_committed)
+                    solve_ok = True
 
             # Per-step diagnostics.
             if solve_ok and P is not None and H is not None:
@@ -1548,6 +1754,13 @@ def run_transient(F_max=None, debug=False,
             steps_completed_arr[ic] = n_steps
 
         contact_clamp_count[ic] = contact_count
+        # Stage J — close-out per-config Ausas counters.
+        if ausas_state is not None:
+            ausas_state_reset_count[ic] = int(ausas_state.reset_count)
+            ausas_failed_step_count[ic] = int(
+                ausas_state.failed_step_count)
+            ausas_rejected_commit_count[ic] = int(
+                ausas_state.rejected_commit_count)
         t_cfg = _time.time() - t_cfg_start
         cfg_times.append(t_cfg)
         n_solver_fail = int(solver_failed_count[ic])
@@ -1782,4 +1995,23 @@ def run_transient(F_max=None, debug=False,
         "N_phi_grid": int(N_phi_eff),
         "N_z_grid": int(N_z_eff),
         "texture_resolution_diagnostic": texture_res_diag,
+        # Stage J — Ausas dynamic + groove diagnostics. The legacy
+        # half-Sommerfeld path produces zero-filled Ausas arrays so
+        # downstream consumers can read these unconditionally.
+        "cavitation_model": cavitation_str,
+        "texture_kind": str(texture_kind),
+        "groove_preset": (str(groove_preset)
+                            if groove_preset is not None else None),
+        "groove_preset_resolved": groove_preset_resolved,
+        "groove_relief_stats": groove_relief_stats,
+        "fidelity": (str(fidelity) if fidelity is not None else None),
+        "ausas_options": dict(ausas_options or {}),
+        "ausas_converged": ausas_converged_all,
+        "ausas_n_inner": ausas_n_inner_all,
+        "ausas_cav_frac": ausas_cav_frac_all,
+        "ausas_theta_min": ausas_theta_min_all,
+        "ausas_theta_max": ausas_theta_max_all,
+        "ausas_state_reset_count": ausas_state_reset_count,
+        "ausas_failed_step_count": ausas_failed_step_count,
+        "ausas_rejected_commit_count": ausas_rejected_commit_count,
     }
