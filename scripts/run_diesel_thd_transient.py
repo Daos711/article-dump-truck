@@ -333,7 +333,9 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                     grid: int, n_cycles: int,
                     d_phi_base: float, d_phi_peak: float,
                     runtime_s: float, cli_args: str,
-                    F_max_source: str = ""):
+                    F_max_source: str = "",
+                    peak_lo_deg: Optional[float] = None,
+                    peak_hi_deg: Optional[float] = None):
     sl = _last_cycle_slice(results)
     n_steps_last = int(results["n_steps_per_cycle"])
     cfgs = results["configs"]
@@ -345,6 +347,18 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         header = "Stage Diesel Transient THD-0 run — ABORTED OUTSIDE ENVELOPE"
     else:
         header = "Stage Diesel Transient THD-0 run — PARTIAL PRODUCTION RESULT"
+    # Stage Diesel Transient PeakWindow GridDiagnostic — prefer per-
+    # run anisotropic grid + peak window from the results dict, fall
+    # back to legacy isotropic ``grid`` and the kwargs.
+    n_phi_grid = int(results.get("N_phi_grid", grid))
+    n_z_grid = int(results.get("N_z_grid", grid))
+    peak_lo = float(results.get(
+        "peak_lo_deg",
+        peak_lo_deg if peak_lo_deg is not None else 330.0))
+    peak_hi = float(results.get(
+        "peak_hi_deg",
+        peak_hi_deg if peak_hi_deg is not None else 480.0))
+    tex_diag = results.get("texture_resolution_diagnostic") or {}
     lines = [
         header,
         f"  thermal mode    : {thermal.mode}",
@@ -354,9 +368,10 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         f"  cp_J_kgK        : {thermal.cp_J_kgK:.1f}",
         f"  mdot_floor_kg_s : {thermal.mdot_floor_kg_s:.2e} "
         "(mdot policy: max(rho*|Q|, mdot_floor))",
-        f"  grid            : {grid} x {grid} (N_phi x N_Z)",
+        f"  spatial grid    : {n_phi_grid} x {n_z_grid} (N_phi x N_Z)",
         f"  n_cycles        : {n_cycles}",
         f"  d_phi_base/peak : {d_phi_base}° / {d_phi_peak}°",
+        f"  fine d_phi window : {peak_lo:.1f}° - {peak_hi:.1f}°",
         f"  F_max           : {float(results['F_max'])/1e3:.1f} kN",
         f"  F_max_source    : {F_max_source}" if F_max_source else "",
         f"  runtime_s       : {runtime_s:.1f}",
@@ -370,6 +385,33 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         "",
     ]
     lines = [ln for ln in lines if ln != ""] + [""]
+
+    # Stage Diesel Transient PeakWindow GridDiagnostic — texture
+    # pocket resolution block (independent of configs; same for all
+    # textured rows since geometry + grid are run-global).
+    if tex_diag:
+        cpp_phi = float(tex_diag.get("cells_per_pocket_phi", float("nan")))
+        cpp_z = float(tex_diag.get("cells_per_pocket_z", float("nan")))
+        status_str = str(tex_diag.get("resolution_status", "unknown"))
+        rec_n_phi = int(tex_diag.get("recommended_n_phi_min", 0))
+        lines.append("texture resolution :")
+        lines.append(
+            f"  cells_per_pocket_phi : {cpp_phi:.2f}  "
+            f"(N_phi={n_phi_grid})"
+        )
+        lines.append(
+            f"  cells_per_pocket_z   : {cpp_z:.2f}  "
+            f"(N_z={n_z_grid})"
+        )
+        lines.append(f"  resolution_status    : {status_str}")
+        lines.append(f"  recommended_N_phi_min (cells>=4) : {rec_n_phi}")
+        if status_str == "insufficient":
+            lines.append(
+                "  [WARN] texture pocket under-resolved "
+                f"(cells_per_pocket_phi={cpp_phi:.2f} < 4); "
+                f"increase --n-phi to >= {rec_n_phi}."
+            )
+        lines.append("")
 
     if global_status == "aborted_outside_envelope":
         # All configs aborted — the legacy diagnostic header.
@@ -930,6 +972,8 @@ def _regenerate_summary_from_dir(run_dir: str) -> None:
         runtime_s=float("nan"),
         cli_args="(regenerated from data.npz)",
         F_max_source="(regenerated)",
+        peak_lo_deg=None,
+        peak_hi_deg=None,
     )
     print(f"summary.txt regenerated in {run_dir}")
 
@@ -1043,6 +1087,10 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         n_cycles=args.n_cycles,
         d_phi_base_deg=args.d_phi_base,
         d_phi_peak_deg=args.d_phi_peak,
+        peak_lo_deg=float(args.peak_lo_deg),
+        peak_hi_deg=float(args.peak_hi_deg),
+        n_phi_grid=args.n_phi,
+        n_z_grid=args.n_z,
         retry_config=retry_cfg,
         envelope_abort=envelope_abort,
         firing_sector_deg=getattr(args, "firing_sector_resolved", None),
@@ -1060,7 +1108,9 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
                     d_phi_peak=float(args.d_phi_peak),
                     runtime_s=dt,
                     cli_args=" ".join(sys.argv[1:]),
-                    F_max_source=F_max_source)
+                    F_max_source=F_max_source,
+                    peak_lo_deg=float(args.peak_lo_deg),
+                    peak_hi_deg=float(args.peak_hi_deg))
 
     title_g = f"gamma={thermal.gamma_mix:.2f} tau={thermal.tau_th_s:.2f}s"
     _plot_last_cycle(results, "T_eff", "T_eff (deg C)",
@@ -1134,6 +1184,25 @@ def main(argv=None):
                     help="Base crank-angle step (deg).")
     pa.add_argument("--d-phi-peak", type=float, default=2.0,
                     help="Adaptive step at firing peak (deg).")
+    # Stage Diesel Transient PeakWindow GridDiagnostic.
+    pa.add_argument("--peak-lo-deg", dest="peak_lo_deg",
+                    type=float, default=330.0,
+                    help="Lower bound of the fine-d_phi window (deg). "
+                         "Default 330.")
+    pa.add_argument("--peak-hi-deg", dest="peak_hi_deg",
+                    type=float, default=480.0,
+                    help="Upper bound of the fine-d_phi window (deg). "
+                         "Default 480 covers the full production "
+                         "metrics window 340°-480° including post-"
+                         "peak recovery; legacy default was 420°.")
+    pa.add_argument("--n-phi", dest="n_phi", type=int, default=None,
+                    help="Circumferential grid resolution Nφ. If "
+                         "unspecified, falls back to --n-grid (legacy "
+                         "isotropic). Use a larger Nφ to resolve the "
+                         "texture pocket (cells_per_pocket >= 4).")
+    pa.add_argument("--n-z", dest="n_z", type=int, default=None,
+                    help="Axial grid resolution N_Z. If unspecified, "
+                         "falls back to --n-grid (legacy isotropic).")
     pa.add_argument("--cavitation", default="half_sommerfeld")
     pa.add_argument("--configs", default=None,
                     help="comma-separated keys: "

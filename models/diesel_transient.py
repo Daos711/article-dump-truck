@@ -277,10 +277,18 @@ def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
 def get_step_deg(phi_deg, *, d_phi_base_deg: Optional[float] = None,
                   d_phi_peak_deg: float = 0.25,
                   peak_lo_deg: float = 330.0,
-                  peak_hi_deg: float = 420.0):
+                  peak_hi_deg: float = 480.0):
     """Адаптивный шаг: ``d_phi_peak_deg`` у пика Вибе, ``d_phi_base_deg``
     вне. Дефолт ``d_phi_base_deg=params.d_phi_crank_deg`` сохраняет
-    legacy behaviour."""
+    legacy behaviour.
+
+    Stage Diesel Transient PeakWindow GridDiagnostic — default
+    ``peak_hi_deg`` raised from 420° to 480° so the production
+    metrics window 340°-480° is fully covered by the fine step.
+    Recovery angles (down to ε < 0.80 typically at φ ≈ 430°-470°)
+    used to be sampled at the coarse 1° base step which under-
+    resolved the orbit and the post-peak SOR.
+    """
     phi_mod = phi_deg % 720.0
     base = (float(d_phi_base_deg)
              if d_phi_base_deg is not None
@@ -288,6 +296,41 @@ def get_step_deg(phi_deg, *, d_phi_base_deg: Optional[float] = None,
     if peak_lo_deg <= phi_mod <= peak_hi_deg:
         return float(d_phi_peak_deg)
     return base
+
+
+def texture_resolution_diagnostic(
+    N_phi: int, N_z: int,
+    R: float, L: float,
+    a_dim: float, b_dim: float,
+) -> Dict[str, Any]:
+    """Diagnose whether a (Nφ × N_Z) grid resolves the elliptical
+    texture pocket. ``a_dim`` and ``b_dim`` are physical axial and
+    circumferential semi-axes (meters), matching ``DieselParams``.
+    Pocket full angular width = 2·b_dim/R rad; full non-dim axial
+    width = 4·a_dim/L (since physical z = (L/2)·Z so Z ∈ [-1, +1]).
+    Returns cells per pocket in each direction, a categorical
+    ``resolution_status`` ('ok' / 'marginal' / 'insufficient'), and
+    the minimum Nφ at which cells_per_pocket_phi reaches 4.
+    """
+    N_phi = int(N_phi)
+    N_z = int(N_z)
+    cells_per_pocket_phi = float(N_phi) * float(b_dim) / (np.pi * float(R))
+    cells_per_pocket_z = 2.0 * float(N_z) * float(a_dim) / float(L)
+    if cells_per_pocket_phi >= 6.0:
+        status = "ok"
+    elif cells_per_pocket_phi >= 4.0:
+        status = "marginal"
+    else:
+        status = "insufficient"
+    recommended_n_phi_min = int(np.ceil(4.0 * np.pi * float(R) / float(b_dim)))
+    return {
+        "N_phi": N_phi,
+        "N_z": N_z,
+        "cells_per_pocket_phi": cells_per_pocket_phi,
+        "cells_per_pocket_z": cells_per_pocket_z,
+        "resolution_status": status,
+        "recommended_n_phi_min": recommended_n_phi_min,
+    }
 
 
 def _solve_dynamic_with_retry(
@@ -877,7 +920,11 @@ def run_transient(F_max=None, debug=False,
                   d_phi_peak_deg: float = 0.25,
                   retry_config: Optional[SolverRetryConfig] = None,
                   envelope_abort: Optional[EnvelopeAbortConfig] = None,
-                  firing_sector_deg: Optional[Tuple[float, float]] = None):
+                  firing_sector_deg: Optional[Tuple[float, float]] = None,
+                  peak_lo_deg: float = 330.0,
+                  peak_hi_deg: float = 480.0,
+                  n_phi_grid: Optional[int] = None,
+                  n_z_grid: Optional[int] = None):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -923,9 +970,35 @@ def run_transient(F_max=None, debug=False,
     firing_sector_deg = (float(firing_sector_deg[0]),
                           float(firing_sector_deg[1]))
 
-    N = int(n_grid) if n_grid is not None else int(params.N_grid_transient)
-    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(N, N)
+    # Anisotropic grid: legacy isotropic ``n_grid`` still works when
+    # neither ``n_phi_grid`` nor ``n_z_grid`` is supplied; otherwise
+    # the explicit (Nφ, Nz) win. setup_grid already accepts (N_phi,
+    # N_Z) so no solver-side change is required.
+    N_legacy = int(n_grid) if n_grid is not None else int(
+        params.N_grid_transient)
+    N_phi_eff = int(n_phi_grid) if n_phi_grid is not None else N_legacy
+    N_z_eff = int(n_z_grid) if n_z_grid is not None else N_legacy
+    phi_1D, Z_1D, Phi_mesh, Z_mesh, d_phi, d_Z = setup_grid(
+        N_phi_eff, N_z_eff)
     phi_c, Z_c = setup_texture(params)
+
+    # Stage Diesel Transient PeakWindow GridDiagnostic — diagnose
+    # whether the chosen Nφ × N_Z grid resolves the elliptical
+    # texture pocket. The diagnostic depends only on grid + global
+    # bearing geometry, so it is the same for every textured config.
+    texture_res_diag = texture_resolution_diagnostic(
+        N_phi_eff, N_z_eff,
+        R=params.R, L=params.L,
+        a_dim=params.a_dim, b_dim=params.b_dim,
+    )
+    if texture_res_diag["resolution_status"] == "insufficient":
+        print(
+            "  [WARN] texture pocket under-resolved: "
+            f"cells_per_pocket_phi="
+            f"{texture_res_diag['cells_per_pocket_phi']:.2f} < 4 "
+            f"(N_phi={N_phi_eff}; recommend N_phi >= "
+            f"{texture_res_diag['recommended_n_phi_min']})"
+        )
 
     omega = 2 * np.pi * params.n / 60.0
     U = omega * params.R
@@ -941,6 +1014,8 @@ def run_transient(F_max=None, debug=False,
             phi_cur,
             d_phi_base_deg=d_phi_base_deg,
             d_phi_peak_deg=d_phi_peak_deg,
+            peak_lo_deg=peak_lo_deg,
+            peak_hi_deg=peak_hi_deg,
         )
     phi_crank_deg = np.array(phi_list)
     n_steps = len(phi_crank_deg)
@@ -1047,6 +1122,8 @@ def run_transient(F_max=None, debug=False,
                 phi_crank_deg[step],
                 d_phi_base_deg=d_phi_base_deg,
                 d_phi_peak_deg=d_phi_peak_deg,
+                peak_lo_deg=peak_lo_deg,
+                peak_hi_deg=peak_hi_deg,
             )) / omega
 
             # Per-step thermal: η fixed for the whole Verlet substep.
@@ -1504,4 +1581,10 @@ def run_transient(F_max=None, debug=False,
         "steps_completed": steps_completed_arr,
         "applicable": applicable_arr,
         "applicable_reason": applicable_reason_arr,
+        # Stage Diesel Transient PeakWindow GridDiagnostic.
+        "peak_lo_deg": float(peak_lo_deg),
+        "peak_hi_deg": float(peak_hi_deg),
+        "N_phi_grid": int(N_phi_eff),
+        "N_z_grid": int(N_z_eff),
+        "texture_resolution_diagnostic": texture_res_diag,
     }
