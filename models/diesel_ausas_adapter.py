@@ -194,10 +194,6 @@ def set_ausas_backend_for_tests(
 # ─── Commit-once one-step wrapper ──────────────────────────────────
 
 
-_DEFAULT_AUSAS_TOL = 1e-6
-_DEFAULT_AUSAS_MAX_INNER = 200
-
-
 def ausas_one_step_with_state(
     state: DieselAusasState,
     *,
@@ -294,10 +290,21 @@ def ausas_one_step_with_state(
     )
     if extra_options:
         kwargs.update(extra_options)
-    # Convergence threshold for the derived ``ok`` flag — matches
-    # the kwarg the runner can override.
-    tol = float(kwargs.get("tol", _DEFAULT_AUSAS_TOL))
-    max_inner = int(kwargs.get("max_inner", _DEFAULT_AUSAS_MAX_INNER))
+    # ``max_inner`` is only used to derive the convergence flag when
+    # the solver does not return one explicitly. If the caller did
+    # not override it, we don't know the solver's internal budget,
+    # so we MUST trust the solver: a finite return value with no
+    # explicit non-convergence flag means the step is accepted. We
+    # never compare ``residual`` against a local guess at ``tol``
+    # because the solver's internal stopping criterion can be
+    # tighter or looser than any default we'd pick here, and a
+    # mismatched local tol would silently drop accepted steps as
+    # ``rejected_commit_count`` (the precise regression that broke
+    # the first GPU integration smoke).
+    user_max_inner = (
+        int(extra_options["max_inner"])
+        if (extra_options is not None
+            and "max_inner" in extra_options) else None)
 
     try:
         out = backend(**kwargs)
@@ -322,14 +329,22 @@ def ausas_one_step_with_state(
     P_phys, theta_phys, residual, n_inner, ok_explicit = (
         _unpack_ausas_return(out))
 
-    # Derive ``ok``: short shapes return ok_explicit=None; for those
-    # use n_inner < max_inner AND residual <= tol (residual stays
-    # NaN in 2-/3-tuple legacy shapes, in which case we trust
-    # n_inner < max_inner alone).
+    # Derive ``ok``:
+    # * If the solver explicitly returned a convergence flag, honour
+    #   it (5-tuple / dict shapes only).
+    # * Otherwise: trust the solver. A finite return with no
+    #   explicit failure flag means the step is accepted. The only
+    #   information we can use independently is ``user_max_inner``
+    #   — when the caller passed ``max_inner`` in ``extra_options``,
+    #   we know the budget, and ``n_inner >= max_inner`` then
+    #   indicates the solver hit the budget without converging.
+    #   When the caller did NOT pass ``max_inner``, the solver's
+    #   internal default is unknown and we must NOT second-guess it.
     if ok_explicit is None:
-        ok_residual = (np.isfinite(residual) and residual <= tol) \
-            or (not np.isfinite(residual))
-        ok = bool(n_inner < max_inner) and bool(ok_residual)
+        if user_max_inner is not None and n_inner >= user_max_inner:
+            ok = False
+        else:
+            ok = True
     else:
         ok = bool(ok_explicit)
 

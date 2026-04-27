@@ -42,15 +42,18 @@ def test_phi_padding_roundtrip():
 # ─── Helper: deterministic stub backend ────────────────────────────
 
 
-def _make_backend(*, ok: bool = True, n_inner: int = 7,
+def _make_backend(*, n_inner: int = 7,
                   residual: float = 1e-9,
                   raise_exc: bool = False):
     """Return a Python stub that mimics the real
     ``ausas_unsteady_one_step_gpu`` 4-tuple return shape
     ``(P, theta, residual, n_inner)`` — Stage J integration
-    regression Bug 2 fix. The optional ``ok`` flag drives the
-    derived convergence by setting ``residual`` and ``n_inner``
-    inside vs outside the gate."""
+    regression Bug 2 fix. The adapter trusts the solver: a finite
+    return with no explicit non-convergence flag is an accepted
+    step. To force the derived ``ok`` flag to ``False``, the caller
+    must pass ``max_inner`` in ``extra_options`` such that
+    ``n_inner >= max_inner`` — which is precisely the budget-
+    exhausted condition that the live runner would also detect."""
     calls: list = []
 
     def fake(**kwargs):
@@ -61,10 +64,7 @@ def _make_backend(*, ok: bool = True, n_inner: int = 7,
         # Synthetic but deterministic: P = 0.5*H, theta = clip(H, 0, 1).
         P = 0.5 * H
         theta = np.clip(H, 0.0, 1.0)
-        # When ``ok`` is False, return a residual ABOVE the default
-        # tol so the adapter's derived ok-flag flips to False.
-        res = float(residual) if ok else 1.0
-        return (P, theta, res, int(n_inner))
+        return (P, theta, float(residual), int(n_inner))
 
     fake.calls = calls
     return fake
@@ -210,6 +210,68 @@ def test_half_sommerfeld_path_does_not_require_ausas_state():
     assert sig.parameters["groove_preset"].default is None
     assert sig.parameters["fidelity"].default is None
     assert sig.parameters["ausas_options"].default is None
+
+
+def test_commit_accepts_step_when_max_inner_not_overridden():
+    """When the caller does NOT override ``max_inner`` in
+    ``extra_options``, the adapter must trust the solver: a finite
+    return value (no explicit non-convergence flag) means the step
+    is accepted, ``step_index`` advances by 1, and
+    ``rejected_commit_count`` stays 0.
+
+    Regression guard for the live-GPU smoke that hit
+    ``rejected_commit_count = 1, step_index = 0`` after every step
+    because the adapter was comparing the solver's residual against
+    a hard-coded local ``tol = 1e-6`` and demanding ``n_inner <
+    200`` against a hard-coded local ``max_inner``. Both numbers
+    were guesses unrelated to the solver's internal stopping
+    criterion, and they silently rejected accepted steps.
+    """
+    # Backend reports n_inner=150 with a residual of 5e-3 — well
+    # above the legacy local tol guess of 1e-6. The runner did not
+    # pass ``max_inner`` overrides, so the adapter has no business
+    # second-guessing the solver: the step is accepted.
+    backend = _make_backend(n_inner=150, residual=5e-3)
+    set_ausas_backend_for_tests(backend)
+    try:
+        state = DieselAusasState.cold_start(N_phi=8, N_z=4)
+        H = np.ones((4, 8))
+        out = ausas_one_step_with_state(
+            state, H_curr_phys=H, dt_s=1e-4,
+            d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
+            commit=True,
+        )
+        assert out["ok"] is True
+        assert state.step_index == 1
+        assert state.rejected_commit_count == 0
+        assert out["residual"] == pytest.approx(5e-3)
+        assert out["n_inner"] == 150
+    finally:
+        set_ausas_backend_for_tests(None)
+
+
+def test_commit_rejects_step_when_n_inner_hits_user_max_inner():
+    """When the caller explicitly passes ``max_inner`` in
+    ``extra_options`` and the solver returns ``n_inner >=
+    max_inner``, the adapter must mark the step as not converged
+    (ok=False) and increment ``rejected_commit_count`` without
+    advancing ``step_index``."""
+    backend = _make_backend(n_inner=200, residual=1.0)
+    set_ausas_backend_for_tests(backend)
+    try:
+        state = DieselAusasState.cold_start(N_phi=8, N_z=4)
+        H = np.ones((4, 8))
+        out = ausas_one_step_with_state(
+            state, H_curr_phys=H, dt_s=1e-4,
+            d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
+            extra_options={"max_inner": 200},
+            commit=True,
+        )
+        assert out["ok"] is False
+        assert state.step_index == 0
+        assert state.rejected_commit_count == 1
+    finally:
+        set_ausas_backend_for_tests(None)
 
 
 def test_set_backend_none_clears_cache_for_re_probe():
