@@ -35,6 +35,7 @@ from .guards import (
     GuardOutcome,
     PhysicalGuardsConfig,
     RejectionReason,
+    check_mechanical_candidate,
     check_physical_guards,
     check_solver_validity,
 )
@@ -561,13 +562,100 @@ def _run_damped_implicit_film(
 
     fixed_point_converged = False
     mech_relax_min_seen = relax
+    # Stage J fu-2 Step 9 — line-search anchor + last-rejection
+    # tracking. ``last_rejection`` carries the GuardOutcome of the
+    # most recent guard reject so that, on line-search exhaustion
+    # (``relax < mech_relax_min``), the kernel reports the SPECIFIC
+    # gate that drove the failure (per user's followup-2 §3.4
+    # diagnostic-priority decision: a real rejection bucket like
+    # PHYSICAL_PRESSURE_GPA is more informative in summary than a
+    # generic MECHANICAL_RELAX_EXHAUSTED).
+    last_rejection: Optional[GuardOutcome] = None
 
-    # ── Picard fixed-point loop ────────────────────────────────
+    # Anchor = last accepted candidate (initial = step start).
+    ex_anchor, ey_anchor = float(ex_n), float(ey_n)
+    vx_anchor, vy_anchor = float(vx_n), float(vy_n)
+    ax_anchor, ay_anchor = float(ax_prev), float(ay_prev)
+    # Candidate = current attempt (initial = post-predictor-clamp Verlet).
+    ex_cand, ey_cand = float(ex_pred), float(ey_pred)
+    vx_cand, vy_cand = float(vx_n), float(vy_n)
+
+    # Empty-result placeholder for trials skipped by the mechanical
+    # gate (no GPU call → no real PressureSolveResult).
+    def _empty_pressure_result(reason: str) -> PressureSolveResult:
+        return PressureSolveResult(
+            P_nd=None, theta=None,
+            Fx_hyd=float("nan"), Fy_hyd=float("nan"),
+            H_used=np.zeros((1, 1)),
+            residual=float("nan"), n_inner=0, converged=False,
+            backend_name=backend.name, reason=reason,
+        )
+
+    # ── Picard + line-search loop ──────────────────────────────
     for k in range(max_mech_inner):
-        eps_x_old = ex_pred / context.c
-        eps_y_old = ey_pred / context.c
-        H_ = build_H_fn(eps_x_old, eps_y_old)
         n_trials += 1
+
+        # Stage J fu-2 Step 9 — mechanical candidate guard runs
+        # BEFORE the GPU call. A candidate that violates Δε bounds
+        # or sits at the eps_max wall is rejected immediately
+        # (saves a GPU trial that would only produce a useless
+        # GPa pressure). Skipped when the policy declares no
+        # bounds (``max_delta_eps_inner is None``).
+        mech_outcome = check_mechanical_candidate(
+            eps_x_curr=ex_anchor / context.c,
+            eps_y_curr=ey_anchor / context.c,
+            eps_x_cand=ex_cand / context.c,
+            eps_y_cand=ey_cand / context.c,
+            eps_x_step_start=ex_n / context.c,
+            eps_y_step_start=ey_n / context.c,
+            eps_max=eps_max,
+            max_delta_eps_inner=policy.max_delta_eps_inner,
+            max_delta_eps_step=policy.max_delta_eps_step,
+        )
+
+        if not mech_outcome.accept:
+            # Mechanical reject — log skipped trial, shrink relax,
+            # re-blend toward anchor; NO GPU call.
+            trial_log.append(TrialRecord(
+                inner=k, relax_used=float(relax),
+                eps_x_cand=ex_cand / context.c,
+                eps_y_cand=ey_cand / context.c,
+                pressure_result=_empty_pressure_result(
+                    "skipped_by_mechanical_guard"),
+                outcome_solver=GuardOutcome(
+                    accept=True,
+                    reason=RejectionReason.NONE,
+                    detail="skipped"),
+                outcome_physical=GuardOutcome(
+                    accept=True,
+                    reason=RejectionReason.NONE,
+                    detail="skipped"),
+                outcome_mechanical=mech_outcome,
+                accepted=False,
+            ))
+            last_rejection = mech_outcome
+            relax *= 0.5
+            mech_relax_min_seen = min(mech_relax_min_seen, relax)
+            if relax < float(policy.mech_relax_min):
+                solve_ok = False
+                solve_reason = (
+                    f"line_search_exhausted_"
+                    f"{mech_outcome.reason.value}: "
+                    f"{mech_outcome.detail}")
+                break
+            ex_cand = ex_anchor + relax * (ex_cand - ex_anchor)
+            ey_cand = ey_anchor + relax * (ey_cand - ey_anchor)
+            vx_cand = vx_anchor + relax * (vx_cand - vx_anchor)
+            vy_cand = vy_anchor + relax * (vy_cand - vy_anchor)
+            ex_cand, ey_cand, vx_cand, vy_cand, cl = clamp_fn(
+                ex_cand, ey_cand, vx_cand, vy_cand)
+            if cl:
+                n_contact_events += 1
+                p_warm_local = None
+            continue
+
+        # ── GPU trial ──
+        H_ = build_H_fn(ex_cand / context.c, ey_cand / context.c)
 
         result: PressureSolveResult = backend.solve_trial(
             H_curr=H_,
@@ -579,8 +667,8 @@ def _run_damped_implicit_film(
             context=context,
             extra_options=extra_options,
             p_warm_init=p_warm_local,
-            vx_squeeze=vx_corr,
-            vy_squeeze=vy_corr,
+            vx_squeeze=vx_cand,
+            vy_squeeze=vy_cand,
         )
         ok_ = bool(result.converged)
         reason_ = str(result.reason)
@@ -592,16 +680,7 @@ def _run_damped_implicit_film(
             retry_recovered_step = True
             omega_recovery = outcome["retry_omega"]
 
-        # Stage J fu-2 Step 7 — solver-validity HARD gate (doc 1
-        # §3.1). Always enforced for the damped policy regardless
-        # of ``physical_guards_mode``. Catches:
-        #   * ``n_inner == max_inner`` budget exhaust → SOLVER_BUDGET
-        #   * ``residual > tol`` (when finite)        → SOLVER_RESIDUAL
-        #   * non-finite P_nd / theta                 → SOLVER_NONFINITE
-        #   * negative pressure                       → SOLVER_NEG_PRESSURE
-        #   * theta out of [0, 1]                     → SOLVER_THETA_OUT_OF_RANGE
-        # Step 9 will add line-search shrink — at Step 7 a hard
-        # rejection breaks the Picard loop with the gate's reason.
+        # Solver-validity (Step 7).
         solver_outcome = check_solver_validity(
             backend_name=backend.name,
             P_nd=result.P_nd, theta=result.theta,
@@ -611,24 +690,7 @@ def _run_damped_implicit_film(
             ausas_max_inner=ausas_max_inner,
         )
 
-        # Stage J fu-2 Step 8 — physical guards (doc 1 §3.2 / §4.2).
-        # Pressure-amplitude cap, F-ratio cap, same-direction
-        # runaway, cavitation runaway. Honour ``guards_cfg.mode``
-        # (the EFFECTIVE runtime mode — CLI ``--ausas-physical-guards``
-        # may override the policy's baseline default):
-        #   * "hard"        — verdict drives trial rejection
-        #   * "diagnostic"  — verdict logged on TrialRecord but does
-        #                     NOT reject (warning emitted via
-        #                     ``warnings.warn`` so it surfaces in
-        #                     the runner / pytest output)
-        #   * "off"         — guard returns accept always
-        # ``policy.physical_guards_mode`` is the documented baseline
-        # for that policy; ``guards_cfg.mode`` carries the
-        # per-run effective value.
-        # Run the check only when the solver-validity gate already
-        # accepted: a trial that the solver rejected has NaN
-        # forces, which would only generate noisy false-positive
-        # warnings without information value.
+        # Physical guards (Step 8).
         phys_outcome: GuardOutcome
         guards_mode = guards_cfg.mode
         if (policy.enable_physical_guards
@@ -646,7 +708,6 @@ def _run_damped_implicit_film(
             )
             if (not phys_outcome.accept
                     and guards_mode == "diagnostic"):
-                # Diagnostic mode — surface but do NOT reject.
                 import warnings as _warnings
                 _warnings.warn(
                     f"Stage-J physical guard (diagnostic mode): "
@@ -658,53 +719,66 @@ def _run_damped_implicit_film(
             phys_outcome = GuardOutcome(
                 accept=True, reason=RejectionReason.NONE)
 
-        # Trial acceptance: solver-validity ALWAYS hard-gates;
-        # physical guards hard-gate only when ``guards_cfg.mode ==
-        # "hard"`` (per-run effective mode, see comment above).
         accepted_trial = bool(
             ok_
             and solver_outcome.accept
             and (phys_outcome.accept or guards_mode != "hard"))
 
         trial_log.append(TrialRecord(
-            inner=k,
-            relax_used=float(relax),
-            eps_x_cand=eps_x_old,
-            eps_y_cand=eps_y_old,
+            inner=k, relax_used=float(relax),
+            eps_x_cand=ex_cand / context.c,
+            eps_y_cand=ey_cand / context.c,
             pressure_result=result,
             outcome_solver=solver_outcome,
             outcome_physical=phys_outcome,
-            outcome_mechanical=GuardOutcome(
-                accept=True, reason=RejectionReason.NONE),
+            outcome_mechanical=mech_outcome,
             accepted=accepted_trial,
         ))
 
         if not accepted_trial:
-            p_warm_local = None
-            P_last = result.P_nd
-            H_last = H_
-            Fx_hyd = float("nan")
-            Fy_hyd = float("nan")
-            solve_ok = False
-            # Reason precedence: solver-validity > physical guards >
-            # backend's own ``reason``. The kernel surfaces the
-            # FIRST gate that rejected so the Stage 10 summary
-            # writer reports the right rejection bucket.
+            # Track which gate rejected for line-search-exhausted
+            # ``rejection_reason``. Solver-validity has priority,
+            # then physical guards (only in hard mode), else fall
+            # through to a generic SOLVER_RESIDUAL bucket.
             if not solver_outcome.accept:
-                solve_reason = (
-                    f"rejected_by_solver_validity:"
-                    f"{solver_outcome.reason.value}"
-                    f" ({solver_outcome.detail})")
+                last_rejection = solver_outcome
             elif (not phys_outcome.accept
                     and guards_mode == "hard"):
-                solve_reason = (
-                    f"rejected_by_physical_guards:"
-                    f"{phys_outcome.reason.value}"
-                    f" ({phys_outcome.detail})")
+                last_rejection = phys_outcome
             else:
-                solve_reason = reason_
-            break
+                last_rejection = GuardOutcome(
+                    accept=False,
+                    reason=RejectionReason.SOLVER_RESIDUAL,
+                    detail=reason_,
+                )
 
+            relax *= 0.5
+            mech_relax_min_seen = min(mech_relax_min_seen, relax)
+            if relax < float(policy.mech_relax_min):
+                solve_ok = False
+                P_last = result.P_nd
+                H_last = H_
+                Fx_hyd = float("nan")
+                Fy_hyd = float("nan")
+                solve_reason = (
+                    f"line_search_exhausted_"
+                    f"{last_rejection.reason.value}: "
+                    f"{last_rejection.detail}")
+                break
+
+            # Retreat candidate toward anchor with smaller relax.
+            ex_cand = ex_anchor + relax * (ex_cand - ex_anchor)
+            ey_cand = ey_anchor + relax * (ey_cand - ey_anchor)
+            vx_cand = vx_anchor + relax * (vx_cand - vx_anchor)
+            vy_cand = vy_anchor + relax * (vy_cand - vy_anchor)
+            ex_cand, ey_cand, vx_cand, vy_cand, cl = clamp_fn(
+                ex_cand, ey_cand, vx_cand, vy_cand)
+            if cl:
+                n_contact_events += 1
+                p_warm_local = None
+            continue
+
+        # ── Trial ACCEPTED ─────────────────────────────────────
         P_last = result.P_nd
         H_last = H_
         Fx_hyd = float(result.Fx_hyd)
@@ -713,48 +787,62 @@ def _run_damped_implicit_film(
         solve_reason = reason_
         p_warm_local = result.P_nd
 
-        # External load + Verlet correction → new candidate.
+        # New anchor = current accepted candidate.
+        ex_anchor = ex_cand
+        ey_anchor = ey_cand
+        vx_anchor = vx_cand
+        vy_anchor = vy_cand
+
+        # Compute Verlet-full target with the new force.
         Fx_ext = float(context.F_ext_x)
         Fy_ext = float(context.F_ext_y)
         ax_new = (Fx_ext + Fx_hyd) / m_shaft
         ay_new = (Fy_ext + Fy_hyd) / m_shaft
+        ax_anchor = ax_new
+        ay_anchor = ay_new
         vx_full = vx_n + 0.5 * (ax_prev + ax_new) * dt_step
         vy_full = vy_n + 0.5 * (ay_prev + ay_new) * dt_step
-        ex_pred_full = (ex_n + vx_full * dt_step
-                         + 0.5 * ax_new * dt_step ** 2)
-        ey_pred_full = (ey_n + vy_full * dt_step
-                         + 0.5 * ay_new * dt_step ** 2)
+        ex_full = (ex_n + vx_full * dt_step
+                    + 0.5 * ax_new * dt_step ** 2)
+        ey_full = (ey_n + vy_full * dt_step
+                    + 0.5 * ay_new * dt_step ** 2)
 
-        # Picard blend: move only ``relax`` toward the new estimate
-        # (vs legacy 100% jump). This is what damps squeeze-driven
-        # oscillations between Verlet iterations.
-        ex_pred_new = ex_pred + relax * (ex_pred_full - ex_pred)
-        ey_pred_new = ey_pred + relax * (ey_pred_full - ey_pred)
-        vx_corr_new = vx_corr + relax * (vx_full - vx_corr)
-        vy_corr_new = vy_corr + relax * (vy_full - vy_corr)
+        # Reset relax for the NEXT iteration's first try (line-
+        # search shrinks compound only WITHIN one inner attempt;
+        # a successful accept restarts the shrink budget).
+        relax = float(policy.mech_relax_initial)
 
-        # Mid-iteration clamp matches legacy_verlet: substep clamp
-        # is recorded as a contact event but does NOT set
-        # ``step_clamped`` (only predictor / final do).
-        ex_blend, ey_blend, vx_blend, vy_blend, cl = clamp_fn(
-            ex_pred_new, ey_pred_new, vx_corr_new, vy_corr_new)
+        # Picard blend: next-iteration candidate.
+        next_ex = ex_anchor + relax * (ex_full - ex_anchor)
+        next_ey = ey_anchor + relax * (ey_full - ey_anchor)
+        next_vx = vx_anchor + relax * (vx_full - vx_anchor)
+        next_vy = vy_anchor + relax * (vy_full - vy_anchor)
+        next_ex, next_ey, next_vx, next_vy, cl = clamp_fn(
+            next_ex, next_ey, next_vx, next_vy)
         if cl:
             n_contact_events += 1
             p_warm_local = None
 
-        # Picard convergence — magnitude of the candidate update
-        # in non-dim ε units.
         delta_eps = float(np.hypot(
-            (ex_blend - ex_pred) / context.c,
-            (ey_blend - ey_pred) / context.c,
+            (next_ex - ex_anchor) / context.c,
+            (next_ey - ey_anchor) / context.c,
         ))
-        ex_pred, ey_pred = ex_blend, ey_blend
-        vx_corr, vy_corr = vx_blend, vy_blend
-        mech_relax_min_seen = min(mech_relax_min_seen, float(relax))
-
         if delta_eps <= eps_tol:
             fixed_point_converged = True
             break
+
+        ex_cand, ey_cand = next_ex, next_ey
+        vx_cand, vy_cand = next_vx, next_vy
+
+    # ── End of Picard + line-search loop ──────────────────────
+    # Anchor holds the last accepted state (or the step-start
+    # state if no trial ever succeeded).
+    ex_pred = ex_anchor
+    ey_pred = ey_anchor
+    vx_corr = vx_anchor
+    vy_corr = vy_anchor
+    ax_new = ax_anchor
+    ay_new = ay_anchor
 
     # ── Accept post-iteration mechanical state ────────────────
     ex_new, ey_new = ex_pred, ey_pred
@@ -794,22 +882,21 @@ def _run_damped_implicit_film(
         rejection_reason = RejectionReason.NONE
         rejection_detail = ""
     else:
-        # Step 7+8 — pick the FIRST gate that rejected on the
-        # last trial. Solver-validity has priority; physical guards
-        # only count when ``mode == "hard"`` (diagnostic mode warns
-        # but doesn't reject, so the reason stays NONE on that
-        # axis). Falls back to SOLVER_RESIDUAL bucket if neither
-        # gate rejected (defensive).
-        if trial_log:
-            tr = trial_log[-1]
-            if not tr.outcome_solver.accept:
-                rejection_reason = tr.outcome_solver.reason
-            elif (not tr.outcome_physical.accept
-                    and guards_cfg.mode == "hard"):
-                rejection_reason = tr.outcome_physical.reason
-            else:
-                rejection_reason = RejectionReason.SOLVER_RESIDUAL
+        # Step 9 — surface ``last_rejection.reason`` (the SPECIFIC
+        # gate that drove every retry until the line search
+        # exhausted ``mech_relax_min``). Per user followup-2 §3.4:
+        # NO new MECHANICAL_RELAX_EXHAUSTED bucket — a real
+        # rejection like SOLVER_BUDGET / PHYSICAL_PRESSURE_GPA /
+        # MECHANICAL_DELTA_EPS_INNER preserves diagnostic value
+        # for the Stage 10 summary. ``last_rejection`` is set on
+        # every guard-reject branch (solver, physical-hard,
+        # mechanical) so this covers all paths to ``solve_ok=False``.
+        if last_rejection is not None:
+            rejection_reason = last_rejection.reason
         else:
+            # Defensive — solve_ok=False without a recorded
+            # last_rejection should not happen after Step 9, but
+            # keep the bucket fallback for robustness.
             rejection_reason = RejectionReason.SOLVER_RESIDUAL
         rejection_detail = solve_reason
 

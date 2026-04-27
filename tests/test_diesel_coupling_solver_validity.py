@@ -225,19 +225,34 @@ def test_damped_kernel_breaks_on_n_inner_at_max():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1, (
-        f"Step 7 gate must break on first trial; got "
-        f"n_trials={ms.n_trials}")
+    # Stage J fu-2 Step 9 — line-search retries the same candidate
+    # with shrinking ``relax`` before declaring failure. Every retry
+    # produces the SAME SOLVER_BUDGET reject (the stub is constant),
+    # so the kernel exhausts ``policy.mech_relax_min`` and surfaces
+    # the LAST rejection reason as ``MechanicalStepResult.rejection_reason``
+    # (per user's followup-2 §3.4 diagnostic-priority decision: keep
+    # the specific reason rather than introducing a generic
+    # MECHANICAL_RELAX_EXHAUSTED bucket).
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_BUDGET, (
-        f"expected SOLVER_BUDGET, got {ms.rejection_reason}")
+        f"expected SOLVER_BUDGET (the rejection that drove every "
+        f"line-search retry), got {ms.rejection_reason}")
     assert "n_inner=5000" in ms.rejection_detail
-    # TrialRecord carries the solver outcome verbatim.
-    assert len(ms.trial_log) == 1
-    tr = ms.trial_log[0]
-    assert tr.accepted is False
-    assert tr.outcome_solver.accept is False
-    assert tr.outcome_solver.reason is RejectionReason.SOLVER_BUDGET
+    # n_trials may be > 1 (line-search budget) but must respect
+    # ``policy.max_mech_inner = 8`` and have exhausted
+    # ``mech_relax_min``.
+    assert 1 <= ms.n_trials <= POLICY_AUSAS_DYNAMIC.max_mech_inner
+    assert ms.mech_relax_min_seen < float(
+        POLICY_AUSAS_DYNAMIC.mech_relax_initial), (
+        f"line-search did not shrink relax: "
+        f"min_seen={ms.mech_relax_min_seen}, initial="
+        f"{POLICY_AUSAS_DYNAMIC.mech_relax_initial}")
+    # Every TrialRecord carries the solver outcome verbatim.
+    assert len(ms.trial_log) == ms.n_trials
+    for tr in ms.trial_log:
+        assert tr.accepted is False
+        assert tr.outcome_solver.accept is False
+        assert tr.outcome_solver.reason is RejectionReason.SOLVER_BUDGET
     # Ausas state never advances on a rejected step.
     assert state.step_index == 0
 
@@ -275,9 +290,14 @@ def test_damped_kernel_breaks_on_negative_pressure():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1
+    # Step 9 line-search retries before declaring failure — same
+    # invariant as the BUDGET test: state not committed, rejection
+    # reason matches, line search shrunk relax. ``n_trials`` may
+    # be > 1 due to retries.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_NEG_PRESSURE
+    assert ms.mech_relax_min_seen < float(
+        POLICY_AUSAS_DYNAMIC.mech_relax_initial)
     assert state.step_index == 0
 
 

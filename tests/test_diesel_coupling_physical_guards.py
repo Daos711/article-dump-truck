@@ -265,15 +265,22 @@ def test_damped_kernel_hard_mode_breaks_on_pressure_cap():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1
+    # Step 9 line-search retries: every retry produces the same
+    # PHYSICAL_PRESSURE_GPA reject, so the kernel exhausts
+    # ``policy.mech_relax_min`` and the surfaced rejection_reason
+    # is the LAST guard that failed (Followup-2 §3.4 diagnostic-
+    # priority — specific reason wins over generic exhaustion).
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.PHYSICAL_PRESSURE_GPA
+    assert ms.mech_relax_min_seen < float(
+        POLICY_AUSAS_DYNAMIC.mech_relax_initial)
     # Solver-validity passed (n_inner=100 < 5000, residual=1e-9 < 1e-6),
-    # so the rejection came from physical guards.
-    tr = ms.trial_log[0]
-    assert tr.outcome_solver.accept is True
-    assert tr.outcome_physical.accept is False
-    assert tr.outcome_physical.reason is RejectionReason.PHYSICAL_PRESSURE_GPA
+    # so EVERY retry's solver_outcome is accept and physical_outcome
+    # rejects with the same reason.
+    for tr in ms.trial_log:
+        assert tr.outcome_solver.accept is True
+        assert tr.outcome_physical.accept is False
+        assert tr.outcome_physical.reason is RejectionReason.PHYSICAL_PRESSURE_GPA
 
 
 def test_damped_kernel_diagnostic_mode_warns_but_does_not_break():
