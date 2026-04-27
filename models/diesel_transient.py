@@ -400,6 +400,57 @@ def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
     return Fx, Fy
 
 
+def _print_ausas_debug_step(
+    label, *,
+    phi_deg, dt_s, aw_result,
+    eps_x, eps_y, p_scale,
+    Fx_hyd, Fy_hyd, F_max,
+):
+    """Stage J followup §4 — diagnostic line for the first N
+    Ausas-dynamic Verlet substep / accepted-step decisions.
+
+    Activated by ``run_transient(..., debug_first_steps=N)`` /
+    CLI ``--debug-first-steps N``. Prints once per substep call
+    (``TRIAL k=...``) plus once per accepted step
+    (``ACCEPTED``); the output goes to stdout BEFORE the regular
+    progress / summary lines so the operator can locate the
+    Verlet break-down on a failing smoke without re-running.
+    """
+    Fx_ext_a, Fy_ext_a = load_diesel(phi_deg, F_max=F_max)
+    Fx_ext = float(np.asarray(Fx_ext_a).item())
+    Fy_ext = float(np.asarray(Fy_ext_a).item())
+    F_ext_mag = float(np.hypot(Fx_ext, Fy_ext))
+    F_hyd_mag = float(np.hypot(Fx_hyd, Fy_hyd))
+    if (F_hyd_mag > 0.0 and F_ext_mag > 0.0
+            and np.isfinite(F_hyd_mag) and np.isfinite(F_ext_mag)):
+        dot_norm = float(
+            (Fx_hyd * Fx_ext + Fy_hyd * Fy_ext)
+            / (F_hyd_mag * F_ext_mag))
+    else:
+        dot_norm = float("nan")
+    p_nd_max = float(aw_result.p_nd_max)
+    p_dim_max_MPa = (p_nd_max * float(p_scale) * 1e-6
+                     if np.isfinite(p_nd_max) else float("nan"))
+    print(
+        f"  [J-debug {label}] "
+        f"phi={float(phi_deg):.2f}° "
+        f"dt_s={float(dt_s):.4e}s dt_tau={float(aw_result.dt_ausas):.4e} "
+        f"eps=({float(eps_x):+.4f},{float(eps_y):+.4f}) "
+        f"|F_ext|={F_ext_mag/1e3:.2f}kN "
+        f"({Fx_ext/1e3:+.2f},{Fy_ext/1e3:+.2f}) "
+        f"|F_hyd|={F_hyd_mag/1e3:.4f}kN "
+        f"({float(Fx_hyd)/1e3:+.4f},{float(Fy_hyd)/1e3:+.4f}) "
+        f"dot_norm={dot_norm:+.3f} "
+        f"p_nd_max={p_nd_max:.4e} p_dim_max={p_dim_max_MPa:.3f}MPa "
+        f"theta=[{float(aw_result.theta_min):.3f},"
+        f"{float(aw_result.theta_max):.3f}] "
+        f"res={float(aw_result.residual):.2e} "
+        f"n_inner={int(aw_result.n_inner)} "
+        f"converged={bool(aw_result.converged)}",
+        flush=True,
+    )
+
+
 def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
                      eta, omega, R, L, c):
     """Сила трения."""
@@ -1069,7 +1120,8 @@ def run_transient(F_max=None, debug=False,
                   groove_preset: Optional[str] = None,
                   fidelity: Optional[str] = None,
                   ausas_options: Optional[Dict[str, Any]] = None,
-                  save_field_checkpoints: bool = False):
+                  save_field_checkpoints: bool = False,
+                  debug_first_steps: int = 0):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -1479,6 +1531,16 @@ def run_transient(F_max=None, debug=False,
                         ok_ = False
                         reason_ = (aw.reason if aw.reason
                                    else "ausas_failed")
+                    if step < int(debug_first_steps):
+                        _print_ausas_debug_step(
+                            f"step={step:03d} TRIAL k={k}",
+                            phi_deg=phi_deg, dt_s=dt_step,
+                            aw_result=aw,
+                            eps_x=eps_x_, eps_y=eps_y_,
+                            p_scale=p_scale_step,
+                            Fx_hyd=Fx_, Fy_hyd=Fy_,
+                            F_max=F_max,
+                        )
                 else:
                     base_kw = dict(
                         closure=closure, cavitation=cavitation,
@@ -1601,6 +1663,16 @@ def run_transient(F_max=None, debug=False,
                     Fx_hyd, Fy_hyd = float(Fx_committed), float(
                         Fy_committed)
                     solve_ok = True
+                if step < int(debug_first_steps):
+                    _print_ausas_debug_step(
+                        f"step={step:03d} ACCEPTED",
+                        phi_deg=phi_deg, dt_s=dt_step,
+                        aw_result=aw_commit,
+                        eps_x=ex / params.c, eps_y=ey / params.c,
+                        p_scale=p_scale_step,
+                        Fx_hyd=Fx_hyd, Fy_hyd=Fy_hyd,
+                        F_max=F_max,
+                    )
 
             # Per-step diagnostics.
             if solve_ok and P is not None and H is not None:

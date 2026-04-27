@@ -1504,6 +1504,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         fidelity=args.fidelity,
         ausas_options=(ausas_options if ausas_options else None),
         save_field_checkpoints=bool(args.save_field_checkpoints),
+        debug_first_steps=int(getattr(args, "debug_first_steps", 0) or 0),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -1655,6 +1656,16 @@ def main(argv=None):
                     action="store_true", default=False,
                     help="Save peak-pressure / min-hmin / max-eps "
                          "field checkpoints (Stage J).")
+    pa.add_argument("--debug-first-steps", dest="debug_first_steps",
+                    type=int, default=0,
+                    help="Stage J followup §4 — when running with "
+                         "--cavitation ausas_dynamic, print per-step "
+                         "diagnostics (phi, dt_s, dt_tau, eps, F_ext, "
+                         "F_hyd, dot_norm, p_nd_max, p_dim_max, theta, "
+                         "residual, n_inner, converged) for each Verlet "
+                         "trial substep AND the accepted commit, for "
+                         "the first N steps. Default 0 (off). "
+                         "Recommended N=5 for smoke debugging.")
     pa.add_argument("--configs", default=None,
                     help="comma-separated keys: "
                          + ", ".join(sorted(CONFIG_KEYS)))
