@@ -34,7 +34,8 @@ solver_dynamic_gpu = pytest.importorskip(
     "reynolds_solver.cavitation.ausas.solver_dynamic_gpu")
 
 
-from models.bearing_model import setup_grid, solve_and_compute  # noqa: E402
+from models.bearing_model import setup_grid  # noqa: E402
+from reynolds_solver import solve_reynolds  # noqa: E402
 from models.diesel_ausas_adapter import (  # noqa: E402
     DieselAusasState,
     ausas_one_step_with_state,
@@ -65,9 +66,12 @@ def test_p_nd_magnitude_within_one_order_of_legacy():
     H = build_H_2d(eps_x, eps_y, Phi, Z, dparams)
 
     # Half-Sommerfeld baseline.
-    P_legacy_nd, _, _, _ = solve_and_compute(
+    # Half-Sommerfeld baseline through the low-level GPU call —
+    # same path the runner takes for ``cavitation='half_sommerfeld'``.
+    P_legacy_nd, _, _, _ = solve_reynolds(
         H, d_phi, d_Z, dparams.R, dparams.L,
-        cavitation="half_sommerfeld", tol=1e-7, max_iter=50000)
+        closure="laminar", cavitation="half_sommerfeld",
+        tol=1e-7, max_iter=50000)
 
     # Ausas one-step with H_curr = H_prev (no squeeze).
     state = DieselAusasState.from_initial_gap(H)
@@ -106,9 +110,12 @@ def test_force_sign_agrees_with_legacy():
     p_scale = (6.0 * _ETA_DIESEL * _OMEGA_DIESEL
                * (dparams.R / dparams.c) ** 2)
 
-    P_legacy_nd, _, _, _ = solve_and_compute(
+    # Half-Sommerfeld baseline through the low-level GPU call —
+    # same path the runner takes for ``cavitation='half_sommerfeld'``.
+    P_legacy_nd, _, _, _ = solve_reynolds(
         H, d_phi, d_Z, dparams.R, dparams.L,
-        cavitation="half_sommerfeld", tol=1e-7, max_iter=50000)
+        closure="laminar", cavitation="half_sommerfeld",
+        tol=1e-7, max_iter=50000)
     Fx_l, Fy_l = compute_hydro_forces(
         P_legacy_nd, p_scale, Phi, phi_1D, Z_1D, dparams.R, dparams.L)
 

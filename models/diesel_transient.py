@@ -1477,7 +1477,8 @@ def run_transient(F_max=None, debug=False,
                         Fx_ = float("nan")
                         Fy_ = float("nan")
                         ok_ = False
-                        reason_ = aw.get("reason", "ausas_failed")
+                        reason_ = (aw.reason if aw.reason
+                                   else "ausas_failed")
                 else:
                     base_kw = dict(
                         closure=closure, cavitation=cavitation,
