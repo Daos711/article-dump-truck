@@ -300,7 +300,15 @@ def test_damped_kernel_mech_guard_skips_gpu_on_bad_candidate():
 def test_damped_kernel_line_search_shrinks_relax_on_physical_reject():
     """A converged-but-physically-bad solver result drives the
     line-search loop: ``relax`` halves on each rejection, and the
-    last-rejection reason matches the physical-guard verdict."""
+    last-rejection reason matches the physical-guard verdict.
+
+    To exercise the SHRINK path (rather than the Step 9 fixup's
+    reject-at-anchor abort), the test sets non-zero ``vx_n``,
+    ``vy_n`` so the Verlet predictor produces ``ex_pred != ex_n``;
+    that puts the candidate strictly off the anchor, and a
+    rejecting trial then drives the relax shrink retreat toward
+    anchor on each retry.
+    """
     set_ausas_backend_for_tests(None)
     ctx = _make_step_ctx()
     state = DieselAusasState.from_initial_gap(np.ones((8, 16)))
@@ -319,12 +327,20 @@ def test_damped_kernel_line_search_shrinks_relax_on_physical_reject():
         ms = advance_mechanical_step(
             backend=backend, backend_state=state,
             **_kernel_kwargs(ctx, POLICY_AUSAS_DYNAMIC,
+                              # Non-zero starting velocity so the
+                              # Verlet predictor moves the candidate
+                              # OFF the anchor by ~vx*dt = 1e-7 m
+                              # ≈ 8.3e-4 in ε units (above the 1e-12
+                              # reject-at-anchor floor; well below
+                              # the 0.10 max_delta_eps_inner cap).
+                              ex_n=0.0, ey_n=-0.6 * ctx.c,
+                              vx_n=1e-3, vy_n=1e-3,
                               mode="hard", profile="general"),
         )
     finally:
         set_ausas_backend_for_tests(None)
 
-    # Line-search shrunk relax at least once.
+    # Line-search shrunk relax at least once (cand was off-anchor).
     assert ms.mech_relax_min_seen < float(
         POLICY_AUSAS_DYNAMIC.mech_relax_initial), (
         f"line-search did not shrink: min_seen="
@@ -335,9 +351,13 @@ def test_damped_kernel_line_search_shrinks_relax_on_physical_reject():
     # retry with PHYSICAL_PRESSURE_GPA, that's the surfaced reason.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.PHYSICAL_PRESSURE_GPA
-    # The detail string includes the physical-guard rejection
-    # text (line_search_exhausted_<reason>: <detail>).
-    assert "line_search_exhausted" in ms.rejection_detail
+    # The detail string includes the line-search-exhausted tag
+    # (or, on borderline retreat, reject-at-anchor). Either path
+    # surfaces the physical-guard reason.
+    assert (
+        "line_search_exhausted" in ms.rejection_detail
+        or "reject_at_anchor" in ms.rejection_detail), (
+        f"unexpected detail: {ms.rejection_detail!r}")
     assert "physical_pressure_above_dim_max" in ms.rejection_detail
 
 

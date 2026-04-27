@@ -783,6 +783,40 @@ def _run_damped_implicit_film(
                     detail=reason_,
                 )
 
+            # Stage J fu-2 Step 9 fixup — if the rejected candidate
+            # is already AT the anchor (e.g. on k=0 the predictor
+            # equals ex_n / ey_n because vx_n=vy_n=ax_prev=ay_prev=0),
+            # then ``cand = anchor + relax*(cand - anchor) = anchor``
+            # for any relax — the line-search would issue (n)
+            # IDENTICAL GPU trials before exhausting. That's a real
+            # solver failure on the anchor itself; abort
+            # immediately with the SAME rejection reason rather
+            # than spinning the budget.
+            _retreat_dx = float(np.hypot(
+                (ex_cand - ex_anchor) / context.c,
+                (ey_cand - ey_anchor) / context.c))
+            if _retreat_dx <= 1e-12:
+                if debug_dump:
+                    print(
+                        f"    [J9-dump k={k} REJECT-AT-ANCHOR] "
+                        f"solver={solver_outcome.reason.value} "
+                        f"phys={phys_outcome.reason.value} "
+                        f"converged={ok_} reason={reason_!r} "
+                        f"retreat_Δε={_retreat_dx:.3e} ≤ 1e-12 "
+                        f"— abort line-search (anchor itself "
+                        f"failed; no shrink can recover)",
+                        flush=True)
+                solve_ok = False
+                P_last = result.P_nd
+                H_last = H_
+                Fx_hyd = float("nan")
+                Fy_hyd = float("nan")
+                solve_reason = (
+                    f"reject_at_anchor_"
+                    f"{last_rejection.reason.value}: "
+                    f"{last_rejection.detail}")
+                break
+
             if debug_dump:
                 print(
                     f"    [J9-dump k={k} REJECT] "

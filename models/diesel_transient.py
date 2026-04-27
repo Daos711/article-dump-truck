@@ -1519,6 +1519,19 @@ def run_transient(F_max=None, debug=False,
                     groove_relief=groove_relief,
                 )
 
+            # Stage J fu-2 Step 9 fixup — propagate the user's
+            # ``--ausas-tol`` / ``--ausas-max-inner`` (carried in
+            # ``ausas_options``) to the kernel's solver-validity
+            # cap. Hard-coding 1e-6 / 5000 here turns every
+            # legitimate ``residual <= user_tol`` solve into a
+            # false ``SOLVER_RESIDUAL`` reject and stalls the
+            # Picard loop on n_trials=1 forever. The HS path
+            # ignores ``ausas_tol`` / ``ausas_max_inner``, so this
+            # is safe to thread unconditionally.
+            _kernel_ausas_tol = float(
+                (ausas_options or {}).get("tol", 1e-6))
+            _kernel_ausas_max_inner = int(
+                (ausas_options or {}).get("max_inner", 5000))
             _ms = _coupling.advance_mechanical_step(
                 ex_n=ex_n, ey_n=ey_n,
                 vx_n=vx_n, vy_n=vy_n,
@@ -1535,8 +1548,8 @@ def run_transient(F_max=None, debug=False,
                 policy=_coupling.select_policy(_backend),
                 guards_cfg=_coupling.PhysicalGuardsConfig.from_profile(
                     "diagnostic", "general"),
-                ausas_tol=1e-6,
-                ausas_max_inner=5000,
+                ausas_tol=_kernel_ausas_tol,
+                ausas_max_inner=_kernel_ausas_max_inner,
                 extra_options=(ausas_options if use_ausas_dynamic
                                else None),
                 context=step_ctx,

@@ -225,28 +225,22 @@ def test_damped_kernel_breaks_on_n_inner_at_max():
     finally:
         set_ausas_backend_for_tests(None)
 
-    # Stage J fu-2 Step 9 — line-search retries the same candidate
-    # with shrinking ``relax`` before declaring failure. Every retry
-    # produces the SAME SOLVER_BUDGET reject (the stub is constant),
-    # so the kernel exhausts ``policy.mech_relax_min`` and surfaces
-    # the LAST rejection reason as ``MechanicalStepResult.rejection_reason``
-    # (per user's followup-2 §3.4 diagnostic-priority decision: keep
-    # the specific reason rather than introducing a generic
-    # MECHANICAL_RELAX_EXHAUSTED bucket).
+    # Stage J fu-2 Step 9 — with the test setup (vx_n=vy_n=0,
+    # ax_prev=ay_prev=0) the Verlet predictor produces ex_pred==ex_n,
+    # ey_pred==ey_n so the FIRST candidate equals the anchor. The
+    # Step 9 fixup detects ``|cand - anchor| < 1e-12`` and aborts
+    # the line-search immediately (shrinking can never recover when
+    # the anchor itself fails the gate); n_trials=1, the surfaced
+    # rejection reason is the SAME SOLVER_BUDGET enum.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_BUDGET, (
-        f"expected SOLVER_BUDGET (the rejection that drove every "
-        f"line-search retry), got {ms.rejection_reason}")
+        f"expected SOLVER_BUDGET, got {ms.rejection_reason}")
     assert "n_inner=5000" in ms.rejection_detail
-    # n_trials may be > 1 (line-search budget) but must respect
-    # ``policy.max_mech_inner = 8`` and have exhausted
-    # ``mech_relax_min``.
+    # solve_reason carries the abort path tag for the summary writer.
+    assert ("reject_at_anchor" in ms.solve_reason
+            or "line_search_exhausted" in ms.solve_reason), (
+        f"solve_reason={ms.solve_reason!r}")
     assert 1 <= ms.n_trials <= POLICY_AUSAS_DYNAMIC.max_mech_inner
-    assert ms.mech_relax_min_seen < float(
-        POLICY_AUSAS_DYNAMIC.mech_relax_initial), (
-        f"line-search did not shrink relax: "
-        f"min_seen={ms.mech_relax_min_seen}, initial="
-        f"{POLICY_AUSAS_DYNAMIC.mech_relax_initial}")
     # Every TrialRecord carries the solver outcome verbatim.
     assert len(ms.trial_log) == ms.n_trials
     for tr in ms.trial_log:
@@ -290,14 +284,11 @@ def test_damped_kernel_breaks_on_negative_pressure():
     finally:
         set_ausas_backend_for_tests(None)
 
-    # Step 9 line-search retries before declaring failure — same
-    # invariant as the BUDGET test: state not committed, rejection
-    # reason matches, line search shrunk relax. ``n_trials`` may
-    # be > 1 due to retries.
+    # Step 9 — same invariants as the BUDGET test: with cand=anchor
+    # at k=0 the kernel aborts immediately (no shrinking can
+    # recover). state not committed, rejection reason matches.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_NEG_PRESSURE
-    assert ms.mech_relax_min_seen < float(
-        POLICY_AUSAS_DYNAMIC.mech_relax_initial)
     assert state.step_index == 0
 
 
