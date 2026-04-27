@@ -143,7 +143,28 @@ class PressureBackend(Protocol):
         commit: bool,
         context: StepContext,
         extra_options: Optional[Dict[str, Any]] = None,
+        *,
+        p_warm_init: Optional[np.ndarray] = None,
+        vx_squeeze: float = 0.0,
+        vy_squeeze: float = 0.0,
     ) -> PressureSolveResult:
+        """Solve the pressure problem for a candidate film.
+
+        Per-trial kwargs:
+
+        ``p_warm_init``
+            Legacy SOR warm-start hint; consumed by
+            ``HalfSommerfeldBackend``. Ignored by stateful backends
+            (Ausas carries its own warm via ``state``).
+        ``vx_squeeze`` / ``vy_squeeze``
+            Current Verlet corrector velocities that drive the
+            squeeze term ``squeeze_to_api_params(-vx, -vy, c, omega,
+            d_phi)``. Consumed by ``HalfSommerfeldBackend``;
+            ignored by Ausas (squeeze comes from H_prev → H_curr).
+
+        The kernel updates these between trials so the within-step
+        warm / squeeze chain matches the legacy runner bit-for-bit.
+        """
         ...
 
 
@@ -153,10 +174,11 @@ class PressureBackend(Protocol):
 class HalfSommerfeldBackend:
     """Legacy half-Sommerfeld closure via ``solve_reynolds``.
 
-    Step 2 — skeleton only. Step 4 wires ``solve_trial`` to the
-    existing ``_solve_dynamic_with_retry`` call from
-    ``models.diesel_transient``. ``commit`` and ``state`` are
-    ignored (stateless backend).
+    Stateless: ``commit`` and ``state`` arguments are ignored.
+    The SOR warm-start ``p_warm_init`` is consumed per-call
+    (the kernel threads the up-to-date warm through the within-
+    step trial chain so behaviour matches the legacy runner
+    bit-for-bit).
     """
     name: str = "half_sommerfeld"
     stateful: bool = False
@@ -167,7 +189,8 @@ class HalfSommerfeldBackend:
         retry_config: Any,
         textured_for_retry: bool,
     ) -> None:
-        ...
+        self._retry_config = retry_config
+        self._textured_for_retry = bool(textured_for_retry)
 
     def solve_trial(
         self,
@@ -179,8 +202,63 @@ class HalfSommerfeldBackend:
         commit: bool,
         context: StepContext,
         extra_options: Optional[Dict[str, Any]] = None,
+        *,
+        p_warm_init: Optional[np.ndarray] = None,
+        vx_squeeze: float = 0.0,
+        vy_squeeze: float = 0.0,
     ) -> PressureSolveResult:
-        ...
+        # Stage J fu-2 Step 4 — extracted from the legacy
+        # ``for k in range(N_SUB):`` body. Behaviour is bit-for-bit
+        # identical to the pre-refactor runner (Gate 1 contract).
+        # Local imports avoid a top-level cycle through the runner.
+        # ``squeeze_to_api_params`` lives in ``reynolds_solver`` but
+        # the diesel runner already resolves it via a try-chain
+        # (``reynolds_solver.dynamic.squeeze`` /
+        # ``reynolds_solver.squeeze`` / ``reynolds_solver``); we
+        # reuse that resolution by importing through the runner's
+        # namespace.
+        from models.diesel_transient import (
+            _solve_dynamic_with_retry,
+            squeeze_to_api_params,
+        )
+
+        xp_, yp_, bt_ = squeeze_to_api_params(
+            -float(vx_squeeze),
+            -float(vy_squeeze),
+            context.c, context.omega, context.d_phi,
+        )
+        base_kw = dict(
+            closure=context.closure,
+            cavitation=context.cavitation,
+            tol=1e-5,
+            max_iter=50000,
+            P_init=p_warm_init,
+            xprime=xp_, yprime=yp_, beta=bt_,
+        )
+        P_, Fx_, Fy_, n_outer, ok_, reason_ = _solve_dynamic_with_retry(
+            H_curr, context.d_phi, context.d_Z,
+            context.R, context.L,
+            base_kw=base_kw,
+            p_scale=context.p_scale,
+            Phi_mesh=context.Phi_mesh,
+            phi_1D=context.phi_1D, Z_1D=context.Z_1D,
+            retry_config=self._retry_config,
+            textured=self._textured_for_retry,
+        )
+        Fx_f = float(Fx_) if np.isfinite(Fx_) else float("nan")
+        Fy_f = float(Fy_) if np.isfinite(Fy_) else float("nan")
+        return PressureSolveResult(
+            P_nd=P_,
+            theta=None,
+            Fx_hyd=Fx_f,
+            Fy_hyd=Fy_f,
+            H_used=H_curr,
+            residual=float("nan"),     # legacy SOR doesn't surface
+            n_inner=int(n_outer),
+            converged=bool(ok_),
+            backend_name=self.name,
+            reason=str(reason_),
+        )
 
 
 class AusasDynamicBackend:

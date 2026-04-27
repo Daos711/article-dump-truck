@@ -97,9 +97,47 @@ class PhysicalGuardsConfig:
     ) -> "PhysicalGuardsConfig":
         """Build a resolved config from profile + optional overrides.
 
-        Step 2 — skeleton only. Step 8 implements the body.
+        Profile choice picks the active ``p_dim_max_pa`` and
+        ``f_ratio_max`` limits:
+
+        * ``general`` → ``P_DIM_HARD_MAX_PA``, ``F_RATIO_HARD_MAX``
+        * ``smoke``   → ``P_DIM_SMOKE_MAX_PA``, ``F_RATIO_SMOKE_MAX``
+
+        Each of the four numeric thresholds can be overridden via the
+        matching ``p_dim_hard_pa`` / ``p_dim_smoke_pa`` /
+        ``f_ratio_hard`` / ``f_ratio_smoke`` kwargs (CLI flags surface
+        them in Step 10). Other thresholds (``same_dir_runaway_*``,
+        ``cav_frac_runaway``, theta tolerances, ε-floor) come from the
+        module-level constants verbatim from doc 1 §3.4.
         """
-        ...
+        p_hard = (float(p_dim_hard_pa) if p_dim_hard_pa is not None
+                  else P_DIM_HARD_MAX_PA)
+        p_smoke = (float(p_dim_smoke_pa) if p_dim_smoke_pa is not None
+                   else P_DIM_SMOKE_MAX_PA)
+        fr_hard = (float(f_ratio_hard) if f_ratio_hard is not None
+                   else F_RATIO_HARD_MAX)
+        fr_smoke = (float(f_ratio_smoke) if f_ratio_smoke is not None
+                    else F_RATIO_SMOKE_MAX)
+        if profile == "smoke":
+            p_dim_max = p_smoke
+            f_ratio_max = fr_smoke
+        else:
+            p_dim_max = p_hard
+            f_ratio_max = fr_hard
+        return cls(
+            mode=mode,
+            profile=profile,
+            p_dim_max_pa=p_dim_max,
+            f_ratio_max=f_ratio_max,
+            same_dir_runaway_dot_norm=SAME_DIR_RUNAWAY_DOT_NORM,
+            same_dir_runaway_f_ratio=SAME_DIR_RUNAWAY_F_RATIO,
+            cav_frac_runaway=CAV_FRAC_RUNAWAY,
+            early_phi_deg=float(early_phi_deg),
+            p_negative_tol_nd=P_NEGATIVE_TOL_ND,
+            theta_floor=THETA_FLOOR,
+            theta_ceil=THETA_CEIL,
+            f_ext_floor_n=F_EXT_FLOOR_N,
+        )
 
 
 # ─── Rejection taxonomy ────────────────────────────────────────────
