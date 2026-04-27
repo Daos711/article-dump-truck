@@ -1121,7 +1121,8 @@ def run_transient(F_max=None, debug=False,
                   fidelity: Optional[str] = None,
                   ausas_options: Optional[Dict[str, Any]] = None,
                   save_field_checkpoints: bool = False,
-                  debug_first_steps: int = 0):
+                  debug_first_steps: int = 0,
+                  seed: int = 0):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -2118,6 +2119,8 @@ def run_transient(F_max=None, debug=False,
         "N_phi_grid": int(N_phi_eff),
         "N_z_grid": int(N_z_eff),
         "texture_resolution_diagnostic": texture_res_diag,
+        # Stage J followup-2 — reproducibility marker.
+        "seed": int(seed),
         # Stage J — Ausas dynamic + groove diagnostics. The legacy
         # half-Sommerfeld path produces zero-filled Ausas arrays so
         # downstream consumers can read these unconditionally.

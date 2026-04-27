@@ -439,6 +439,8 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
         f"cold_start={retry_cfg.cold_start} "
         f"textured_only={retry_cfg.textured_only}",
         f"  cli             : {cli_args}",
+        # Stage J followup-2 — reproducibility marker.
+        f"  seed            : {int(results.get('seed', 0))}",
         "",
     ]
     lines = [ln for ln in lines if ln != ""] + [""]
@@ -1505,6 +1507,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         ausas_options=(ausas_options if ausas_options else None),
         save_field_checkpoints=bool(args.save_field_checkpoints),
         debug_first_steps=int(getattr(args, "debug_first_steps", 0) or 0),
+        seed=int(getattr(args, "seed", 0) or 0),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -1580,6 +1583,16 @@ def main(argv=None):
         description="Stage Diesel Transient THD-0 BelAZ")
     pa.add_argument("--mode", default="global_relax",
                     choices=["off", "global_static", "global_relax"])
+    # Stage J followup-2 — explicit seed for documenting determinism
+    # in run_config / npz / summary. The current transient runner has
+    # no rng calls, so this is a no-op for half-Sommerfeld + dimple
+    # legacy paths; the flag is reserved for future stages that may
+    # add stochastic perturbation (e.g. multi-start equilibrium).
+    pa.add_argument("--seed", type=int, default=0,
+                    help="Reproducibility marker. Currently a no-op "
+                         "(no rng in the transient path) — recorded "
+                         "in summary.txt / data.npz so the legacy "
+                         "fixture command is documented bit-for-bit.")
     pa.add_argument("--gamma", type=float, default=0.7)
     pa.add_argument("--gamma-sweep", default=None,
                     help="comma-separated list, e.g. 0.6,0.7,0.8")
