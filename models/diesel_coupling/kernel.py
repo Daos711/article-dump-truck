@@ -125,6 +125,14 @@ class MechanicalStepResult:
     omega_recovery: Optional[float] = None
     solve_reason: str = "no_attempt"
     p_warm_out: Optional[np.ndarray] = None
+    # Stateful-backend (Ausas) per-step diagnostics. Zero / 1.0
+    # default values are used by the half-Sommerfeld path so the
+    # runner's per-step diagnostic arrays for both backends stay on
+    # a single dataclass schema.
+    cav_frac_committed: float = 0.0
+    theta_min_committed: float = 1.0
+    theta_max_committed: float = 1.0
+    dt_ausas_committed: float = 0.0
 
 
 # ─── Public kernel entry point ─────────────────────────────────────
@@ -188,6 +196,7 @@ def advance_mechanical_step(
             ax_prev=ax_prev, ay_prev=ay_prev,
             dt_phys_s=dt_phys_s,
             backend=backend,
+            backend_state=backend_state,
             policy=policy,
             extra_options=extra_options,
             context=context,
@@ -213,6 +222,7 @@ def _run_legacy_verlet(
     ax_prev: float, ay_prev: float,
     dt_phys_s: float,
     backend: PressureBackend,
+    backend_state: Optional[Any],
     policy: CouplingPolicy,
     extra_options: Optional[dict],
     context: StepContext,
@@ -269,7 +279,7 @@ def _run_legacy_verlet(
             H_prev=None,
             dt_phys=dt_step,
             omega=context.omega,
-            state=None,
+            state=backend_state,
             commit=False,
             context=context,
             extra_options=extra_options,
@@ -353,6 +363,57 @@ def _run_legacy_verlet(
 
     step_clamped = bool(predictor_clamped or final_clamped)
 
+    # ── Stateful-backend commit (Stage J fu-2 Step 5) ─────────
+    # Per Followup-2 §3.4: commit the accepted hydrodynamic step
+    # only when the solver converged AND the step was NOT clamped
+    # (boundary-limited gaps don't describe a hydrodynamic state).
+    # No rebuild of H from post-clamp ε — that's the explicit
+    # difference vs the original Stage J inline code.
+    state_committed = False
+    theta_for_diag: Optional[np.ndarray] = None
+    residual_for_diag = float("nan")
+    cav_frac_for_diag = 0.0
+    theta_min_for_diag = 1.0
+    theta_max_for_diag = 1.0
+    dt_ausas_for_diag = 0.0
+    if (backend.stateful and solve_ok and not step_clamped
+            and H_last is not None):
+        commit_result = backend.solve_trial(
+            H_curr=H_last,
+            H_prev=None,
+            dt_phys=dt_step,
+            omega=context.omega,
+            state=backend_state,
+            commit=True,
+            context=context,
+            extra_options=extra_options,
+            p_warm_init=p_warm_local,
+            vx_squeeze=vx_corr,
+            vy_squeeze=vy_corr,
+        )
+        # Use the COMMITTED solve as the per-step diagnostic
+        # values (mass-conservation invariant): this matches the
+        # pre-refactor inline code's behaviour where the post-
+        # clamp commit replaced the last-trial pressure.
+        if (commit_result.converged
+                and commit_result.P_nd is not None):
+            P_last = commit_result.P_nd
+            theta_for_diag = commit_result.theta
+            Fx_hyd = float(commit_result.Fx_hyd)
+            Fy_hyd = float(commit_result.Fy_hyd)
+            residual_for_diag = float(commit_result.residual)
+            cav_frac_for_diag = float(commit_result.cav_frac)
+            theta_min_for_diag = float(commit_result.theta_min)
+            theta_max_for_diag = float(commit_result.theta_max)
+            dt_ausas_for_diag = float(commit_result.dt_ausas)
+            state_committed = True
+        else:
+            # Commit returned non-converged → adapter increments
+            # rejected_commit_count internally; runner sees
+            # state.step_index unchanged. Do NOT poison diag arrays
+            # with the non-converged residual.
+            state_committed = False
+
     # Legacy reports "accepted" even when the SOR solver failed —
     # the mechanical state always advances; only force/pressure
     # arrays go to NaN. Match that contract.
@@ -363,10 +424,10 @@ def _run_legacy_verlet(
         ax_new=ax_new, ay_new=ay_new,
         H_committed=H_last,
         P_nd_committed=(P_last if solve_ok else None),
-        theta_committed=None,
+        theta_committed=theta_for_diag,
         Fx_hyd_committed=Fx_hyd,
         Fy_hyd_committed=Fy_hyd,
-        residual=float("nan"),
+        residual=residual_for_diag,
         n_inner=last_n_inner,
         n_trials=n_trials,
         mech_relax_min_seen=1.0,
@@ -375,7 +436,7 @@ def _run_legacy_verlet(
             else RejectionReason.SOLVER_RESIDUAL),
         rejection_detail=("" if solve_ok else solve_reason),
         trial_log=trial_log,
-        state_committed=False,         # HS is stateless
+        state_committed=state_committed,
         step_clamped=step_clamped,
         n_contact_events=n_contact_events,
         predictor_clamped=bool(predictor_clamped),
@@ -384,4 +445,9 @@ def _run_legacy_verlet(
         omega_recovery=omega_recovery,
         solve_reason=solve_reason,
         p_warm_out=p_warm_local,
+        # Ausas-only diagnostics (zeros for HS).
+        cav_frac_committed=cav_frac_for_diag,
+        theta_min_committed=theta_min_for_diag,
+        theta_max_committed=theta_max_for_diag,
+        dt_ausas_committed=dt_ausas_for_diag,
     )

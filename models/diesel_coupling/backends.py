@@ -95,6 +95,14 @@ class PressureSolveResult:
     rejection reason without copying. ``theta`` is ``None`` for the
     half-Sommerfeld backend (no fluid fraction in that closure);
     guards skip theta checks accordingly.
+
+    Stage J followup-2 Step 5 — extra Ausas-specific diagnostic
+    fields (``dt_phys_s`` / ``dt_ausas`` / ``cav_frac`` /
+    ``theta_min`` / ``theta_max`` / ``p_nd_max``) live here too so
+    a single dataclass type flows through the kernel for both
+    backends. Half-Sommerfeld leaves them at the default zeros;
+    the runner's debug printer / summary writer populates them
+    only when ``backend_name == "ausas_dynamic"``.
     """
     P_nd: Optional[np.ndarray]
     theta: Optional[np.ndarray]
@@ -106,6 +114,13 @@ class PressureSolveResult:
     converged: bool
     backend_name: str
     reason: str
+    # Stateful-backend diagnostics (zero-defaults for stateless HS).
+    dt_phys_s: float = 0.0
+    dt_ausas: float = 0.0
+    cav_frac: float = 0.0
+    theta_min: float = 1.0
+    theta_max: float = 1.0
+    p_nd_max: float = 0.0
 
 
 # ─── Protocol ──────────────────────────────────────────────────────
@@ -264,10 +279,12 @@ class HalfSommerfeldBackend:
 class AusasDynamicBackend:
     """Dynamic Ausas JFO via ``ausas_one_step_with_state``.
 
-    Step 2 — skeleton only. Step 5 wires ``solve_trial`` to the
-    adapter. ``state`` must be a ``DieselAusasState`` carrying the
-    previous-accepted ``(P_nd, theta, H_prev)``; ``commit=True``
-    only for the accepted mechanical step after all guards pass.
+    Stateful: ``state`` must be a ``DieselAusasState`` carrying
+    the previous-accepted ``(P_nd, theta, H_prev)``. ``commit=True``
+    is forwarded to the adapter only for the post-clamp accepted
+    mechanical step (per Followup-2 §3.4: no commit on clamped
+    step, no rebuild). The kernel calls ``commit=False`` for every
+    Verlet trial.
     """
     name: str = "ausas_dynamic"
     stateful: bool = True
@@ -277,7 +294,8 @@ class AusasDynamicBackend:
         self,
         ausas_options: Optional[Dict[str, Any]] = None,
     ) -> None:
-        ...
+        self._ausas_options = (dict(ausas_options)
+                                if ausas_options else None)
 
     def solve_trial(
         self,
@@ -289,5 +307,86 @@ class AusasDynamicBackend:
         commit: bool,
         context: StepContext,
         extra_options: Optional[Dict[str, Any]] = None,
+        *,
+        p_warm_init: Optional[np.ndarray] = None,
+        vx_squeeze: float = 0.0,
+        vy_squeeze: float = 0.0,
     ) -> PressureSolveResult:
-        ...
+        # Stage J fu-2 Step 5 — wraps the existing followup-1
+        # adapter. ``state`` is the per-config DieselAusasState; the
+        # adapter mutates it iff commit=True. Squeeze velocities are
+        # ignored (Ausas dynamic infers squeeze from H_prev → H_curr,
+        # so the legacy ``squeeze_to_api_params`` path does not
+        # apply); ``p_warm_init`` is also ignored (the warm chain
+        # is carried by ``state.P``).
+        from models.diesel_ausas_adapter import (
+            DieselAusasState,
+            ausas_one_step_with_state,
+        )
+        from models.diesel_transient import compute_hydro_forces
+
+        if state is None:
+            raise ValueError(
+                "AusasDynamicBackend.solve_trial requires a "
+                "DieselAusasState — runner must construct one via "
+                "DieselAusasState.from_initial_gap(H_initial) before "
+                "the first call.")
+        if not isinstance(state, DieselAusasState):
+            raise TypeError(
+                f"AusasDynamicBackend.solve_trial: state must be a "
+                f"DieselAusasState, got {type(state).__name__}.")
+
+        # Per-call ``extra_options`` overrides backend-stored
+        # ``ausas_options`` from CLI.
+        merged_options: Dict[str, Any] = {}
+        if self._ausas_options:
+            merged_options.update(self._ausas_options)
+        if extra_options:
+            merged_options.update(extra_options)
+
+        aw = ausas_one_step_with_state(
+            state,
+            H_curr=H_curr,
+            dt_s=float(dt_phys),
+            omega_shaft=float(omega),
+            d_phi=float(context.d_phi),
+            d_Z=float(context.d_Z),
+            R=float(context.R), L=float(context.L),
+            extra_options=(merged_options if merged_options else None),
+            commit=bool(commit),
+        )
+
+        if aw.converged and aw.P_nd is not None:
+            P_nd = np.asarray(aw.P_nd)
+            Fx, Fy = compute_hydro_forces(
+                P_nd, context.p_scale, context.Phi_mesh,
+                context.phi_1D, context.Z_1D,
+                context.R, context.L,
+            )
+            Fx_f = float(Fx)
+            Fy_f = float(Fy)
+        else:
+            P_nd = (np.asarray(aw.P_nd) if aw.P_nd is not None
+                    else None)
+            Fx_f = float("nan")
+            Fy_f = float("nan")
+
+        return PressureSolveResult(
+            P_nd=P_nd,
+            theta=(np.asarray(aw.theta) if aw.theta is not None
+                   else None),
+            Fx_hyd=Fx_f, Fy_hyd=Fy_f,
+            H_used=np.asarray(H_curr),
+            residual=float(aw.residual),
+            n_inner=int(aw.n_inner),
+            converged=bool(aw.converged),
+            backend_name=self.name,
+            reason=str(aw.reason),
+            dt_phys_s=float(dt_phys),
+            dt_ausas=float(getattr(aw, "dt_ausas", float("nan"))),
+            cav_frac=float(aw.cav_frac),
+            theta_min=float(aw.theta_min),
+            theta_max=float(aw.theta_max),
+            p_nd_max=(float(np.max(P_nd))
+                      if P_nd is not None and P_nd.size else 0.0),
+        )

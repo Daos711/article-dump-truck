@@ -114,29 +114,62 @@ def test_legacy_half_sommerfeld_regression_smoke():
 def test_ausas_dynamic_smoke_smooth_mineral():
     """``cavitation='ausas_dynamic'`` with a smooth config and the
     test-only adapter backend must run without exceptions, populate
-    the Ausas diagnostic arrays, and report cav_frac and theta in
-    the [0, 1] range."""
+    the Ausas diagnostic arrays with valid ranges, and respect the
+    Stage J followup-2 §3.4 commit semantics:
+
+    * arrays for ``ausas_converged`` / ``ausas_cav_frac`` /
+      ``ausas_theta_*`` exist with the right shape;
+    * ``cav_frac`` ∈ [0, 1] elementwise;
+    * ``theta_min`` / ``theta_max`` ∈ [0, 1] elementwise (where
+      populated);
+    * **clamped steps do NOT commit** (no Ausas state mutation on
+      a boundary-limited gap) — a step flagged in
+      ``contact_clamp[ic, step]`` must NOT also be flagged in
+      ``ausas_converged[ic, step]``;
+    * for non-clamped steps under a healthy stub backend, the
+      converged fraction is high (the stub deterministically
+      reports converged=True).
+
+    The stub backend in this contract test produces a flat
+    pressure field that under-supports the actual diesel load,
+    so the tiny-grid orbit may clamp — the assertions above are
+    robust to that.
+    """
     res = _run_short(
         cavitation="ausas_dynamic",
         texture_kind="none",
         configs=[CONFIGS[0]],
     )
     assert res["cavitation_model"] == "ausas_dynamic"
-    # The Ausas commit at the end of every accepted step must have
-    # written into the diagnostic arrays for at least one step.
-    assert int(np.sum(res["ausas_converged"])) > 0
+    # Schema integrity.
     cav = np.asarray(res["ausas_cav_frac"])
     tmin = np.asarray(res["ausas_theta_min"])
     tmax = np.asarray(res["ausas_theta_max"])
+    ausas_conv = np.asarray(res["ausas_converged"], dtype=bool)
+    contact = np.asarray(res["contact_clamp"], dtype=bool)
+    assert ausas_conv.shape == contact.shape
+    assert cav.shape == contact.shape
+    # Ranges valid wherever populated.
     assert np.all((cav >= 0.0) & (cav <= 1.0))
     assert np.nanmax(tmax) <= 1.0 + 1e-12
     assert np.nanmin(tmin) >= -1e-12
-    # Stage J target: > 80% converged on smoke. The deterministic
-    # stub backend always returns ok=True, so we expect 100% — guard
-    # against future stub changes by testing the documented gate.
-    n_steps = res["ausas_converged"].shape[1]
-    converged_frac = float(np.sum(res["ausas_converged"][0]) / n_steps)
-    assert converged_frac >= 0.80
+    # Followup-2 §3.4 commit-on-clamp=False contract.
+    overlap = ausas_conv & contact
+    assert not np.any(overlap), (
+        f"ausas_converged is True on {int(overlap.sum())} clamped "
+        "steps — Followup-2 §3.4 forbids committing state on a "
+        "boundary-limited gap.")
+    # If any non-clamped steps exist, their converged fraction
+    # under the deterministic stub must be high.
+    non_clamped = ~contact
+    if int(non_clamped.sum()) > 0:
+        conv_on_nonclamped = (
+            float(np.sum(ausas_conv & non_clamped))
+            / float(non_clamped.sum()))
+        assert conv_on_nonclamped >= 0.80, (
+            f"converged fraction on non-clamped steps = "
+            f"{conv_on_nonclamped:.3f} < 0.80 — stub backend should "
+            "always converge on non-clamp candidates.")
 
 
 # ─── 3. Ausas dynamic + groove smoke ───────────────────────────────
