@@ -91,6 +91,12 @@ from models.diesel_ausas_adapter import (
     ausas_one_step_with_state,
 )
 
+# Stage J followup-2 — backend-agnostic mechanical-step kernel.
+# The half-Sommerfeld path goes through the kernel as of Step 4;
+# Ausas dynamic still uses the inline branch (Step 5 will route it
+# through ``AusasDynamicBackend`` and the same kernel).
+from models import diesel_coupling as _coupling
+
 CONFIGS = [
     {"label": "Гладкий + минеральное", "textured": False,
      "oil": MINERAL_OIL, "color": "blue", "ls": "-"},
@@ -398,6 +404,57 @@ def compute_hydro_forces(P, p_scale, Phi_mesh, phi_1D, Z_1D, R, L):
     Fy = -_trapz(_trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
                  Z_1D, axis=0) * R * L / 2
     return Fx, Fy
+
+
+def _print_ausas_debug_step(
+    label, *,
+    phi_deg, dt_s, aw_result,
+    eps_x, eps_y, p_scale,
+    Fx_hyd, Fy_hyd, F_max,
+):
+    """Stage J followup §4 — diagnostic line for the first N
+    Ausas-dynamic Verlet substep / accepted-step decisions.
+
+    Activated by ``run_transient(..., debug_first_steps=N)`` /
+    CLI ``--debug-first-steps N``. Prints once per substep call
+    (``TRIAL k=...``) plus once per accepted step
+    (``ACCEPTED``); the output goes to stdout BEFORE the regular
+    progress / summary lines so the operator can locate the
+    Verlet break-down on a failing smoke without re-running.
+    """
+    Fx_ext_a, Fy_ext_a = load_diesel(phi_deg, F_max=F_max)
+    Fx_ext = float(np.asarray(Fx_ext_a).item())
+    Fy_ext = float(np.asarray(Fy_ext_a).item())
+    F_ext_mag = float(np.hypot(Fx_ext, Fy_ext))
+    F_hyd_mag = float(np.hypot(Fx_hyd, Fy_hyd))
+    if (F_hyd_mag > 0.0 and F_ext_mag > 0.0
+            and np.isfinite(F_hyd_mag) and np.isfinite(F_ext_mag)):
+        dot_norm = float(
+            (Fx_hyd * Fx_ext + Fy_hyd * Fy_ext)
+            / (F_hyd_mag * F_ext_mag))
+    else:
+        dot_norm = float("nan")
+    p_nd_max = float(aw_result.p_nd_max)
+    p_dim_max_MPa = (p_nd_max * float(p_scale) * 1e-6
+                     if np.isfinite(p_nd_max) else float("nan"))
+    print(
+        f"  [J-debug {label}] "
+        f"phi={float(phi_deg):.2f}° "
+        f"dt_s={float(dt_s):.4e}s dt_tau={float(aw_result.dt_ausas):.4e} "
+        f"eps=({float(eps_x):+.4f},{float(eps_y):+.4f}) "
+        f"|F_ext|={F_ext_mag/1e3:.2f}kN "
+        f"({Fx_ext/1e3:+.2f},{Fy_ext/1e3:+.2f}) "
+        f"|F_hyd|={F_hyd_mag/1e3:.4f}kN "
+        f"({float(Fx_hyd)/1e3:+.4f},{float(Fy_hyd)/1e3:+.4f}) "
+        f"dot_norm={dot_norm:+.3f} "
+        f"p_nd_max={p_nd_max:.4e} p_dim_max={p_dim_max_MPa:.3f}MPa "
+        f"theta=[{float(aw_result.theta_min):.3f},"
+        f"{float(aw_result.theta_max):.3f}] "
+        f"res={float(aw_result.residual):.2e} "
+        f"n_inner={int(aw_result.n_inner)} "
+        f"converged={bool(aw_result.converged)}",
+        flush=True,
+    )
 
 
 def compute_friction(P, p_scale, H, Phi_mesh, phi_1D, Z_1D,
@@ -1069,7 +1126,9 @@ def run_transient(F_max=None, debug=False,
                   groove_preset: Optional[str] = None,
                   fidelity: Optional[str] = None,
                   ausas_options: Optional[Dict[str, Any]] = None,
-                  save_field_checkpoints: bool = False):
+                  save_field_checkpoints: bool = False,
+                  debug_first_steps: int = 0,
+                  seed: int = 0):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -1283,6 +1342,17 @@ def run_transient(F_max=None, debug=False,
     ausas_cav_frac_all = np.zeros((n_cfg, n_steps), dtype=float)
     ausas_theta_min_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
     ausas_theta_max_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
+    # Stage J Bug 4 follow-up — per-step residual and Ausas-domain dt
+    # for sanity / convergence-quality diagnostics.
+    ausas_residual_all = np.full((n_cfg, n_steps), np.nan, dtype=float)
+    ausas_dt_tau_all = np.zeros((n_cfg, n_steps), dtype=float)
+    # Stage J Bug 4 follow-up — per-step force-balance diagnostics.
+    F_hyd_x_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_hyd_y_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_ext_x_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_ext_y_all = np.zeros((n_cfg, n_steps), dtype=float)
+    force_balance_projection_all = np.full(
+        (n_cfg, n_steps), np.nan, dtype=float)
     ausas_state_reset_count = np.zeros(n_cfg, dtype=np.int32)
     ausas_failed_step_count = np.zeros(n_cfg, dtype=np.int32)
     ausas_rejected_commit_count = np.zeros(n_cfg, dtype=np.int32)
@@ -1330,14 +1400,38 @@ def run_transient(F_max=None, debug=False,
         P_prev = None
         contact_count = 0
 
-        # Stage J — per-config Ausas state (cold-start). Created
-        # unconditionally so legacy paths that read ``ausas_state``
-        # downstream don't crash; the legacy half-Sommerfeld branch
-        # never advances it.
+        # Stage J Bug 5 — initialise the per-config Ausas state from
+        # the actual first accepted gap. Using ``cold_start`` with
+        # ``H_prev = ones`` injected an artificial squeeze pulse on
+        # step #1 because the first accepted ``H`` was generally
+        # non-unit (eps_x0/eps_y0 != 0); the resulting fictitious
+        # ∂(θH)/∂t blew up the orbit. ``from_initial_gap`` aligns
+        # ``H_prev`` with the true first H.
         ausas_state: Optional[DieselAusasState] = None
         if use_ausas_dynamic:
-            ausas_state = DieselAusasState.cold_start(
-                N_phi=N_phi_eff, N_z=N_z_eff)
+            H_initial = build_H_2d(
+                ex / params.c, ey / params.c,
+                Phi_mesh, Z_mesh, params,
+                textured=cfg["textured"],
+                phi_c_flat=phi_c, Z_c_flat=Z_c,
+                texture_kind=texture_kind,
+                groove_relief=groove_relief,
+            )
+            ausas_state = DieselAusasState.from_initial_gap(H_initial)
+
+        # Stage J fu-2 Step 5 — instantiate the pressure backend
+        # once per config. ``HalfSommerfeldBackend`` carries the
+        # retry policy + textured-for-retry flag; ``AusasDynamicBackend``
+        # carries the ``ausas_options`` dict. Both go through the
+        # same ``advance_mechanical_step`` kernel call below.
+        if use_ausas_dynamic:
+            _backend = _coupling.AusasDynamicBackend(
+                ausas_options=ausas_options or None)
+        else:
+            _backend = _coupling.HalfSommerfeldBackend(
+                retry_config=retry_config,
+                textured_for_retry=bool(cfg["textured"]),
+            )
 
         def _clamp(ex_, ey_, vx_, vy_):
             clamped = False
@@ -1383,197 +1477,157 @@ def run_transient(F_max=None, debug=False,
             ex_n, ey_n = ex, ey
             vx_n, vy_n = vx, vy
 
-            # Initial Verlet predict.
-            ex_pred = ex_n + vx_n * dt_step + 0.5 * ax_prev * dt_step**2
-            ey_pred = ey_n + vy_n * dt_step + 0.5 * ay_prev * dt_step**2
-            ex_pred, ey_pred, _, _, clamped_p = _clamp(
-                ex_pred, ey_pred, vx_n, vy_n)
-            # Stage Diesel Transient ClampAccounting Fix — track
-            # per-step events separately from the existing aggregate
-            # ``contact_count`` so summary can show "Contact steps"
-            # (unique stepped) vs "Contact events" (predictor +
-            # substep + final, up to ~3 per step).
-            step_event_count = 0
-            if clamped_p:
-                contact_count += 1
-                step_event_count += 1
-                P_prev = None
+            # Stage J fu-2 Step 5 — both backends go through the
+            # backend-agnostic mechanical-step kernel. ``_backend``
+            # was instantiated once per config above; the same
+            # ``advance_mechanical_step`` call dispatches Verlet
+            # predict / for-k corrector / final clamp / (stateful)
+            # commit. Half-Sommerfeld is bit-for-bit identical to
+            # the pre-refactor runner (Gate 1 fixture); Ausas
+            # dynamic uses ``POLICY_LEGACY_HS`` until Step 6 swaps
+            # it for the damped policy.
+            Fx_ext_step_a, Fy_ext_step_a = load_diesel(
+                phi_deg, F_max=F_max)
+            Fx_ext_step = float(np.asarray(Fx_ext_step_a).item())
+            Fy_ext_step = float(np.asarray(Fy_ext_step_a).item())
 
-            vx_corr, vy_corr = vx_n, vy_n
-            ax_new, ay_new = ax_prev, ay_prev
-            P = None
-            H = None
-            Fx_hyd = float("nan")
-            Fy_hyd = float("nan")
-            solve_ok = False
-            solve_reason = "no_attempt"
-            retry_recovered_step = False
-            omega_recovery: Optional[float] = None
+            step_ctx = _coupling.StepContext(
+                phi_deg=float(phi_deg),
+                F_ext_x=Fx_ext_step, F_ext_y=Fy_ext_step,
+                F_max=float(F_max),
+                p_scale=float(p_scale_step),
+                omega=float(omega), eta=float(eta_step),
+                R=float(params.R), L=float(params.L),
+                c=float(params.c),
+                Phi_mesh=Phi_mesh, Z_mesh=Z_mesh,
+                phi_1D=phi_1D, Z_1D=Z_1D,
+                d_phi=float(d_phi), d_Z=float(d_Z),
+                cfg=cfg,
+                texture_kind=str(texture_kind),
+                groove_relief=groove_relief,
+                phi_c_flat=phi_c, Z_c_flat=Z_c,
+                closure=closure, cavitation=cavitation,
+                P_warm_init=P_prev,
+            )
 
-            for k in range(N_SUB):
-                eps_x_ = ex_pred / params.c
-                eps_y_ = ey_pred / params.c
-                H_ = build_H_2d(eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
-                                 textured=cfg["textured"],
-                                 phi_c_flat=phi_c, Z_c_flat=Z_c,
-                                 texture_kind=texture_kind,
-                                 groove_relief=groove_relief)
-                xp_, yp_, bt_ = squeeze_to_api_params(
-                    -vx_corr, -vy_corr, params.c, omega, d_phi)
-                if use_ausas_dynamic:
-                    # Stage J — dynamic Ausas trial solve. The state
-                    # is NOT mutated (commit=False); the runner
-                    # commits once at the end of the mechanical
-                    # step using the final accepted H.
-                    aw = ausas_one_step_with_state(
-                        ausas_state,
-                        H_curr_phys=H_,
-                        dt_s=float(dt_step),
-                        d_phi=float(d_phi),
-                        d_Z=float(d_Z),
-                        R=float(params.R), L=float(params.L),
-                        # Stage J integration regression Bug 1 —
-                        # eta/omega are NOT solver kwargs; the dynamic
-                        # Ausas non-dimensionalisation absorbs them
-                        # into the discretisation coefficients.
-                        extra_options=ausas_options or None,
-                        commit=False,
-                    )
-                    if aw["ok"] and aw["P_phys"] is not None:
-                        # Non-dim P matches solver-side units (P*p_scale
-                        # = dimensional Pa) so existing
-                        # ``compute_hydro_forces`` and
-                        # ``compute_friction`` apply unchanged.
-                        P_ = np.asarray(aw["P_phys"])
-                        Fx_, Fy_ = compute_hydro_forces(
-                            P_, p_scale_step, Phi_mesh,
-                            phi_1D, Z_1D, params.R, params.L)
-                        ok_ = True
-                        reason_ = "ok_ausas_trial"
-                    else:
-                        P_ = np.full_like(H_, np.nan)
-                        Fx_ = float("nan")
-                        Fy_ = float("nan")
-                        ok_ = False
-                        reason_ = aw.get("reason", "ausas_failed")
-                else:
-                    base_kw = dict(
-                        closure=closure, cavitation=cavitation,
-                        tol=1e-5, max_iter=50000,
-                        P_init=P_prev,
-                        xprime=xp_, yprime=yp_, beta=bt_,
-                    )
-                    P_, Fx_, Fy_, _, ok_, reason_ = _solve_dynamic_with_retry(
-                        H_, d_phi, d_Z, params.R, params.L,
-                        base_kw=base_kw,
-                        p_scale=p_scale_step,
-                        Phi_mesh=Phi_mesh, phi_1D=phi_1D, Z_1D=Z_1D,
-                        retry_config=retry_config,
-                        textured=bool(cfg["textured"]),
-                    )
-                outcome = _parse_retry_outcome(reason_)
-                if outcome["retry_recovered"]:
-                    retry_recovered_step = True
-                    omega_recovery = outcome["retry_omega"]
-                if not ok_:
-                    P_prev = None
-                    P = P_
-                    H = H_
-                    Fx_hyd = float("nan")
-                    Fy_hyd = float("nan")
-                    solve_ok = False
-                    solve_reason = reason_
-                    break
-                P, H = P_, H_
-                Fx_hyd, Fy_hyd = float(Fx_), float(Fy_)
-                solve_ok = True
-                solve_reason = reason_
-                P_prev = P
-
-                Fx_ext, Fy_ext = load_diesel(phi_deg, F_max=F_max)
-                # load_diesel always returns (1,)-shape arrays for a
-                # scalar phi; ``.item()`` extracts the scalar without
-                # the np.float(array) DeprecationWarning.
-                Fx_ext = float(np.asarray(Fx_ext).item())
-                Fy_ext = float(np.asarray(Fy_ext).item())
-                ax_new = (Fx_ext + Fx_hyd) / params.m_shaft
-                ay_new = (Fy_ext + Fy_hyd) / params.m_shaft
-                vx_corr = vx_n + 0.5 * (ax_prev + ax_new) * dt_step
-                vy_corr = vy_n + 0.5 * (ay_prev + ay_new) * dt_step
-
-                if k < N_SUB - 1:
-                    ex_pred = (ex_n + vx_corr * dt_step
-                                + 0.5 * ax_new * dt_step**2)
-                    ey_pred = (ey_n + vy_corr * dt_step
-                                + 0.5 * ay_new * dt_step**2)
-                    ex_pred, ey_pred, vx_corr, vy_corr, cl = _clamp(
-                        ex_pred, ey_pred, vx_corr, vy_corr)
-                    if cl:
-                        contact_count += 1
-                        step_event_count += 1
-                        P_prev = None
-
-            # Accept (even if solver failed — keep mechanical state
-            # progressing without poisoned pressure).
-            ex, ey = ex_pred, ey_pred
-            vx, vy = vx_corr, vy_corr
-            ax_prev, ay_prev = ax_new, ay_new
-
-            ex, ey, vx, vy, clamped_final = _clamp(ex, ey, vx, vy)
-            if clamped_final:
-                contact_count += 1
-                step_event_count += 1
-                P_prev = None
-            step_clamped = bool(clamped_p or clamped_final)
-
-            # Stage J — Ausas state commits once per accepted step.
-            # If the final clamp moved (ex, ey) past the last trial,
-            # rebuild H from the accepted (ex, ey) before the commit
-            # so the state's ``H_prev`` matches the orbit truth.
-            if use_ausas_dynamic and ausas_state is not None:
-                if solve_ok and not step_clamped:
-                    H_committed = H
-                else:
-                    H_committed = build_H_2d(
-                        ex / params.c, ey / params.c,
-                        Phi_mesh, Z_mesh, params,
-                        textured=cfg["textured"],
-                        phi_c_flat=phi_c, Z_c_flat=Z_c,
-                        texture_kind=texture_kind,
-                        groove_relief=groove_relief)
-                aw_commit = ausas_one_step_with_state(
-                    ausas_state,
-                    H_curr_phys=H_committed,
-                    dt_s=float(dt_step),
-                    d_phi=float(d_phi),
-                    d_Z=float(d_Z),
-                    R=float(params.R), L=float(params.L),
-                    # Stage J integration regression Bug 1 — see
-                    # the trial-call site above; eta/omega absent.
-                    extra_options=ausas_options or None,
-                    commit=True,
+            def _build_H_for_kernel(eps_x_, eps_y_):
+                return build_H_2d(
+                    eps_x_, eps_y_, Phi_mesh, Z_mesh, params,
+                    textured=cfg["textured"],
+                    phi_c_flat=phi_c, Z_c_flat=Z_c,
+                    texture_kind=texture_kind,
+                    groove_relief=groove_relief,
                 )
-                ausas_converged_all[ic, step] = bool(aw_commit["ok"])
-                ausas_n_inner_all[ic, step] = int(aw_commit["n_inner"])
+
+            _ms = _coupling.advance_mechanical_step(
+                ex_n=ex_n, ey_n=ey_n,
+                vx_n=vx_n, vy_n=vy_n,
+                ax_prev=ax_prev, ay_prev=ay_prev,
+                dt_phys_s=float(dt_step),
+                backend=_backend,
+                backend_state=ausas_state,
+                # Stage J fu-2 Step 6 — capability-based dispatch.
+                # Stateless backends (HS) → POLICY_LEGACY_HS;
+                # stateful backends (Ausas, future PV-on-Ausas) →
+                # POLICY_AUSAS_DYNAMIC. The runner never branches
+                # on backend name; future PV plugs in via the same
+                # protocol.
+                policy=_coupling.select_policy(_backend),
+                guards_cfg=_coupling.PhysicalGuardsConfig.from_profile(
+                    "diagnostic", "general"),
+                ausas_tol=1e-6,
+                ausas_max_inner=5000,
+                extra_options=(ausas_options if use_ausas_dynamic
+                               else None),
+                context=step_ctx,
+                m_shaft=float(params.m_shaft),
+                eps_max=float(params.eps_max),
+                clamp_fn=_clamp,
+                build_H_fn=_build_H_for_kernel,
+                p_warm_init=P_prev,
+            )
+
+            # Apply kernel result to runner state — preserves
+            # the legacy bookkeeping arrays bit-for-bit (Gate 1).
+            contact_count += int(_ms.n_contact_events)
+            step_event_count = int(_ms.n_contact_events)
+            P_prev = _ms.p_warm_out
+            ex, ey = _ms.eps_x_new, _ms.eps_y_new
+            vx, vy = _ms.vx_new, _ms.vy_new
+            ax_prev, ay_prev = _ms.ax_new, _ms.ay_new
+            P = _ms.P_nd_committed
+            H = _ms.H_committed
+            Fx_hyd = _ms.Fx_hyd_committed
+            Fy_hyd = _ms.Fy_hyd_committed
+            solve_ok = (P is not None
+                        and _ms.rejection_reason
+                        == _coupling.RejectionReason.NONE)
+            solve_reason = _ms.solve_reason
+            retry_recovered_step = bool(_ms.retry_recovered)
+            omega_recovery = _ms.omega_recovery
+            clamped_p = bool(_ms.predictor_clamped)
+            clamped_final = bool(_ms.final_clamped)
+            step_clamped = bool(_ms.step_clamped)
+
+            # Stage J Ausas-only diagnostic arrays (zero-defaults on
+            # the HS path are correct — backend.stateful is False so
+            # the kernel never invoked an Ausas commit).
+            if use_ausas_dynamic:
+                ausas_converged_all[ic, step] = bool(_ms.state_committed)
+                ausas_n_inner_all[ic, step] = int(_ms.n_inner)
                 ausas_cav_frac_all[ic, step] = float(
-                    aw_commit["cav_frac"])
+                    _ms.cav_frac_committed)
                 ausas_theta_min_all[ic, step] = float(
-                    aw_commit["theta_min"])
+                    _ms.theta_min_committed)
                 ausas_theta_max_all[ic, step] = float(
-                    aw_commit["theta_max"])
-                # If the commit succeeded, the step's pressure /
-                # forces should reflect the COMMITTED solve, not the
-                # last trial — preserves Ausas mass conservation in
-                # the post-step diagnostic block below.
-                if aw_commit["ok"] and aw_commit["P_phys"] is not None:
-                    P = np.asarray(aw_commit["P_phys"])
-                    H = H_committed
-                    Fx_committed, Fy_committed = compute_hydro_forces(
-                        P, p_scale_step, Phi_mesh,
-                        phi_1D, Z_1D, params.R, params.L)
-                    Fx_hyd, Fy_hyd = float(Fx_committed), float(
-                        Fy_committed)
-                    solve_ok = True
+                    _ms.theta_max_committed)
+                ausas_residual_all[ic, step] = float(_ms.residual)
+                ausas_dt_tau_all[ic, step] = float(
+                    _ms.dt_ausas_committed)
+                # ``--debug-first-steps N`` — stream per-trial
+                # diagnostic lines from the kernel's trial_log, plus
+                # one ACCEPTED line summarising the committed step.
+                if step < int(debug_first_steps):
+                    for k_idx, tr in enumerate(_ms.trial_log):
+                        _print_ausas_debug_step(
+                            f"step={step:03d} TRIAL k={k_idx}",
+                            phi_deg=phi_deg, dt_s=dt_step,
+                            aw_result=tr.pressure_result,
+                            eps_x=tr.eps_x_cand, eps_y=tr.eps_y_cand,
+                            p_scale=p_scale_step,
+                            Fx_hyd=tr.pressure_result.Fx_hyd,
+                            Fy_hyd=tr.pressure_result.Fy_hyd,
+                            F_max=F_max,
+                        )
+                    # Build a minimal "accepted" PressureSolveResult-
+                    # shaped object the printer can consume.
+                    _accepted = type(
+                        "AcceptedView", (),
+                        dict(
+                            P_nd=_ms.P_nd_committed,
+                            theta=_ms.theta_committed,
+                            residual=_ms.residual,
+                            n_inner=_ms.n_inner,
+                            converged=bool(_ms.state_committed),
+                            dt_phys_s=float(dt_step),
+                            dt_ausas=_ms.dt_ausas_committed,
+                            cav_frac=_ms.cav_frac_committed,
+                            theta_min=_ms.theta_min_committed,
+                            theta_max=_ms.theta_max_committed,
+                            p_nd_max=(float(np.max(_ms.P_nd_committed))
+                                      if _ms.P_nd_committed is not None
+                                      else 0.0),
+                        ),
+                    )()
+                    _print_ausas_debug_step(
+                        f"step={step:03d} ACCEPTED",
+                        phi_deg=phi_deg, dt_s=dt_step,
+                        aw_result=_accepted,
+                        eps_x=ex / params.c, eps_y=ey / params.c,
+                        p_scale=p_scale_step,
+                        Fx_hyd=Fx_hyd, Fy_hyd=Fy_hyd,
+                        F_max=F_max,
+                    )
 
             # Per-step diagnostics.
             if solve_ok and P is not None and H is not None:
@@ -1646,6 +1700,28 @@ def run_transient(F_max=None, debug=False,
             Nloss_all[ic, step] = P_loss_step
             Fx_hyd_all[ic, step] = Fx_hyd
             Fy_hyd_all[ic, step] = Fy_hyd
+            # Stage J Bug 4 follow-up — record both force vectors and
+            # the dot-product projection of F_hyd onto the resisting
+            # direction (-F_ext). A physically scaled hydrodynamic
+            # response should keep this projection POSITIVE: the
+            # film pressure pushes against the external load. A
+            # consistently negative or near-zero projection is the
+            # signature of a sign / unit regression in the cavitation
+            # backend coupling.
+            Fx_ext_arr, Fy_ext_arr = load_diesel(phi_deg, F_max=F_max)
+            Fx_ext_step = float(np.asarray(Fx_ext_arr).item())
+            Fy_ext_step = float(np.asarray(Fy_ext_arr).item())
+            F_hyd_x_all[ic, step] = float(Fx_hyd)
+            F_hyd_y_all[ic, step] = float(Fy_hyd)
+            F_ext_x_all[ic, step] = Fx_ext_step
+            F_ext_y_all[ic, step] = Fy_ext_step
+            F_ext_mag_step = np.hypot(Fx_ext_step, Fy_ext_step)
+            if F_ext_mag_step > 1.0 and np.isfinite(Fx_hyd) \
+                    and np.isfinite(Fy_hyd):
+                ux = -Fx_ext_step / F_ext_mag_step
+                uy = -Fy_ext_step / F_ext_mag_step
+                force_balance_projection_all[ic, step] = (
+                    float(Fx_hyd) * ux + float(Fy_hyd) * uy)
             T_eff_used_all[ic, step] = T_used_C
             T_eff_all[ic, step] = T_state_C
             T_target_all[ic, step] = T_target_C
@@ -1997,6 +2073,8 @@ def run_transient(F_max=None, debug=False,
         "N_phi_grid": int(N_phi_eff),
         "N_z_grid": int(N_z_eff),
         "texture_resolution_diagnostic": texture_res_diag,
+        # Stage J followup-2 — reproducibility marker.
+        "seed": int(seed),
         # Stage J — Ausas dynamic + groove diagnostics. The legacy
         # half-Sommerfeld path produces zero-filled Ausas arrays so
         # downstream consumers can read these unconditionally.
@@ -2016,4 +2094,11 @@ def run_transient(F_max=None, debug=False,
         "ausas_state_reset_count": ausas_state_reset_count,
         "ausas_failed_step_count": ausas_failed_step_count,
         "ausas_rejected_commit_count": ausas_rejected_commit_count,
+        "ausas_residual": ausas_residual_all,
+        "ausas_dt_tau": ausas_dt_tau_all,
+        "F_hyd_x": F_hyd_x_all,
+        "F_hyd_y": F_hyd_y_all,
+        "F_ext_x": F_ext_x_all,
+        "F_ext_y": F_ext_y_all,
+        "force_balance_projection": force_balance_projection_all,
     }

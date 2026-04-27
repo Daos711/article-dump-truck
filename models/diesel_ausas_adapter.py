@@ -50,16 +50,50 @@ class DieselAusasState:
     step_index: int = 0
     time_s: float = 0.0
     dt_last_s: float = 0.0
+    dt_ausas_last: float = 0.0
     valid: bool = True
     reset_count: int = 0
     failed_step_count: int = 0
     rejected_commit_count: int = 0
 
     @classmethod
+    def from_initial_gap(
+        cls,
+        H_initial: np.ndarray,
+        *,
+        P_warm: Optional[np.ndarray] = None,
+        theta_warm: Optional[np.ndarray] = None,
+    ) -> "DieselAusasState":
+        """Stage J Bug 5 — initialise from the actual first accepted
+        diesel gap so step #1 has no artificial squeeze.
+
+        ``H_prev`` is set to ``H_initial`` (NOT to a unit gap), and
+        ``P`` / ``theta`` default to the identity (zero / full film)
+        unless explicit warm-up arrays are supplied. The legacy
+        :meth:`cold_start` constructor used ``H_prev = ones`` which
+        injected a fictitious squeeze pulse on the first mechanical
+        step — that is the regression this constructor closes.
+        """
+        H = np.asarray(H_initial, dtype=float).copy()
+        return cls(
+            P=(np.asarray(P_warm, dtype=float).copy()
+               if P_warm is not None else np.zeros_like(H)),
+            theta=(np.asarray(theta_warm, dtype=float).copy()
+                   if theta_warm is not None else np.ones_like(H)),
+            H_prev=H,
+        )
+
+    @classmethod
     def cold_start(cls, *, N_phi: int, N_z: int) -> "DieselAusasState":
-        """Cold-start state for an Ausas run: full-film
-        (``theta = 1``), zero pressure, unit gap. Allocated on the
-        unpadded ``(N_z, N_phi)`` physical grid."""
+        """Legacy cold-start (``H_prev = ones``).
+
+        .. deprecated::
+            Stage J Bug 5 — prefer :meth:`from_initial_gap` so the
+            first mechanical step does not see an artificial squeeze
+            pulse. ``cold_start`` is retained only for tests that
+            still assert against the unit-gap shape; new runner
+            code should not call it.
+        """
         return cls(
             P=np.zeros((int(N_z), int(N_phi)), dtype=float),
             theta=np.ones((int(N_z), int(N_phi)), dtype=float),
@@ -80,6 +114,118 @@ class DieselAusasState:
         self.valid = True
         self.dt_last_s = 0.0
         self.reset_count += 1
+
+
+# ─── Time non-dimensionalisation ──────────────────────────────────
+
+
+def ausas_dt_from_physical(dt_s: float, omega_shaft: float) -> float:
+    """Stage J Bug 4 — convert a physical timestep (seconds) to the
+    Ausas non-dimensional time ``τ = ω · t``.
+
+    The dynamic Ausas discretisation in
+    ``ausas_unsteady_one_step_gpu`` uses the same non-dimensional
+    pressure scale ``p_scale = 6 η ω (R/c)²`` as the diesel runner;
+    this convention requires time to be measured in shaft-rotation
+    units (``τ = ω t``), not physical seconds. The previous adapter
+    forwarded ``dt_phys`` directly, which inflated the unsteady
+    coefficient ``β = 2 d_phi² / dt`` by roughly ``ω_shaft ≈ 199``
+    at 1900 rpm and made the squeeze term dominate the Couette
+    pressure-generation term — converging to a physically wrong
+    pressure field that then collapsed the orbit on the first step.
+
+    This helper is the single-line conversion the adapter applies
+    before forwarding ``dt`` to the GPU backend.
+    """
+    return float(dt_s) * float(omega_shaft)
+
+
+# ─── Structured one-step result ────────────────────────────────────
+
+
+@dataclass
+class DieselAusasStepResult:
+    """Stage J Bug 4-5 follow-up — replaces the legacy result dict.
+
+    Carries the canonical solver outputs (``P_nd``, ``theta``,
+    ``residual``, ``n_inner``), the derived ``converged`` flag, the
+    committed gap ``H_curr``, and both timestep representations
+    (``dt_phys_s`` in seconds and ``dt_ausas`` in non-dimensional
+    shaft-rotation units) so the runner / summary writer can
+    sanity-check the conversion without re-deriving it.
+
+    Fields are populated even on failure (``converged=False``); the
+    arrays may be ``None`` when the backend raised.
+    """
+    P_nd: Optional[np.ndarray]
+    theta: Optional[np.ndarray]
+    residual: float
+    n_inner: int
+    converged: bool
+    H_curr: Optional[np.ndarray]
+    dt_phys_s: float
+    dt_ausas: float
+    reason: str = "ok"
+
+    @property
+    def cav_frac(self) -> float:
+        if self.theta is None or not self.theta.size:
+            return float("nan")
+        return float(np.mean(self.theta < 1.0))
+
+    @property
+    def theta_min(self) -> float:
+        if self.theta is None or not self.theta.size:
+            return float("nan")
+        return float(np.min(self.theta))
+
+    @property
+    def theta_max(self) -> float:
+        if self.theta is None or not self.theta.size:
+            return float("nan")
+        return float(np.max(self.theta))
+
+    @property
+    def p_nd_max(self) -> float:
+        if self.P_nd is None or not self.P_nd.size:
+            return float("nan")
+        return float(np.max(self.P_nd))
+
+
+def ausas_result_is_physical(
+    result: DieselAusasStepResult, *, tol: float, max_inner: int,
+) -> bool:
+    """Stage J Bug 4-5 follow-up — promote convergence from "no
+    exception" to a physical contract.
+
+    Returns True iff every gate passes:
+
+    * ``result.converged`` is True (set by the adapter from the
+      solver-side ``residual``/``n_inner`` budget — see
+      :func:`ausas_one_step_with_state`);
+    * ``result.residual`` is finite and ``≤ tol``;
+    * ``result.n_inner`` is strictly below ``max_inner``;
+    * ``result.P_nd`` is finite element-wise;
+    * ``result.theta`` is element-wise in ``[0, 1]``.
+
+    Used by the runner to decide whether the step's pressure /
+    forces are trustworthy. Failing the gate flips the step into
+    ``solver_failed`` for envelope metrics — the abort policy is
+    unchanged.
+    """
+    if not bool(result.converged):
+        return False
+    if not np.isfinite(result.residual) or result.residual > float(tol):
+        return False
+    if int(result.n_inner) >= int(max_inner):
+        return False
+    if result.P_nd is None or not np.all(np.isfinite(result.P_nd)):
+        return False
+    if result.theta is None:
+        return False
+    if (result.theta_min < -1e-9) or (result.theta_max > 1.0 + 1e-9):
+        return False
+    return True
 
 
 # ─── Phi padding helpers ───────────────────────────────────────────
@@ -197,16 +343,31 @@ def set_ausas_backend_for_tests(
 def ausas_one_step_with_state(
     state: DieselAusasState,
     *,
-    H_curr_phys: np.ndarray,
+    H_curr: np.ndarray,
     dt_s: float,
+    omega_shaft: float,
     d_phi: float,
     d_Z: float,
     R: float,
     L: float,
     extra_options: Optional[Dict[str, Any]] = None,
     commit: bool,
-) -> Dict[str, Any]:
+) -> DieselAusasStepResult:
     """Advance the Ausas state by one mechanical step.
+
+    Stage J Bug 4 follow-up — ``omega_shaft`` is a required kwarg
+    so the adapter can convert the physical timestep ``dt_s``
+    (seconds) into the Ausas non-dimensional time
+    ``dt_ausas = ω·dt_s`` that the GPU solver actually consumes.
+    Forwarding ``dt_s`` directly inflated the unsteady coefficient
+    by ``ω ≈ 199`` at 1900 rpm and made the orbit collapse on the
+    first step.
+
+    Stage J Bug 5 follow-up — the runner now initialises ``state``
+    via :meth:`DieselAusasState.from_initial_gap` so ``H_prev``
+    matches the actual first accepted gap; the legacy
+    ``cold_start`` (``H_prev = ones``) injected an artificial
+    squeeze pulse on step #1.
 
     Stage J integration regression — Bugs 1/2/3 fixed:
 
@@ -230,12 +391,21 @@ def ausas_one_step_with_state(
     ----------
     state
         ``DieselAusasState`` carrying the previous accepted
-        ``P``, ``theta`` and ``H_prev`` on the unpadded physical grid.
-    H_curr_phys
+        ``P_nd``, ``theta`` and ``H_prev`` on the unpadded physical
+        grid.
+    H_curr
         Current candidate film thickness on the physical
-        ``(N_z, N_phi)`` diesel grid.
-    dt_s, d_phi, d_Z, R, L
-        Solver kwargs forwarded to ``ausas_unsteady_one_step_gpu``.
+        ``(N_z, N_phi)`` diesel grid (``H = h / c``).
+    dt_s
+        Mechanical timestep in **physical seconds**. The adapter
+        converts to non-dimensional ``dt_ausas = ω·dt_s`` before
+        forwarding to the GPU backend.
+    omega_shaft
+        Shaft angular velocity (rad/s). Required for the
+        non-dimensional time conversion.
+    d_phi, d_Z, R, L
+        Solver kwargs forwarded to ``ausas_unsteady_one_step_gpu``
+        unchanged.
     extra_options
         Optional dict merged into the solver kwargs (e.g.
         ``omega_p``, ``omega_theta``, ``alpha``, ``tol``,
@@ -243,25 +413,17 @@ def ausas_one_step_with_state(
     commit
         When ``False`` the state is **not** mutated — used for the
         Verlet trial path. When ``True`` the wrapper writes the new
-        ``P``, ``theta``, ``H_prev``, ``step_index``, ``time_s`` and
-        ``dt_last_s`` back into ``state``.
+        ``P``, ``theta``, ``H_prev``, ``step_index``, ``time_s``,
+        ``dt_last_s`` and ``dt_ausas_last`` back into ``state``.
 
     Returns
     -------
-    dict with keys:
-        ``P_phys``    — pressure on the physical grid (callers
-                          integrate this for force / friction).
-        ``theta_phys``— fluid fraction on the physical grid.
-        ``ok``        — solver convergence flag derived from the
-                          residual / inner-iteration budget.
-        ``n_inner``   — inner-iteration count reported by the solver.
-        ``residual``  — final residual reported by the solver
-                          (``nan`` if the legacy short shape is in
-                          use).
-        ``cav_frac``  — ``mean(theta_phys < 1)`` (dim-less cavitation
-                          fraction).
-        ``theta_min`` / ``theta_max``
-        ``reason``    — human-readable solver status.
+    :class:`DieselAusasStepResult`
+        Structured result; ``P_nd`` / ``theta`` are on the unpadded
+        physical grid. The runner is expected to pass ``P_nd``
+        (NOT a re-dimensionalised pressure) into
+        ``compute_hydro_forces`` etc., which already multiply by
+        ``p_scale_step``.
     """
     backend = _resolve_ausas_backend()
     if backend is None:
@@ -275,14 +437,18 @@ def ausas_one_step_with_state(
         )
 
     # Unpadded physical grid in / out — solver pads internally.
-    H_curr = np.asarray(H_curr_phys)
+    H_curr_arr = np.asarray(H_curr)
+
+    # Stage J Bug 4 — convert physical timestep to Ausas non-dim
+    # ``τ`` units before forwarding to the GPU backend.
+    dt_ausas = ausas_dt_from_physical(dt_s, omega_shaft)
 
     kwargs = dict(
-        H_curr=H_curr,
+        H_curr=H_curr_arr,
         H_prev=state.H_prev,
         P_prev=state.P,
         theta_prev=state.theta,
-        dt=float(dt_s),
+        dt=float(dt_ausas),
         d_phi=float(d_phi),
         d_Z=float(d_Z),
         R=float(R),
@@ -314,19 +480,16 @@ def ausas_one_step_with_state(
         # mark the step invalid.
         if commit:
             state.failed_step_count += 1
-        return dict(
-            P_phys=None,
-            theta_phys=None,
-            ok=False,
-            n_inner=0,
-            residual=float("nan"),
-            cav_frac=float("nan"),
-            theta_min=float("nan"),
-            theta_max=float("nan"),
+        return DieselAusasStepResult(
+            P_nd=None, theta=None,
+            residual=float("nan"), n_inner=0,
+            converged=False,
+            H_curr=H_curr_arr,
+            dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
             reason=f"ausas_one_step_failed: {type(exc).__name__}: {exc}",
         )
 
-    P_phys, theta_phys, residual, n_inner, ok_explicit = (
+    P_nd, theta_phys, residual, n_inner, ok_explicit = (
         _unpack_ausas_return(out))
 
     # Derive ``ok``:
@@ -342,60 +505,54 @@ def ausas_one_step_with_state(
     #   internal default is unknown and we must NOT second-guess it.
     if ok_explicit is None:
         if user_max_inner is not None and n_inner >= user_max_inner:
-            ok = False
+            converged = False
         else:
-            ok = True
+            converged = True
     else:
-        ok = bool(ok_explicit)
-
-    cav = float(np.mean(theta_phys < 1.0)) if theta_phys.size else 0.0
+        converged = bool(ok_explicit)
 
     finite = (
-        np.all(np.isfinite(P_phys))
+        np.all(np.isfinite(P_nd))
         and np.all(np.isfinite(theta_phys))
     )
     if not finite:
         if commit:
             state.failed_step_count += 1
-        return dict(
-            P_phys=P_phys, theta_phys=theta_phys,
-            ok=False, n_inner=int(n_inner),
+        return DieselAusasStepResult(
+            P_nd=np.asarray(P_nd), theta=np.asarray(theta_phys),
             residual=float(residual)
                 if np.isfinite(residual) else float("nan"),
-            cav_frac=cav,
-            theta_min=float(np.nanmin(theta_phys))
-                if theta_phys.size else float("nan"),
-            theta_max=float(np.nanmax(theta_phys))
-                if theta_phys.size else float("nan"),
+            n_inner=int(n_inner),
+            converged=False,
+            H_curr=H_curr_arr,
+            dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
             reason="ausas_returned_nonfinite",
         )
 
     if commit:
-        if not ok:
-            # Solver explicitly reported non-convergence — count the
-            # rejection but still leave the previous accepted state
-            # intact (do not poison).
+        if not converged:
+            # Solver reported non-convergence — count the rejection
+            # but leave the previous accepted state intact.
             state.rejected_commit_count += 1
         else:
-            state.P = np.asarray(P_phys)
+            state.P = np.asarray(P_nd)
             state.theta = np.asarray(theta_phys)
-            state.H_prev = H_curr
+            state.H_prev = H_curr_arr
             state.step_index += 1
             state.time_s += float(dt_s)
             state.dt_last_s = float(dt_s)
+            state.dt_ausas_last = float(dt_ausas)
             state.valid = True
 
-    return dict(
-        P_phys=P_phys, theta_phys=theta_phys,
-        ok=bool(ok), n_inner=int(n_inner),
+    return DieselAusasStepResult(
+        P_nd=np.asarray(P_nd), theta=np.asarray(theta_phys),
         residual=float(residual)
             if np.isfinite(residual) else float("nan"),
-        cav_frac=cav,
-        theta_min=float(np.min(theta_phys))
-            if theta_phys.size else float("nan"),
-        theta_max=float(np.max(theta_phys))
-            if theta_phys.size else float("nan"),
-        reason=("ok" if ok else "ausas_not_converged"),
+        n_inner=int(n_inner),
+        converged=bool(converged),
+        H_curr=H_curr_arr,
+        dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
+        reason=("ok" if converged else "ausas_not_converged"),
     )
 
 
