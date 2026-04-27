@@ -1432,8 +1432,10 @@ def run_transient(F_max=None, debug=False,
                         d_phi=float(d_phi),
                         d_Z=float(d_Z),
                         R=float(params.R), L=float(params.L),
-                        eta=float(eta_step),
-                        omega=float(omega),
+                        # Stage J integration regression Bug 1 —
+                        # eta/omega are NOT solver kwargs; the dynamic
+                        # Ausas non-dimensionalisation absorbs them
+                        # into the discretisation coefficients.
                         extra_options=ausas_options or None,
                         commit=False,
                     )
@@ -1546,8 +1548,8 @@ def run_transient(F_max=None, debug=False,
                     d_phi=float(d_phi),
                     d_Z=float(d_Z),
                     R=float(params.R), L=float(params.L),
-                    eta=float(eta_step),
-                    omega=float(omega),
+                    # Stage J integration regression Bug 1 — see
+                    # the trial-call site above; eta/omega absent.
                     extra_options=ausas_options or None,
                     commit=True,
                 )

@@ -43,11 +43,14 @@ def test_phi_padding_roundtrip():
 
 
 def _make_backend(*, ok: bool = True, n_inner: int = 7,
+                  residual: float = 1e-9,
                   raise_exc: bool = False):
-    """Return a Python stub that mimics
-    ``ausas_unsteady_one_step_gpu``. Records every call into
-    ``calls`` so the tests can check argument shapes / commit
-    semantics."""
+    """Return a Python stub that mimics the real
+    ``ausas_unsteady_one_step_gpu`` 4-tuple return shape
+    ``(P, theta, residual, n_inner)`` — Stage J integration
+    regression Bug 2 fix. The optional ``ok`` flag drives the
+    derived convergence by setting ``residual`` and ``n_inner``
+    inside vs outside the gate."""
     calls: list = []
 
     def fake(**kwargs):
@@ -58,7 +61,10 @@ def _make_backend(*, ok: bool = True, n_inner: int = 7,
         # Synthetic but deterministic: P = 0.5*H, theta = clip(H, 0, 1).
         P = 0.5 * H
         theta = np.clip(H, 0.0, 1.0)
-        return (P, theta, int(n_inner), bool(ok))
+        # When ``ok`` is False, return a residual ABOVE the default
+        # tol so the adapter's derived ok-flag flips to False.
+        res = float(residual) if ok else 1.0
+        return (P, theta, res, int(n_inner))
 
     fake.calls = calls
     return fake
@@ -82,7 +88,7 @@ def test_state_not_mutated_on_trial_solve():
         result = ausas_one_step_with_state(
             state, H_curr_phys=H_curr, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=False,
+            commit=False,
         )
         assert result["ok"] is True
         # State arrays must be untouched.
@@ -116,23 +122,25 @@ def test_state_committed_once_per_step():
         ausas_one_step_with_state(
             state, H_curr_phys=H_trial1, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=False)
+            commit=False)
         ausas_one_step_with_state(
             state, H_curr_phys=H_trial2, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=False)
+            commit=False)
         assert state.step_index == 0
         # Final commit — exactly one step advance.
         ausas_one_step_with_state(
             state, H_curr_phys=H_committed, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=True)
+            commit=True)
         assert state.step_index == 1
         assert state.dt_last_s == pytest.approx(1e-4)
-        # ``H_prev`` must reflect the committed (padded) gap, not
-        # the trial gaps.
-        H_committed_pad = pad_phi_for_ausas(H_committed)
-        assert np.array_equal(state.H_prev, H_committed_pad)
+        # Stage J integration regression Bug 3 — state arrays now
+        # live on the unpadded physical grid (the solver pads
+        # internally), so ``H_prev`` must equal the committed H
+        # bit-for-bit, NOT a pre-padded version of it.
+        assert state.H_prev.shape == H_committed.shape
+        assert np.array_equal(state.H_prev, H_committed)
     finally:
         set_ausas_backend_for_tests(None)
 
@@ -154,7 +162,7 @@ def test_failed_step_does_not_poison_state():
         result = ausas_one_step_with_state(
             state, H_curr_phys=H_curr, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=True,
+            commit=True,
         )
         assert result["ok"] is False
         assert "ausas_one_step_failed" in result["reason"]
@@ -173,7 +181,7 @@ def test_failed_step_does_not_poison_state():
         result2 = ausas_one_step_with_state(
             state, H_curr_phys=H_curr, dt_s=1e-4,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
-            eta=0.01, omega=200.0, commit=True,
+            commit=True,
         )
         assert result2["ok"] is True
         assert state.step_index == 1

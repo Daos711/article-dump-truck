@@ -34,12 +34,20 @@ def _stub_solve_reynolds_ok():
 
 
 def _stub_ausas_backend(*, ok: bool = True, n_inner: int = 5):
-    """Ausas backend stub: P = 0.5*H, theta clipped to [0, 1]."""
+    """Ausas backend stub matching the real solver's 4-tuple
+    return shape ``(P, theta, residual, n_inner)`` — Stage J
+    integration regression Bug 2 fix. The legacy stub returned
+    ``(P, theta, n_inner, converged)`` which is the WRONG shape and
+    would have masked the integration regression."""
     def fake(**kwargs):
         H = kwargs["H_curr"]
         P = 0.5 * H
         theta = np.clip(H, 0.0, 1.0)
-        return (P, theta, int(n_inner), bool(ok))
+        # ``ok`` toggles the residual above/below the default tol
+        # (1e-6) so the adapter's derived convergence flag matches
+        # the test's intent.
+        residual = 1e-9 if ok else 1.0
+        return (P, theta, residual, int(n_inner))
     return fake
 
 

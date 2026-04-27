@@ -36,10 +36,13 @@ import numpy as np
 class DieselAusasState:
     """Per-config dynamic state for the diesel Ausas path.
 
-    ``P``, ``theta`` and ``H_prev`` live on the **padded** grid
-    (Ausas seam ghost columns included) so the solver does not need
-    extra boundary handling. Use the adapter helpers to convert
-    to/from the diesel physical grid.
+    ``P``, ``theta`` and ``H_prev`` live on the **unpadded physical
+    grid** ``(N_z, N_phi)`` — same shape and indexing as the diesel
+    ``setup_grid`` output. ``ausas_unsteady_one_step_gpu`` does its
+    own ``_pack_ghosts(..., periodic_phi=True)`` internally so the
+    adapter must NOT pre-pad the seam ghost columns; doing so
+    triggers a double-wrap that corrupts every step (Stage J
+    integration regression, Bug 3).
     """
     P: np.ndarray
     theta: np.ndarray
@@ -55,13 +58,12 @@ class DieselAusasState:
     @classmethod
     def cold_start(cls, *, N_phi: int, N_z: int) -> "DieselAusasState":
         """Cold-start state for an Ausas run: full-film
-        (``theta = 1``), zero pressure, gap padded later from the
-        first mechanical step."""
-        N_phi_pad = int(N_phi) + 2
+        (``theta = 1``), zero pressure, unit gap. Allocated on the
+        unpadded ``(N_z, N_phi)`` physical grid."""
         return cls(
-            P=np.zeros((int(N_z), N_phi_pad), dtype=float),
-            theta=np.ones((int(N_z), N_phi_pad), dtype=float),
-            H_prev=np.ones((int(N_z), N_phi_pad), dtype=float),
+            P=np.zeros((int(N_z), int(N_phi)), dtype=float),
+            theta=np.ones((int(N_z), int(N_phi)), dtype=float),
+            H_prev=np.ones((int(N_z), int(N_phi)), dtype=float),
             step_index=0,
             time_s=0.0,
             dt_last_s=0.0,
@@ -84,15 +86,23 @@ class DieselAusasState:
 
 
 def pad_phi_for_ausas(field: np.ndarray) -> np.ndarray:
-    """Convert a (N_z, N_phi) physical field to a (N_z, N_phi + 2)
-    seam-padded field by mirroring one ghost column on each side.
+    """Mirror one ghost column on each circumferential side of a
+    ``(N_z, N_phi)`` field, returning ``(N_z, N_phi + 2)``.
 
-    The diesel ``setup_grid`` is endpoint-free on phi, so column 0
-    and column N_phi are conjugate (``Phi[N_phi] == Phi[0] + 2π``).
-    The seam wrap is therefore:
+    .. note::
+        Stage J integration regression (Bug 3) — this helper is
+        **not** called inside the live ``ausas_one_step_with_state``
+        path. ``ausas_unsteady_one_step_gpu`` performs
+        ``_pack_ghosts(..., periodic_phi=True)`` internally, so
+        pre-padding triggers a double-wrap. The helper survives
+        only as a debug utility for offline introspection.
 
-        col_left_ghost  = field[:, -1]        # i.e. phi = -dphi
-        col_right_ghost = field[:, 0]         # i.e. phi = 2π
+    Diesel ``setup_grid`` is endpoint-free on phi, so column 0 and
+    column ``N_phi`` are conjugate (``Phi[N_phi] == Phi[0] + 2π``).
+    The seam wrap is::
+
+        col_left_ghost  = field[:, -1]        # phi = -dphi
+        col_right_ghost = field[:, 0]         # phi = 2π
     """
     a = np.asarray(field)
     if a.ndim != 2:
@@ -109,8 +119,9 @@ def pad_phi_for_ausas(field: np.ndarray) -> np.ndarray:
 
 def unpad_phi_from_ausas(field_pad: np.ndarray) -> np.ndarray:
     """Inverse of :func:`pad_phi_for_ausas`. Drops the two ghost
-    columns and returns the physical (N_z, N_phi) array used by the
-    diesel force / friction integrations."""
+    columns; returns the physical ``(N_z, N_phi)`` array. Same
+    note as ``pad_phi_for_ausas``: not called by the live path
+    after Bug 3."""
     a = np.asarray(field_pad)
     if a.ndim != 2:
         raise ValueError(
@@ -169,6 +180,10 @@ def set_ausas_backend_for_tests(
 # ─── Commit-once one-step wrapper ──────────────────────────────────
 
 
+_DEFAULT_AUSAS_TOL = 1e-6
+_DEFAULT_AUSAS_MAX_INNER = 200
+
+
 def ausas_one_step_with_state(
     state: DieselAusasState,
     *,
@@ -178,27 +193,43 @@ def ausas_one_step_with_state(
     d_Z: float,
     R: float,
     L: float,
-    eta: float,
-    omega: float,
     extra_options: Optional[Dict[str, Any]] = None,
     commit: bool,
 ) -> Dict[str, Any]:
     """Advance the Ausas state by one mechanical step.
 
+    Stage J integration regression — Bugs 1/2/3 fixed:
+
+    * **Bug 1** — ``eta`` and ``omega`` are NOT forwarded to
+      ``ausas_unsteady_one_step_gpu``. The dynamic Ausas solver uses
+      a different non-dimensionalisation; viscosity enters through
+      the discretisation coefficients, not as an explicit kwarg.
+      The adapter signature therefore no longer accepts them.
+    * **Bug 2** — the 4-tuple return shape is interpreted as
+      ``(P, theta, residual, n_inner)`` (matches the GPU solver
+      docstring), and convergence is derived from
+      ``n_inner < max_inner`` AND ``residual <= tol`` (legacy
+      shapes that already report a ``converged`` flag still honour
+      it).
+    * **Bug 3** — state arrays live on the unpadded physical grid
+      ``(N_z, N_phi)``; the adapter does NOT pre-pad. The GPU
+      solver does its own ``_pack_ghosts(..., periodic_phi=True)``,
+      so adding ghost columns here would double-wrap.
+
     Parameters
     ----------
     state
         ``DieselAusasState`` carrying the previous accepted
-        ``P``, ``theta`` and ``H_prev`` on the padded grid.
+        ``P``, ``theta`` and ``H_prev`` on the unpadded physical grid.
     H_curr_phys
-        Current candidate film thickness on the physical (N_z, N_phi)
-        diesel grid. The wrapper takes care of padding.
-    dt_s, d_phi, d_Z, R, L, eta, omega
+        Current candidate film thickness on the physical
+        ``(N_z, N_phi)`` diesel grid.
+    dt_s, d_phi, d_Z, R, L
         Solver kwargs forwarded to ``ausas_unsteady_one_step_gpu``.
     extra_options
-        Optional dict merged into the solver kwargs (e.g. ``omega_p``,
-        ``omega_theta``, ``tol``, ``max_inner``, ``check_every``,
-        ``scheme``).
+        Optional dict merged into the solver kwargs (e.g.
+        ``omega_p``, ``omega_theta``, ``alpha``, ``tol``,
+        ``max_inner``, ``check_every``, ``scheme``).
     commit
         When ``False`` the state is **not** mutated — used for the
         Verlet trial path. When ``True`` the wrapper writes the new
@@ -211,8 +242,12 @@ def ausas_one_step_with_state(
         ``P_phys``    — pressure on the physical grid (callers
                           integrate this for force / friction).
         ``theta_phys``— fluid fraction on the physical grid.
-        ``ok``        — solver convergence flag.
+        ``ok``        — solver convergence flag derived from the
+                          residual / inner-iteration budget.
         ``n_inner``   — inner-iteration count reported by the solver.
+        ``residual``  — final residual reported by the solver
+                          (``nan`` if the legacy short shape is in
+                          use).
         ``cav_frac``  — ``mean(theta_phys < 1)`` (dim-less cavitation
                           fraction).
         ``theta_min`` / ``theta_max``
@@ -229,10 +264,11 @@ def ausas_one_step_with_state(
             "``models.diesel_ausas_adapter.set_ausas_backend_for_tests``."
         )
 
-    H_curr_pad = pad_phi_for_ausas(H_curr_phys)
+    # Unpadded physical grid in / out — solver pads internally.
+    H_curr = np.asarray(H_curr_phys)
 
     kwargs = dict(
-        H_curr=H_curr_pad,
+        H_curr=H_curr,
         H_prev=state.H_prev,
         P_prev=state.P,
         theta_prev=state.theta,
@@ -241,11 +277,13 @@ def ausas_one_step_with_state(
         d_Z=float(d_Z),
         R=float(R),
         L=float(L),
-        eta=float(eta),
-        omega=float(omega),
     )
     if extra_options:
         kwargs.update(extra_options)
+    # Convergence threshold for the derived ``ok`` flag — matches
+    # the kwarg the runner can override.
+    tol = float(kwargs.get("tol", _DEFAULT_AUSAS_TOL))
+    max_inner = int(kwargs.get("max_inner", _DEFAULT_AUSAS_MAX_INNER))
 
     try:
         out = backend(**kwargs)
@@ -260,21 +298,32 @@ def ausas_one_step_with_state(
             theta_phys=None,
             ok=False,
             n_inner=0,
+            residual=float("nan"),
             cav_frac=float("nan"),
             theta_min=float("nan"),
             theta_max=float("nan"),
             reason=f"ausas_one_step_failed: {type(exc).__name__}: {exc}",
         )
 
-    P_pad, theta_pad, n_inner, ok = _unpack_ausas_return(out)
+    P_phys, theta_phys, residual, n_inner, ok_explicit = (
+        _unpack_ausas_return(out))
 
-    P_phys = unpad_phi_from_ausas(P_pad)
-    theta_phys = unpad_phi_from_ausas(theta_pad)
+    # Derive ``ok``: short shapes return ok_explicit=None; for those
+    # use n_inner < max_inner AND residual <= tol (residual stays
+    # NaN in 2-/3-tuple legacy shapes, in which case we trust
+    # n_inner < max_inner alone).
+    if ok_explicit is None:
+        ok_residual = (np.isfinite(residual) and residual <= tol) \
+            or (not np.isfinite(residual))
+        ok = bool(n_inner < max_inner) and bool(ok_residual)
+    else:
+        ok = bool(ok_explicit)
+
     cav = float(np.mean(theta_phys < 1.0)) if theta_phys.size else 0.0
 
     finite = (
-        np.all(np.isfinite(P_pad))
-        and np.all(np.isfinite(theta_pad))
+        np.all(np.isfinite(P_phys))
+        and np.all(np.isfinite(theta_phys))
     )
     if not finite:
         if commit:
@@ -282,6 +331,8 @@ def ausas_one_step_with_state(
         return dict(
             P_phys=P_phys, theta_phys=theta_phys,
             ok=False, n_inner=int(n_inner),
+            residual=float(residual)
+                if np.isfinite(residual) else float("nan"),
             cav_frac=cav,
             theta_min=float(np.nanmin(theta_phys))
                 if theta_phys.size else float("nan"),
@@ -297,9 +348,9 @@ def ausas_one_step_with_state(
             # intact (do not poison).
             state.rejected_commit_count += 1
         else:
-            state.P = P_pad
-            state.theta = theta_pad
-            state.H_prev = H_curr_pad
+            state.P = np.asarray(P_phys)
+            state.theta = np.asarray(theta_phys)
+            state.H_prev = H_curr
             state.step_index += 1
             state.time_s += float(dt_s)
             state.dt_last_s = float(dt_s)
@@ -308,6 +359,8 @@ def ausas_one_step_with_state(
     return dict(
         P_phys=P_phys, theta_phys=theta_phys,
         ok=bool(ok), n_inner=int(n_inner),
+        residual=float(residual)
+            if np.isfinite(residual) else float("nan"),
         cav_frac=cav,
         theta_min=float(np.min(theta_phys))
             if theta_phys.size else float("nan"),
@@ -319,21 +372,40 @@ def ausas_one_step_with_state(
 
 def _unpack_ausas_return(
     out: Any,
-) -> Tuple[np.ndarray, np.ndarray, int, bool]:
-    """Normalise the variety of return shapes the solver may use.
+) -> Tuple[np.ndarray, np.ndarray, float, int, Optional[bool]]:
+    """Normalise the variety of ``ausas_unsteady_one_step_gpu``
+    return shapes onto ``(P, theta, residual, n_inner, ok_explicit)``.
+
+    ``ok_explicit`` is ``None`` when the shape carries no convergence
+    flag — in which case the caller derives ``ok`` from
+    ``n_inner < max_inner`` and ``residual <= tol``.
 
     Accepts:
-        ``(P, theta)``                              (no diagnostics)
-        ``(P, theta, n_inner)``                     (legacy)
-        ``(P, theta, n_inner, converged)``          (modern)
-        ``dict(P=..., theta=..., n_inner=..., converged=...)``
+        ``(P, theta)``
+            no diagnostics → residual=NaN, n_inner=0,
+            ok_explicit=None.
+        ``(P, theta, n_inner)``
+            legacy short shape → residual=NaN, ok_explicit=None.
+        ``(P, theta, residual, n_inner)``
+            **canonical real-solver shape** (Stage J Bug 2 fix):
+            third element is the **residual** scalar, fourth is
+            the inner-iteration count. ok_explicit=None.
+        ``(P, theta, residual, n_inner, converged)``
+            future-proofing extension that does include an explicit
+            convergence flag.
+        ``dict(P=..., theta=..., residual=..., n_inner=...,
+               converged=...)``
+            keyword shape — every field optional except ``P`` and
+            ``theta``.
     """
     if isinstance(out, dict):
         P = np.asarray(out["P"])
         theta = np.asarray(out["theta"])
+        residual = float(out.get("residual", float("nan")))
         n_inner = int(out.get("n_inner", 0))
-        ok = bool(out.get("converged", True))
-        return P, theta, n_inner, ok
+        ok_explicit: Optional[bool] = (
+            bool(out["converged"]) if "converged" in out else None)
+        return P, theta, residual, n_inner, ok_explicit
     if not isinstance(out, (tuple, list)):
         raise TypeError(
             "Unrecognised ausas_unsteady_one_step_gpu return type: "
@@ -341,14 +413,21 @@ def _unpack_ausas_return(
         )
     if len(out) == 2:
         P, theta = out
-        return np.asarray(P), np.asarray(theta), 0, True
+        return (np.asarray(P), np.asarray(theta),
+                float("nan"), 0, None)
     if len(out) == 3:
         P, theta, n_inner = out
-        return np.asarray(P), np.asarray(theta), int(n_inner), True
-    if len(out) >= 4:
-        P, theta, n_inner, ok = out[:4]
         return (np.asarray(P), np.asarray(theta),
-                int(n_inner), bool(ok))
+                float("nan"), int(n_inner), None)
+    if len(out) == 4:
+        # Canonical real-solver shape: (P, theta, residual, n_inner).
+        P, theta, residual, n_inner = out
+        return (np.asarray(P), np.asarray(theta),
+                float(residual), int(n_inner), None)
+    if len(out) >= 5:
+        P, theta, residual, n_inner, ok = out[:5]
+        return (np.asarray(P), np.asarray(theta),
+                float(residual), int(n_inner), bool(ok))
     raise TypeError(
         f"Unrecognised ausas_unsteady_one_step_gpu return shape "
         f"{len(out)} of {type(out)!r}"
