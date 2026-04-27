@@ -86,20 +86,21 @@ def test_state_not_mutated_on_trial_solve():
         step_index_before = state.step_index
         H_curr = np.ones((4, 8))
         result = ausas_one_step_with_state(
-            state, H_curr_phys=H_curr, dt_s=1e-4,
+            state, H_curr=H_curr, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=False,
         )
-        assert result["ok"] is True
+        assert result.converged is True
         # State arrays must be untouched.
         assert np.array_equal(state.P, P_before)
         assert np.array_equal(state.theta, theta_before)
         assert np.array_equal(state.H_prev, H_prev_before)
         assert state.step_index == step_index_before
         # And the trial result must still report sensible diagnostics.
-        assert result["P_phys"] is not None
-        assert result["P_phys"].shape == (4, 8)
-        assert result["theta_phys"].shape == (4, 8)
+        assert result.P_nd is not None
+        assert result.P_nd.shape == (4, 8)
+        assert result.theta.shape == (4, 8)
     finally:
         set_ausas_backend_for_tests(None)
 
@@ -120,17 +121,20 @@ def test_state_committed_once_per_step():
         H_committed = np.ones((4, 8)) * 1.05
         # Two trial solves — neither must mutate the state.
         ausas_one_step_with_state(
-            state, H_curr_phys=H_trial1, dt_s=1e-4,
+            state, H_curr=H_trial1, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=False)
         ausas_one_step_with_state(
-            state, H_curr_phys=H_trial2, dt_s=1e-4,
+            state, H_curr=H_trial2, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=False)
         assert state.step_index == 0
         # Final commit — exactly one step advance.
         ausas_one_step_with_state(
-            state, H_curr_phys=H_committed, dt_s=1e-4,
+            state, H_curr=H_committed, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=True)
         assert state.step_index == 1
@@ -160,12 +164,13 @@ def test_failed_step_does_not_poison_state():
         theta_before = state.theta.copy()
         H_curr = np.ones((4, 8))
         result = ausas_one_step_with_state(
-            state, H_curr_phys=H_curr, dt_s=1e-4,
+            state, H_curr=H_curr, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=True,
         )
-        assert result["ok"] is False
-        assert "ausas_one_step_failed" in result["reason"]
+        assert result.converged is False
+        assert "ausas_one_step_failed" in result.reason
         # State preserved bit-for-bit.
         assert np.array_equal(state.P, P_before)
         assert np.array_equal(state.theta, theta_before)
@@ -179,11 +184,12 @@ def test_failed_step_does_not_poison_state():
         good_backend = _make_backend()
         set_ausas_backend_for_tests(good_backend)
         result2 = ausas_one_step_with_state(
-            state, H_curr_phys=H_curr, dt_s=1e-4,
+            state, H_curr=H_curr, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=True,
         )
-        assert result2["ok"] is True
+        assert result2.converged is True
         assert state.step_index == 1
     finally:
         set_ausas_backend_for_tests(None)
@@ -237,15 +243,16 @@ def test_commit_accepts_step_when_max_inner_not_overridden():
         state = DieselAusasState.cold_start(N_phi=8, N_z=4)
         H = np.ones((4, 8))
         out = ausas_one_step_with_state(
-            state, H_curr_phys=H, dt_s=1e-4,
+            state, H_curr=H, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             commit=True,
         )
-        assert out["ok"] is True
+        assert out.converged is True
         assert state.step_index == 1
         assert state.rejected_commit_count == 0
-        assert out["residual"] == pytest.approx(5e-3)
-        assert out["n_inner"] == 150
+        assert out.residual == pytest.approx(5e-3)
+        assert out.n_inner == 150
     finally:
         set_ausas_backend_for_tests(None)
 
@@ -262,12 +269,13 @@ def test_commit_rejects_step_when_n_inner_hits_user_max_inner():
         state = DieselAusasState.cold_start(N_phi=8, N_z=4)
         H = np.ones((4, 8))
         out = ausas_one_step_with_state(
-            state, H_curr_phys=H, dt_s=1e-4,
+            state, H_curr=H, dt_s=1e-4,
+            omega_shaft=200.0,
             d_phi=0.1, d_Z=0.5, R=0.1, L=0.08,
             extra_options={"max_inner": 200},
             commit=True,
         )
-        assert out["ok"] is False
+        assert out.converged is False
         assert state.step_index == 0
         assert state.rejected_commit_count == 1
     finally:

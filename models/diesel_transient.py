@@ -1283,6 +1283,17 @@ def run_transient(F_max=None, debug=False,
     ausas_cav_frac_all = np.zeros((n_cfg, n_steps), dtype=float)
     ausas_theta_min_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
     ausas_theta_max_all = np.full((n_cfg, n_steps), 1.0, dtype=float)
+    # Stage J Bug 4 follow-up — per-step residual and Ausas-domain dt
+    # for sanity / convergence-quality diagnostics.
+    ausas_residual_all = np.full((n_cfg, n_steps), np.nan, dtype=float)
+    ausas_dt_tau_all = np.zeros((n_cfg, n_steps), dtype=float)
+    # Stage J Bug 4 follow-up — per-step force-balance diagnostics.
+    F_hyd_x_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_hyd_y_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_ext_x_all = np.zeros((n_cfg, n_steps), dtype=float)
+    F_ext_y_all = np.zeros((n_cfg, n_steps), dtype=float)
+    force_balance_projection_all = np.full(
+        (n_cfg, n_steps), np.nan, dtype=float)
     ausas_state_reset_count = np.zeros(n_cfg, dtype=np.int32)
     ausas_failed_step_count = np.zeros(n_cfg, dtype=np.int32)
     ausas_rejected_commit_count = np.zeros(n_cfg, dtype=np.int32)
@@ -1330,14 +1341,24 @@ def run_transient(F_max=None, debug=False,
         P_prev = None
         contact_count = 0
 
-        # Stage J — per-config Ausas state (cold-start). Created
-        # unconditionally so legacy paths that read ``ausas_state``
-        # downstream don't crash; the legacy half-Sommerfeld branch
-        # never advances it.
+        # Stage J Bug 5 — initialise the per-config Ausas state from
+        # the actual first accepted gap. Using ``cold_start`` with
+        # ``H_prev = ones`` injected an artificial squeeze pulse on
+        # step #1 because the first accepted ``H`` was generally
+        # non-unit (eps_x0/eps_y0 != 0); the resulting fictitious
+        # ∂(θH)/∂t blew up the orbit. ``from_initial_gap`` aligns
+        # ``H_prev`` with the true first H.
         ausas_state: Optional[DieselAusasState] = None
         if use_ausas_dynamic:
-            ausas_state = DieselAusasState.cold_start(
-                N_phi=N_phi_eff, N_z=N_z_eff)
+            H_initial = build_H_2d(
+                ex / params.c, ey / params.c,
+                Phi_mesh, Z_mesh, params,
+                textured=cfg["textured"],
+                phi_c_flat=phi_c, Z_c_flat=Z_c,
+                texture_kind=texture_kind,
+                groove_relief=groove_relief,
+            )
+            ausas_state = DieselAusasState.from_initial_gap(H_initial)
 
         def _clamp(ex_, ey_, vx_, vy_):
             clamped = False
@@ -1425,26 +1446,27 @@ def run_transient(F_max=None, debug=False,
                     # is NOT mutated (commit=False); the runner
                     # commits once at the end of the mechanical
                     # step using the final accepted H.
+                    # Stage J Bug 4 — pass omega_shaft so the adapter
+                    # converts dt_phys → dt_ausas = ω·dt_phys before
+                    # forwarding to the GPU backend. The trial solve
+                    # never mutates ausas_state (commit=False).
                     aw = ausas_one_step_with_state(
                         ausas_state,
-                        H_curr_phys=H_,
+                        H_curr=H_,
                         dt_s=float(dt_step),
+                        omega_shaft=float(omega),
                         d_phi=float(d_phi),
                         d_Z=float(d_Z),
                         R=float(params.R), L=float(params.L),
-                        # Stage J integration regression Bug 1 —
-                        # eta/omega are NOT solver kwargs; the dynamic
-                        # Ausas non-dimensionalisation absorbs them
-                        # into the discretisation coefficients.
+                        # Bug 1 — no eta/omega forwarded to backend.
                         extra_options=ausas_options or None,
                         commit=False,
                     )
-                    if aw["ok"] and aw["P_phys"] is not None:
-                        # Non-dim P matches solver-side units (P*p_scale
-                        # = dimensional Pa) so existing
-                        # ``compute_hydro_forces`` and
-                        # ``compute_friction`` apply unchanged.
-                        P_ = np.asarray(aw["P_phys"])
+                    if aw.converged and aw.P_nd is not None:
+                        # ``aw.P_nd`` is non-dim and matches the diesel
+                        # half-Sommerfeld convention; existing helpers
+                        # multiply by ``p_scale_step`` themselves.
+                        P_ = np.asarray(aw.P_nd)
                         Fx_, Fy_ = compute_hydro_forces(
                             P_, p_scale_step, Phi_mesh,
                             phi_1D, Z_1D, params.R, params.L)
@@ -1543,30 +1565,34 @@ def run_transient(F_max=None, debug=False,
                         groove_relief=groove_relief)
                 aw_commit = ausas_one_step_with_state(
                     ausas_state,
-                    H_curr_phys=H_committed,
+                    H_curr=H_committed,
                     dt_s=float(dt_step),
+                    omega_shaft=float(omega),
                     d_phi=float(d_phi),
                     d_Z=float(d_Z),
                     R=float(params.R), L=float(params.L),
-                    # Stage J integration regression Bug 1 — see
-                    # the trial-call site above; eta/omega absent.
+                    # Bug 1 — no eta/omega forwarded to backend.
                     extra_options=ausas_options or None,
                     commit=True,
                 )
-                ausas_converged_all[ic, step] = bool(aw_commit["ok"])
-                ausas_n_inner_all[ic, step] = int(aw_commit["n_inner"])
+                ausas_converged_all[ic, step] = bool(aw_commit.converged)
+                ausas_n_inner_all[ic, step] = int(aw_commit.n_inner)
                 ausas_cav_frac_all[ic, step] = float(
-                    aw_commit["cav_frac"])
+                    aw_commit.cav_frac)
                 ausas_theta_min_all[ic, step] = float(
-                    aw_commit["theta_min"])
+                    aw_commit.theta_min)
                 ausas_theta_max_all[ic, step] = float(
-                    aw_commit["theta_max"])
+                    aw_commit.theta_max)
+                ausas_residual_all[ic, step] = float(
+                    aw_commit.residual)
+                ausas_dt_tau_all[ic, step] = float(
+                    aw_commit.dt_ausas)
                 # If the commit succeeded, the step's pressure /
                 # forces should reflect the COMMITTED solve, not the
                 # last trial — preserves Ausas mass conservation in
                 # the post-step diagnostic block below.
-                if aw_commit["ok"] and aw_commit["P_phys"] is not None:
-                    P = np.asarray(aw_commit["P_phys"])
+                if aw_commit.converged and aw_commit.P_nd is not None:
+                    P = np.asarray(aw_commit.P_nd)
                     H = H_committed
                     Fx_committed, Fy_committed = compute_hydro_forces(
                         P, p_scale_step, Phi_mesh,
@@ -1646,6 +1672,28 @@ def run_transient(F_max=None, debug=False,
             Nloss_all[ic, step] = P_loss_step
             Fx_hyd_all[ic, step] = Fx_hyd
             Fy_hyd_all[ic, step] = Fy_hyd
+            # Stage J Bug 4 follow-up — record both force vectors and
+            # the dot-product projection of F_hyd onto the resisting
+            # direction (-F_ext). A physically scaled hydrodynamic
+            # response should keep this projection POSITIVE: the
+            # film pressure pushes against the external load. A
+            # consistently negative or near-zero projection is the
+            # signature of a sign / unit regression in the cavitation
+            # backend coupling.
+            Fx_ext_arr, Fy_ext_arr = load_diesel(phi_deg, F_max=F_max)
+            Fx_ext_step = float(np.asarray(Fx_ext_arr).item())
+            Fy_ext_step = float(np.asarray(Fy_ext_arr).item())
+            F_hyd_x_all[ic, step] = float(Fx_hyd)
+            F_hyd_y_all[ic, step] = float(Fy_hyd)
+            F_ext_x_all[ic, step] = Fx_ext_step
+            F_ext_y_all[ic, step] = Fy_ext_step
+            F_ext_mag_step = np.hypot(Fx_ext_step, Fy_ext_step)
+            if F_ext_mag_step > 1.0 and np.isfinite(Fx_hyd) \
+                    and np.isfinite(Fy_hyd):
+                ux = -Fx_ext_step / F_ext_mag_step
+                uy = -Fy_ext_step / F_ext_mag_step
+                force_balance_projection_all[ic, step] = (
+                    float(Fx_hyd) * ux + float(Fy_hyd) * uy)
             T_eff_used_all[ic, step] = T_used_C
             T_eff_all[ic, step] = T_state_C
             T_target_all[ic, step] = T_target_C
@@ -2016,4 +2064,11 @@ def run_transient(F_max=None, debug=False,
         "ausas_state_reset_count": ausas_state_reset_count,
         "ausas_failed_step_count": ausas_failed_step_count,
         "ausas_rejected_commit_count": ausas_rejected_commit_count,
+        "ausas_residual": ausas_residual_all,
+        "ausas_dt_tau": ausas_dt_tau_all,
+        "F_hyd_x": F_hyd_x_all,
+        "F_hyd_y": F_hyd_y_all,
+        "F_ext_x": F_ext_x_all,
+        "F_ext_y": F_ext_y_all,
+        "force_balance_projection": force_balance_projection_all,
     }
