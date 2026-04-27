@@ -1526,7 +1526,13 @@ def run_transient(F_max=None, debug=False,
                 dt_phys_s=float(dt_step),
                 backend=_backend,
                 backend_state=ausas_state,
-                policy=_coupling.POLICY_LEGACY_HS,
+                # Stage J fu-2 Step 6 — capability-based dispatch.
+                # Stateless backends (HS) → POLICY_LEGACY_HS;
+                # stateful backends (Ausas, future PV-on-Ausas) →
+                # POLICY_AUSAS_DYNAMIC. The runner never branches
+                # on backend name; future PV plugs in via the same
+                # protocol.
+                policy=_coupling.select_policy(_backend),
                 guards_cfg=_coupling.PhysicalGuardsConfig.from_profile(
                     "diagnostic", "general"),
                 ausas_tol=1e-6,

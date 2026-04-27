@@ -49,6 +49,11 @@ class CouplingPolicy:
     require_solver_converged: bool
     max_delta_eps_inner: Optional[float]
     max_delta_eps_step: Optional[float]
+    # Fixed-point convergence tolerance for the damped policy
+    # (|Δε| between successive trials, non-dimensional ε units).
+    # The legacy policy iterates a fixed N_SUB times and never
+    # terminates early, so the value is irrelevant there.
+    eps_update_tol: float = 1.0
 
 
 POLICY_LEGACY_HS: CouplingPolicy = CouplingPolicy(
@@ -63,6 +68,7 @@ POLICY_LEGACY_HS: CouplingPolicy = CouplingPolicy(
     require_solver_converged=True,
     max_delta_eps_inner=None,
     max_delta_eps_step=None,
+    eps_update_tol=1.0,    # not used by legacy policy
 )
 
 
@@ -78,6 +84,7 @@ POLICY_AUSAS_DYNAMIC: CouplingPolicy = CouplingPolicy(
     require_solver_converged=True,
     max_delta_eps_inner=0.10,
     max_delta_eps_step=0.25,
+    eps_update_tol=1.0e-4,
 )
 
 
