@@ -39,6 +39,27 @@ from .guards import (
     check_physical_guards,
     check_solver_validity,
 )
+
+# ─── Stage J fu-2 Step 9 fixup-2 — Picard contractivity ────────────
+# Constants for the damped-policy contractivity / oscillation / stall
+# detector that drives the per-step relax shrink (expert patch).
+#
+# * ``PICARD_GROW_RATIO`` — δε grew by more than 5% vs the previous
+#   iter; symptom: the Picard map is locally non-contractive.
+# * ``PICARD_OSC_COS`` — step direction reversed (cos < -0.25) AND
+#   ratio > 0.70; symptom: the candidate is bouncing between two
+#   attractors of the squeeze film.
+# * ``PICARD_STALL_RATIO`` — k≥3 and δε never improved beyond 85%
+#   of best_step_norm; symptom: shrink budget is being wasted.
+# * ``PICARD_ACTIVE_FLOOR_MULT`` — detector only activates when
+#   ``δε > 10 × eps_update_tol``; near-converged tails (δε ~ tol)
+#   should NOT shrink relax further (would just delay accept).
+PICARD_STALL_RATIO: float = 0.85
+PICARD_GROW_RATIO: float = 1.05
+PICARD_OSC_COS: float = -0.25
+PICARD_ACTIVE_FLOOR_MULT: float = 10.0
+PICARD_OSC_RATIO_MIN: float = 0.70
+
 from .policies import CouplingPolicy
 
 
@@ -582,6 +603,18 @@ def _run_damped_implicit_film(
     # generic MECHANICAL_RELAX_EXHAUSTED).
     last_rejection: Optional[GuardOutcome] = None
 
+    # Stage J fu-2 Step 9 fixup-2 — Picard contractivity tracking.
+    # Per expert patch, the relax shrink is driven by THREE signals
+    # measured between consecutive accepted Picard iterations:
+    #   * growth (δε_k > 1.05 × δε_{k-1});
+    #   * oscillation (cos(step_k, step_{k-1}) < -0.25 AND ratio > 0.70);
+    #   * stall (k≥3 AND δε_k > 0.85 × min_seen).
+    # The detector is gated on δε > 10 × eps_update_tol so near-
+    # converged tails don't trigger pointless shrinks.
+    prev_step_vec: Optional[np.ndarray] = None
+    prev_step_norm: Optional[float] = None
+    best_step_norm: float = float("inf")
+
     # Anchor = last accepted candidate (initial = step start).
     ex_anchor, ey_anchor = float(ex_n), float(ey_n)
     vx_anchor, vy_anchor = float(vx_n), float(vy_n)
@@ -881,10 +914,24 @@ def _run_damped_implicit_film(
         ey_full = (ey_n + vy_full * dt_step
                     + 0.5 * ay_new * dt_step ** 2)
 
-        # Reset relax for the NEXT iteration's first try (line-
-        # search shrinks compound only WITHIN one inner attempt;
-        # a successful accept restarts the shrink budget).
-        relax = float(policy.mech_relax_initial)
+        # Stage J fu-2 Step 9 fixup-2 — DO NOT reset relax here.
+        # The expert patch keeps the relax shrunk by the
+        # contractivity detector (below) across the entire
+        # mechanical step. Resetting to ``mech_relax_initial`` after
+        # every accept defeats the shrink: shrunk_relax → calmer
+        # candidate → next accept → reset to 0.25 → oscillation
+        # restarts. Auto-grow back is intentionally NOT done in
+        # the smoke profile.
+
+        # Picard residual BEFORE relaxation (the un-damped Verlet
+        # step the solver wants to take). Used to (a) drive the
+        # convergence-after-shrink check and (b) compare to the
+        # relaxed step for the contractivity ratio.
+        picard_vec = np.array([
+            (ex_full - ex_anchor) / context.c,
+            (ey_full - ey_anchor) / context.c,
+        ], dtype=float)
+        picard_res_unrelaxed = float(np.linalg.norm(picard_vec))
 
         # Picard blend: next-iteration candidate.
         next_ex = ex_anchor + relax * (ex_full - ex_anchor)
@@ -897,10 +944,89 @@ def _run_damped_implicit_film(
             n_contact_events += 1
             p_warm_local = None
 
-        delta_eps = float(np.hypot(
+        step_vec = np.array([
             (next_ex - ex_anchor) / context.c,
             (next_ey - ey_anchor) / context.c,
-        ))
+        ], dtype=float)
+        delta_eps = float(np.linalg.norm(step_vec))
+
+        # Convergence check — both the relaxed step AND the
+        # un-relaxed Picard residual must be small. Without the
+        # second condition a heavily-shrunk relax would produce a
+        # tiny δε_blend that masks an un-converged Picard map.
+        # ``picard_res_tol = eps_tol / mech_relax_initial`` scales
+        # the un-relaxed tolerance back so the expected
+        # equivalent damped tolerance is recovered.
+        picard_res_tol = (
+            float(eps_tol) / float(policy.mech_relax_initial))
+        if (delta_eps <= eps_tol
+                and picard_res_unrelaxed <= picard_res_tol):
+            if debug_dump:
+                print(
+                    f"    [J9-dump k={k} ACCEPT-CONVERGED] "
+                    f"Δε_blend={delta_eps:.6e} ≤ tol={eps_tol:.1e} "
+                    f"AND picard_res={picard_res_unrelaxed:.6e} "
+                    f"≤ {picard_res_tol:.3e}",
+                    flush=True)
+            fixed_point_converged = True
+            break
+
+        # Contractivity / oscillation / stall detector. Only active
+        # when δε significantly exceeds the convergence tolerance.
+        too_large = False
+        picard_ratio = float("nan")
+        picard_cos = float("nan")
+        if (prev_step_norm is not None
+                and prev_step_vec is not None
+                and delta_eps > PICARD_ACTIVE_FLOOR_MULT
+                * float(eps_tol)):
+            picard_ratio = (delta_eps
+                            / max(float(prev_step_norm), 1e-30))
+            picard_cos = float(
+                np.dot(step_vec, prev_step_vec)
+                / max(delta_eps * float(prev_step_norm), 1e-30))
+            growth_bad = picard_ratio > PICARD_GROW_RATIO
+            osc_bad = (picard_cos < PICARD_OSC_COS
+                       and picard_ratio > PICARD_OSC_RATIO_MIN)
+            stall_bad = (
+                k >= 3
+                and delta_eps > PICARD_STALL_RATIO * best_step_norm)
+            too_large = growth_bad or osc_bad or stall_bad
+
+        # Apply Picard-shrink — halve relax (down to mech_relax_min)
+        # and re-blend the candidate from the SAME accepted anchor /
+        # Verlet-full target. Distinct from the line-search shrink
+        # (which fires on guard reject and retreats the candidate
+        # toward anchor on a rejected GPU trial).
+        if too_large and relax > float(policy.mech_relax_min):
+            old_relax = relax
+            relax = max(float(policy.mech_relax_min), 0.5 * relax)
+            mech_relax_min_seen = min(mech_relax_min_seen, relax)
+            next_ex = ex_anchor + relax * (ex_full - ex_anchor)
+            next_ey = ey_anchor + relax * (ey_full - ey_anchor)
+            next_vx = vx_anchor + relax * (vx_full - vx_anchor)
+            next_vy = vy_anchor + relax * (vy_full - vy_anchor)
+            next_ex, next_ey, next_vx, next_vy, cl = clamp_fn(
+                next_ex, next_ey, next_vx, next_vy)
+            if cl:
+                n_contact_events += 1
+                p_warm_local = None
+            step_vec = np.array([
+                (next_ex - ex_anchor) / context.c,
+                (next_ey - ey_anchor) / context.c,
+            ], dtype=float)
+            delta_eps = float(np.linalg.norm(step_vec))
+            if debug_dump:
+                print(
+                    f"    [J9-dump k={k} PICARD-SHRINK] "
+                    f"old_relax={old_relax:.5f} → "
+                    f"{relax:.5f} "
+                    f"Δε_blend={delta_eps:.6f} "
+                    f"picard_res={picard_res_unrelaxed:.6f} "
+                    f"ratio={picard_ratio:.3f} "
+                    f"cos={picard_cos:+.3f} "
+                    f"best={best_step_norm:.6f}",
+                    flush=True)
 
         if debug_dump:
             print(
@@ -915,13 +1041,20 @@ def _run_damped_implicit_film(
                 f"{ey_full/context.c:+.6f}) "
                 f"ε_blend=({next_ex/context.c:+.6f},"
                 f"{next_ey/context.c:+.6f}) "
-                f"Δε_blend={delta_eps:.6f} eps_tol={eps_tol:.1e} "
-                f"converged={delta_eps <= eps_tol}",
+                f"relax={relax:.5f} "
+                f"picard_res_unrelaxed={picard_res_unrelaxed:.6f} "
+                f"Δε_blend={delta_eps:.6f} "
+                f"ratio={picard_ratio:.3f} "
+                f"cos={picard_cos:+.3f} "
+                f"eps_tol={eps_tol:.1e}",
                 flush=True)
 
-        if delta_eps <= eps_tol:
-            fixed_point_converged = True
-            break
+        # Store contractivity diagnostics AFTER any shrink — the
+        # next iteration compares against the FINAL accepted step,
+        # not the pre-shrink one.
+        prev_step_vec = step_vec
+        prev_step_norm = delta_eps
+        best_step_norm = min(best_step_norm, delta_eps)
 
         ex_cand, ey_cand = next_ex, next_ey
         vx_cand, vy_cand = next_vx, next_vy
@@ -1036,10 +1169,19 @@ def _run_damped_implicit_film(
         # Picard iteration exhausted ``max_mech_inner`` without
         # stabilising — treat the step as solver-failed (commit-on-
         # non-convergence=False extension of Followup-2 §3.4).
+        # Step 9 fixup-2: enrich the detail string with the relax
+        # floor and the last accepted step δε so the Stage 10
+        # summary writer can flag iterations that stalled at the
+        # min relax (pathology) vs. ran out of budget on a
+        # productively contracting δε (just need bigger budget).
         rejection_reason = RejectionReason.SOLVER_RESIDUAL
         rejection_detail = (
             f"damped_picard_not_converged after "
-            f"{n_trials}/{max_mech_inner} trials")
+            f"{n_trials}/{max_mech_inner} trials; "
+            f"min_relax={mech_relax_min_seen:.5f}; "
+            f"last_delta_eps="
+            f"{prev_step_norm if prev_step_norm is not None else 0.0:.3e}"
+        )
 
     return MechanicalStepResult(
         accepted=True,

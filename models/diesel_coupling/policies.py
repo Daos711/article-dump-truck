@@ -74,7 +74,12 @@ POLICY_LEGACY_HS: CouplingPolicy = CouplingPolicy(
 
 POLICY_AUSAS_DYNAMIC: CouplingPolicy = CouplingPolicy(
     name="damped_implicit_film",
-    max_mech_inner=8,
+    # Stage J fu-2 Step 9 fixup-2 — expert patch raised the budget
+    # from 8 to 24. With Picard contractivity shrink, relax can fall
+    # to 0.03125 (8× smaller step); the residual contraction at this
+    # relax may need 15-20 iterations to bring delta_eps below the
+    # 1e-4 tolerance. 24 leaves headroom for stiff transient peaks.
+    max_mech_inner=24,
     mech_relax_initial=0.25,
     mech_relax_min=0.03125,
     enable_line_search=True,
