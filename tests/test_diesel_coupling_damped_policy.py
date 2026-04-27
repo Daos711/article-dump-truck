@@ -287,14 +287,21 @@ def test_damped_does_not_commit_on_non_convergence():
         np.ones((8, 16), dtype=float))
     backend = AusasDynamicBackend(ausas_options=None)
 
-    # Alternating-sign large pressure: each iteration produces a
-    # force pointing the opposite way, so the Picard candidate
-    # never stabilises. With max_mech_inner=8 and no fixed-point
-    # convergence, the kernel must reject the step.
-    rng = np.random.default_rng(20240501)
+    # Alternating-magnitude POSITIVE pressure: each iteration
+    # produces a force of substantially different magnitude, so
+    # the Picard candidate never stabilises (the fixed point
+    # depends on the iteration parity, no consistent attractor).
+    # All entries are positive so the Step 7 solver-validity gate
+    # (which rejects ``P_nd.min() < 0``) does NOT fire — the test
+    # specifically pins Picard non-convergence, not a solver
+    # rejection.
     big = 100.0
-    P_seq = [big * (1.0 if i % 2 == 0 else -1.0)
-             * np.ones((8, 16), dtype=float) for i in range(20)]
+    small = 0.01
+    P_seq = [
+        (big if i % 2 == 0 else small)
+        * np.ones((8, 16), dtype=float)
+        for i in range(20)
+    ]
     theta_seq = [np.ones((8, 16), dtype=float)] * 20
     _make_const_force_backend(
         P_per_call=P_seq, theta_per_call=theta_seq)

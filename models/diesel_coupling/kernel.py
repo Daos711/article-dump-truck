@@ -35,6 +35,7 @@ from .guards import (
     GuardOutcome,
     PhysicalGuardsConfig,
     RejectionReason,
+    check_solver_validity,
 )
 from .policies import CouplingPolicy
 
@@ -214,6 +215,8 @@ def advance_mechanical_step(
             backend=backend,
             backend_state=backend_state,
             policy=policy,
+            ausas_tol=ausas_tol,
+            ausas_max_inner=ausas_max_inner,
             extra_options=extra_options,
             context=context,
             m_shaft=m_shaft,
@@ -472,6 +475,8 @@ def _run_damped_implicit_film(
     backend: PressureBackend,
     backend_state: Optional[Any],
     policy: CouplingPolicy,
+    ausas_tol: float,
+    ausas_max_inner: int,
     extra_options: Optional[dict],
     context: StepContext,
     m_shaft: float,
@@ -584,33 +589,61 @@ def _run_damped_implicit_film(
             retry_recovered_step = True
             omega_recovery = outcome["retry_omega"]
 
+        # Stage J fu-2 Step 7 — solver-validity HARD gate (doc 1
+        # §3.1). Always enforced for the damped policy regardless
+        # of ``physical_guards_mode``. Catches:
+        #   * ``n_inner == max_inner`` budget exhaust → SOLVER_BUDGET
+        #   * ``residual > tol`` (when finite)        → SOLVER_RESIDUAL
+        #   * non-finite P_nd / theta                 → SOLVER_NONFINITE
+        #   * negative pressure                       → SOLVER_NEG_PRESSURE
+        #   * theta out of [0, 1]                     → SOLVER_THETA_OUT_OF_RANGE
+        # Step 9 will add line-search shrink — at Step 7 a hard
+        # rejection breaks the Picard loop with the gate's reason.
+        solver_outcome = check_solver_validity(
+            backend_name=backend.name,
+            P_nd=result.P_nd, theta=result.theta,
+            residual=result.residual, n_inner=result.n_inner,
+            converged=result.converged,
+            ausas_tol=ausas_tol,
+            ausas_max_inner=ausas_max_inner,
+        )
+        # Trial accepted only when BOTH the backend's own ``ok_``
+        # and the solver-validity gate agree. The gate is stricter
+        # in detecting budget exhaust + non-finite + range violations.
+        accepted_trial = bool(ok_ and solver_outcome.accept)
+
         trial_log.append(TrialRecord(
             inner=k,
             relax_used=float(relax),
             eps_x_cand=eps_x_old,
             eps_y_cand=eps_y_old,
             pressure_result=result,
-            outcome_solver=GuardOutcome(
-                accept=ok_,
-                reason=(RejectionReason.NONE if ok_
-                        else RejectionReason.SOLVER_RESIDUAL),
-                detail=reason_,
-            ),
+            outcome_solver=solver_outcome,
             outcome_physical=GuardOutcome(
                 accept=True, reason=RejectionReason.NONE),
             outcome_mechanical=GuardOutcome(
                 accept=True, reason=RejectionReason.NONE),
-            accepted=ok_,
+            accepted=accepted_trial,
         ))
 
-        if not ok_:
+        if not accepted_trial:
             p_warm_local = None
             P_last = result.P_nd
             H_last = H_
             Fx_hyd = float("nan")
             Fy_hyd = float("nan")
             solve_ok = False
-            solve_reason = reason_
+            # Reason precedence: solver-validity gate's verdict wins
+            # when it rejected; backend's own ``reason`` is the
+            # fallback when the gate accepted but the backend
+            # ``converged=False``.
+            if not solver_outcome.accept:
+                solve_reason = (
+                    f"rejected_by_solver_validity:"
+                    f"{solver_outcome.reason.value}"
+                    f" ({solver_outcome.detail})")
+            else:
+                solve_reason = reason_
             break
 
         P_last = result.P_nd
@@ -690,9 +723,24 @@ def _run_damped_implicit_film(
     theta_min_for_diag = 1.0
     theta_max_for_diag = 1.0
     dt_ausas_for_diag = 0.0
-    rejection_reason = (RejectionReason.NONE if solve_ok
-                        else RejectionReason.SOLVER_RESIDUAL)
-    rejection_detail = ("" if solve_ok else solve_reason)
+    # Stage J fu-2 Step 7 — surface the SPECIFIC solver-validity
+    # rejection reason (SOLVER_BUDGET / SOLVER_RESIDUAL /
+    # SOLVER_NONFINITE / SOLVER_NEG_PRESSURE /
+    # SOLVER_THETA_OUT_OF_RANGE) from the last trial's
+    # ``outcome_solver`` rather than the bucket default
+    # ``SOLVER_RESIDUAL``. This is what lets the Stage 10 summary
+    # writer report ``rejected_by_solver`` with the correct
+    # subdivision per Gate 3.
+    if solve_ok:
+        rejection_reason = RejectionReason.NONE
+        rejection_detail = ""
+    else:
+        last_solver_outcome = (
+            trial_log[-1].outcome_solver if trial_log
+            else GuardOutcome(False, RejectionReason.SOLVER_RESIDUAL,
+                              ""))
+        rejection_reason = last_solver_outcome.reason
+        rejection_detail = solve_reason
 
     if (backend.stateful and solve_ok and not step_clamped
             and fixed_point_converged and H_last is not None):

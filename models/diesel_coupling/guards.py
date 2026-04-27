@@ -202,25 +202,79 @@ def check_solver_validity(
     ausas_tol: float,
     ausas_max_inner: int,
 ) -> GuardOutcome:
-    """HARD gate — always enforced (doc 1 §3.1).
+    """HARD gate — Stage J fu-2 §3.1.
 
-    Composition:
-        * ``np.isfinite(residual)``
-        * ``residual <= ausas_tol``  (only when ``converged is False``;
-          if the backend explicitly reports ``converged=True``, trust
-          it on the residual front)
-        * ``n_inner < ausas_max_inner``  (NEVER accept budget-exhaust)
-        * ``np.isfinite(P_nd).all()``
-        * ``P_nd.min() >= -P_NEGATIVE_TOL_ND``
-        * (theta-bearing backends) ``np.isfinite(theta).all()``
-        * (theta-bearing backends) ``theta`` in ``[THETA_FLOOR, THETA_CEIL]``
+    Composition (priority order — first failing check wins):
 
-    Half-Sommerfeld: ``theta is None`` → theta checks skipped;
-    ``residual``/``n_inner`` come from the SOR solver.
+    1. ``P_nd is None``                           → SOLVER_NONFINITE
+    2. ``P_nd`` contains NaN / Inf                → SOLVER_NONFINITE
+    3. ``P_nd.min() < -P_NEGATIVE_TOL_ND``        → SOLVER_NEG_PRESSURE
+    4. (theta-bearing only) ``theta`` non-finite  → SOLVER_NONFINITE
+    5. (theta-bearing only) theta out of [floor, ceil]
+                                                  → SOLVER_THETA_OUT_OF_RANGE
+    6. ``n_inner >= ausas_max_inner``             → SOLVER_BUDGET
+       — doc 1 §1.2: "n_inner == max_inner means
+       the loop exhausted the budget. It must not become
+       converged=True even if the last sampled residual is small."
+    7. ``residual > ausas_tol`` (only if finite)  → SOLVER_RESIDUAL
+       — non-finite residual on a converged backend is allowed
+       (legacy SOR doesn't surface a residual).
 
-    Step 2 — skeleton only. Step 7 implements the body.
+    Half-Sommerfeld (``theta is None``) skips checks 4-5; the
+    residual check still runs but a NaN residual + converged=True
+    is permitted. Backends that DO surface residual (Ausas) get
+    the residual check enforced when finite.
     """
-    ...
+    if P_nd is None:
+        return GuardOutcome(
+            False, RejectionReason.SOLVER_NONFINITE,
+            f"{backend_name}: P_nd is None")
+    P_arr = np.asarray(P_nd)
+    if not np.all(np.isfinite(P_arr)):
+        return GuardOutcome(
+            False, RejectionReason.SOLVER_NONFINITE,
+            f"{backend_name}: P_nd has NaN/Inf")
+    if float(P_arr.min()) < -P_NEGATIVE_TOL_ND:
+        return GuardOutcome(
+            False, RejectionReason.SOLVER_NEG_PRESSURE,
+            f"{backend_name}: min(P_nd)={float(P_arr.min()):.3e} "
+            f"< -{P_NEGATIVE_TOL_ND:.1e}")
+    if theta is not None:
+        theta_arr = np.asarray(theta)
+        if not np.all(np.isfinite(theta_arr)):
+            return GuardOutcome(
+                False, RejectionReason.SOLVER_NONFINITE,
+                f"{backend_name}: theta has NaN/Inf")
+        if (float(theta_arr.min()) < THETA_FLOOR
+                or float(theta_arr.max()) > THETA_CEIL):
+            return GuardOutcome(
+                False, RejectionReason.SOLVER_THETA_OUT_OF_RANGE,
+                f"{backend_name}: theta=["
+                f"{float(theta_arr.min()):.3e}, "
+                f"{float(theta_arr.max()):.3e}] outside "
+                f"[{THETA_FLOOR:.1e}, {THETA_CEIL:.3f}]")
+    if int(n_inner) >= int(ausas_max_inner):
+        return GuardOutcome(
+            False, RejectionReason.SOLVER_BUDGET,
+            f"{backend_name}: n_inner={int(n_inner)} >= "
+            f"max_inner={int(ausas_max_inner)} — budget exhausted, "
+            "doc 1 §1.2 forbids accepting this as converged")
+    if np.isfinite(residual):
+        if float(residual) > float(ausas_tol):
+            return GuardOutcome(
+                False, RejectionReason.SOLVER_RESIDUAL,
+                f"{backend_name}: residual={float(residual):.3e} > "
+                f"tol={float(ausas_tol):.3e}")
+    else:
+        # Non-finite residual: trust the backend's ``converged`` flag.
+        # Legacy half-Sommerfeld SOR doesn't surface a residual; the
+        # solver's own convergence check fires when ok=True.
+        if not bool(converged):
+            return GuardOutcome(
+                False, RejectionReason.SOLVER_NONFINITE,
+                f"{backend_name}: residual is non-finite and "
+                "converged=False")
+    return GuardOutcome(True, RejectionReason.NONE, "ok")
 
 
 def check_physical_guards(
