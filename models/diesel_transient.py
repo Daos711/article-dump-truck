@@ -1545,6 +1545,11 @@ def run_transient(F_max=None, debug=False,
                 clamp_fn=_clamp,
                 build_H_fn=_build_H_for_kernel,
                 p_warm_init=P_prev,
+                # Stage J fu-2 Step 9 diagnostic — only emit the
+                # damped-policy per-iteration dump while the runner
+                # is still inside the operator's debug window.
+                debug_dump=(use_ausas_dynamic
+                            and step < int(debug_first_steps)),
             )
 
             # Apply kernel result to runner state — preserves

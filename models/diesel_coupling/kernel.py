@@ -176,6 +176,14 @@ def advance_mechanical_step(
     ],
     # Legacy SOR warm-start hint threaded across steps by the runner.
     p_warm_init: Optional[np.ndarray] = None,
+    # Stage J fu-2 Step 9 diagnostic — when True the damped-policy
+    # body emits a per-iteration dump after each Picard accept
+    # showing anchor / candidate / Verlet-full / blend / Δε /
+    # mech_relax / fixed_point_converged. Gated to AVOID per-step
+    # cost during normal runs; runner sets this only when the
+    # caller's ``debug_first_steps`` window includes the current
+    # step. NOT used by the legacy_verlet path.
+    debug_dump: bool = False,
 ) -> MechanicalStepResult:
     """One mechanical step.
 
@@ -227,6 +235,7 @@ def advance_mechanical_step(
             clamp_fn=clamp_fn,
             build_H_fn=build_H_fn,
             p_warm_init=p_warm_init,
+            debug_dump=debug_dump,
         )
     raise ValueError(
         f"advance_mechanical_step: unknown policy {policy.name!r}; "
@@ -488,6 +497,7 @@ def _run_damped_implicit_film(
     clamp_fn,
     build_H_fn,
     p_warm_init: Optional[np.ndarray],
+    debug_dump: bool = False,
 ) -> MechanicalStepResult:
     """Damped implicit film coupling — Stage J fu-2 Step 6 skeleton.
 
@@ -612,6 +622,27 @@ def _run_damped_implicit_film(
             max_delta_eps_inner=policy.max_delta_eps_inner,
             max_delta_eps_step=policy.max_delta_eps_step,
         )
+
+        if debug_dump:
+            _dx_inner = float(np.hypot(
+                (ex_cand - ex_anchor) / context.c,
+                (ey_cand - ey_anchor) / context.c))
+            _dx_step = float(np.hypot(
+                (ex_cand - ex_n) / context.c,
+                (ey_cand - ey_n) / context.c))
+            _eps_mag = float(np.hypot(
+                ex_cand / context.c, ey_cand / context.c))
+            print(
+                f"    [J9-dump k={k} ENTER] "
+                f"anchor=({ex_anchor/context.c:+.6f},"
+                f"{ey_anchor/context.c:+.6f}) "
+                f"cand=({ex_cand/context.c:+.6f},"
+                f"{ey_cand/context.c:+.6f}) "
+                f"|Δε_inner|={_dx_inner:.6f} "
+                f"|Δε_step|={_dx_step:.6f} |ε|={_eps_mag:.6f} "
+                f"relax={relax:.5f} "
+                f"mech_outcome={mech_outcome.reason.value}",
+                flush=True)
 
         if not mech_outcome.accept:
             # Mechanical reject — log skipped trial, shrink relax,
@@ -752,6 +783,15 @@ def _run_damped_implicit_film(
                     detail=reason_,
                 )
 
+            if debug_dump:
+                print(
+                    f"    [J9-dump k={k} REJECT] "
+                    f"solver={solver_outcome.reason.value} "
+                    f"phys={phys_outcome.reason.value} "
+                    f"converged={ok_} reason={reason_!r} "
+                    f"shrink relax {relax:.5f} → {relax*0.5:.5f}",
+                    flush=True)
+
             relax *= 0.5
             mech_relax_min_seen = min(mech_relax_min_seen, relax)
             if relax < float(policy.mech_relax_min):
@@ -827,6 +867,24 @@ def _run_damped_implicit_film(
             (next_ex - ex_anchor) / context.c,
             (next_ey - ey_anchor) / context.c,
         ))
+
+        if debug_dump:
+            print(
+                f"    [J9-dump k={k} ACCEPT] "
+                f"|F_hyd|=({Fx_hyd/1e3:+.4f},{Fy_hyd/1e3:+.4f})kN "
+                f"|F_ext|=({Fx_ext/1e3:+.4f},{Fy_ext/1e3:+.4f})kN "
+                f"a_new=({ax_new:+.4e},{ay_new:+.4e}) "
+                f"v_full=({vx_full:+.4e},{vy_full:+.4e}) "
+                f"ε_anchor=({ex_anchor/context.c:+.6f},"
+                f"{ey_anchor/context.c:+.6f}) "
+                f"ε_full=({ex_full/context.c:+.6f},"
+                f"{ey_full/context.c:+.6f}) "
+                f"ε_blend=({next_ex/context.c:+.6f},"
+                f"{next_ey/context.c:+.6f}) "
+                f"Δε_blend={delta_eps:.6f} eps_tol={eps_tol:.1e} "
+                f"converged={delta_eps <= eps_tol}",
+                flush=True)
+
         if delta_eps <= eps_tol:
             fixed_point_converged = True
             break
@@ -835,6 +893,17 @@ def _run_damped_implicit_film(
         vx_cand, vy_cand = next_vx, next_vy
 
     # ── End of Picard + line-search loop ──────────────────────
+    if debug_dump:
+        print(
+            f"    [J9-dump END] n_trials={n_trials} "
+            f"solve_ok={solve_ok} "
+            f"fixed_point_converged={fixed_point_converged} "
+            f"mech_relax_min_seen={mech_relax_min_seen:.5f} "
+            f"ε_anchor=({ex_anchor/context.c:+.6f},"
+            f"{ey_anchor/context.c:+.6f}) "
+            f"last_rejection="
+            f"{last_rejection.reason.value if last_rejection else 'none'}",
+            flush=True)
     # Anchor holds the last accepted state (or the step-start
     # state if no trial ever succeeded).
     ex_pred = ex_anchor
