@@ -289,25 +289,97 @@ def check_physical_guards(
     phi_deg: float,
     cfg: PhysicalGuardsConfig,
 ) -> GuardOutcome:
-    """Active in ``mode='hard'``; emits warning in ``'diagnostic'``;
-    silent in ``'off'``.
+    """Stage J fu-2 §3.2 / doc 1 §4.2 — pressure / force / sign /
+    cavitation HARD guards.
 
-    Composition (doc 1 §3.2 + §4.2):
-        * ``max(P_nd * p_scale) <= cfg.p_dim_max_pa``
-        * ``|F_hyd| / max(|F_ext|, cfg.f_ext_floor_n) <= cfg.f_ratio_max``
-        * NOT (``dot_norm > cfg.same_dir_runaway_dot_norm`` AND
-          ``F_ratio > cfg.same_dir_runaway_f_ratio``) — same-direction
-          runaway gate
-        * ``cav_frac <= cfg.cav_frac_runaway``  (theta-bearing only)
-        * ``theta`` in [floor, ceil]  (theta-bearing only)
+    Returns a verdict regardless of ``cfg.mode`` so the kernel can
+    populate ``TrialRecord.outcome_physical`` consistently. The
+    KERNEL decides what to do with the verdict:
 
-    Smoke profile additionally tightens ``p_dim_max_pa`` to 200 MPa
-    and ``f_ratio_max`` to 25.0; applies only on the early-cycle
-    window ``phi_deg < cfg.early_phi_deg``.
+    * ``mode == "hard"``       → reject the trial (break Picard loop).
+    * ``mode == "diagnostic"`` → emit a warning, accept the trial.
+    * ``mode == "off"``        → no checks, returned verdict is
+      always ``GuardOutcome(True, NONE, "off")``.
 
-    Step 2 — skeleton only. Step 8 implements the body.
+    Composition (priority order — first failing check wins):
+
+    1. Pressure-amplitude cap: ``max(P_nd · p_scale) <= cfg.p_dim_max_pa``
+       — caps GPa-runaway from squeeze-driven Verlet jumps. The
+       ``smoke`` profile additionally applies a 200 MPa cap on the
+       early-cycle window ``phi_deg < cfg.early_phi_deg``;
+       ``general`` profile uses 1 GPa.
+    2. Force-ratio cap: ``|F_hyd| / max(|F_ext|, F_FLOOR_N) <=
+       cfg.f_ratio_max``. Smoke: 25; general: 100.
+    3. Same-direction runaway: rejects when the hydrodynamic force
+       points ALONG the external load (positive cosine) AND its
+       magnitude is many times the external load. This is the
+       signature of a film blow-up that drives the journal further
+       into the wall instead of resisting.
+    4. Cavitation runaway: ``mean(theta < 1) <= cfg.cav_frac_runaway``
+       — catches global cavitation collapse (typically > 0.98).
     """
-    ...
+    if cfg.mode == "off":
+        return GuardOutcome(True, RejectionReason.NONE, "off")
+
+    # Pressure cap.
+    if P_nd is not None:
+        P_arr = np.asarray(P_nd)
+        if P_arr.size > 0:
+            p_dim_max = float(np.max(P_arr)) * float(p_scale)
+            cap = float(cfg.p_dim_max_pa)
+            in_smoke_window = (
+                cfg.profile == "smoke"
+                and float(phi_deg) < cfg.early_phi_deg
+            )
+            label = ("smoke-window" if in_smoke_window
+                     else cfg.profile)
+            if p_dim_max > cap:
+                return GuardOutcome(
+                    False,
+                    RejectionReason.PHYSICAL_PRESSURE_GPA,
+                    f"max(P_dim)={p_dim_max:.3e}Pa > cap="
+                    f"{cap:.3e}Pa ({label} profile, "
+                    f"phi={phi_deg:.1f}°)")
+
+    # Force-ratio + same-direction runaway.
+    F_hyd_mag = float(np.hypot(Fx_hyd, Fy_hyd))
+    F_ext_mag = float(np.hypot(Fx_ext, Fy_ext))
+    if (np.isfinite(F_hyd_mag) and np.isfinite(F_ext_mag)
+            and F_ext_mag > float(cfg.f_ext_floor_n)):
+        F_ratio = F_hyd_mag / F_ext_mag
+        if F_ratio > float(cfg.f_ratio_max):
+            return GuardOutcome(
+                False, RejectionReason.PHYSICAL_FORCE_RATIO,
+                f"|F_hyd|/|F_ext|={F_ratio:.2f} > cap="
+                f"{cfg.f_ratio_max:.2f} (|F_hyd|="
+                f"{F_hyd_mag/1e3:.2f}kN, |F_ext|="
+                f"{F_ext_mag/1e3:.2f}kN)")
+        if F_hyd_mag > 0.0:
+            dot_norm = ((float(Fx_hyd) * float(Fx_ext)
+                         + float(Fy_hyd) * float(Fy_ext))
+                        / (F_hyd_mag * F_ext_mag))
+            if (dot_norm > float(cfg.same_dir_runaway_dot_norm)
+                    and F_ratio
+                    > float(cfg.same_dir_runaway_f_ratio)):
+                return GuardOutcome(
+                    False, RejectionReason.PHYSICAL_SAME_DIR_RUNAWAY,
+                    f"dot_norm={dot_norm:+.3f} > "
+                    f"{cfg.same_dir_runaway_dot_norm:.2f} AND "
+                    f"F_ratio={F_ratio:.2f} > "
+                    f"{cfg.same_dir_runaway_f_ratio:.2f}")
+
+    # Cavitation runaway (theta-bearing backends only).
+    if theta is not None:
+        theta_arr = np.asarray(theta)
+        if theta_arr.size > 0:
+            cav_frac = float(np.mean(theta_arr < 1.0))
+            if cav_frac > float(cfg.cav_frac_runaway):
+                return GuardOutcome(
+                    False, RejectionReason.PHYSICAL_CAV_RUNAWAY,
+                    f"cav_frac={cav_frac:.3f} > cap="
+                    f"{cfg.cav_frac_runaway:.3f}")
+
+    return GuardOutcome(True, RejectionReason.NONE, "ok")
 
 
 def check_mechanical_candidate(

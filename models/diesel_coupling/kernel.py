@@ -35,6 +35,7 @@ from .guards import (
     GuardOutcome,
     PhysicalGuardsConfig,
     RejectionReason,
+    check_physical_guards,
     check_solver_validity,
 )
 from .policies import CouplingPolicy
@@ -215,6 +216,7 @@ def advance_mechanical_step(
             backend=backend,
             backend_state=backend_state,
             policy=policy,
+            guards_cfg=guards_cfg,
             ausas_tol=ausas_tol,
             ausas_max_inner=ausas_max_inner,
             extra_options=extra_options,
@@ -475,6 +477,7 @@ def _run_damped_implicit_film(
     backend: PressureBackend,
     backend_state: Optional[Any],
     policy: CouplingPolicy,
+    guards_cfg: PhysicalGuardsConfig,
     ausas_tol: float,
     ausas_max_inner: int,
     extra_options: Optional[dict],
@@ -607,10 +610,61 @@ def _run_damped_implicit_film(
             ausas_tol=ausas_tol,
             ausas_max_inner=ausas_max_inner,
         )
-        # Trial accepted only when BOTH the backend's own ``ok_``
-        # and the solver-validity gate agree. The gate is stricter
-        # in detecting budget exhaust + non-finite + range violations.
-        accepted_trial = bool(ok_ and solver_outcome.accept)
+
+        # Stage J fu-2 Step 8 — physical guards (doc 1 §3.2 / §4.2).
+        # Pressure-amplitude cap, F-ratio cap, same-direction
+        # runaway, cavitation runaway. Honour ``guards_cfg.mode``
+        # (the EFFECTIVE runtime mode — CLI ``--ausas-physical-guards``
+        # may override the policy's baseline default):
+        #   * "hard"        — verdict drives trial rejection
+        #   * "diagnostic"  — verdict logged on TrialRecord but does
+        #                     NOT reject (warning emitted via
+        #                     ``warnings.warn`` so it surfaces in
+        #                     the runner / pytest output)
+        #   * "off"         — guard returns accept always
+        # ``policy.physical_guards_mode`` is the documented baseline
+        # for that policy; ``guards_cfg.mode`` carries the
+        # per-run effective value.
+        # Run the check only when the solver-validity gate already
+        # accepted: a trial that the solver rejected has NaN
+        # forces, which would only generate noisy false-positive
+        # warnings without information value.
+        phys_outcome: GuardOutcome
+        guards_mode = guards_cfg.mode
+        if (policy.enable_physical_guards
+                and guards_mode != "off"
+                and solver_outcome.accept):
+            phys_outcome = check_physical_guards(
+                P_nd=result.P_nd,
+                p_scale=context.p_scale,
+                Fx_hyd=result.Fx_hyd, Fy_hyd=result.Fy_hyd,
+                Fx_ext=context.F_ext_x,
+                Fy_ext=context.F_ext_y,
+                theta=result.theta,
+                phi_deg=context.phi_deg,
+                cfg=guards_cfg,
+            )
+            if (not phys_outcome.accept
+                    and guards_mode == "diagnostic"):
+                # Diagnostic mode — surface but do NOT reject.
+                import warnings as _warnings
+                _warnings.warn(
+                    f"Stage-J physical guard (diagnostic mode): "
+                    f"{phys_outcome.reason.value} — "
+                    f"{phys_outcome.detail}",
+                    RuntimeWarning, stacklevel=2,
+                )
+        else:
+            phys_outcome = GuardOutcome(
+                accept=True, reason=RejectionReason.NONE)
+
+        # Trial acceptance: solver-validity ALWAYS hard-gates;
+        # physical guards hard-gate only when ``guards_cfg.mode ==
+        # "hard"`` (per-run effective mode, see comment above).
+        accepted_trial = bool(
+            ok_
+            and solver_outcome.accept
+            and (phys_outcome.accept or guards_mode != "hard"))
 
         trial_log.append(TrialRecord(
             inner=k,
@@ -619,8 +673,7 @@ def _run_damped_implicit_film(
             eps_y_cand=eps_y_old,
             pressure_result=result,
             outcome_solver=solver_outcome,
-            outcome_physical=GuardOutcome(
-                accept=True, reason=RejectionReason.NONE),
+            outcome_physical=phys_outcome,
             outcome_mechanical=GuardOutcome(
                 accept=True, reason=RejectionReason.NONE),
             accepted=accepted_trial,
@@ -633,15 +686,21 @@ def _run_damped_implicit_film(
             Fx_hyd = float("nan")
             Fy_hyd = float("nan")
             solve_ok = False
-            # Reason precedence: solver-validity gate's verdict wins
-            # when it rejected; backend's own ``reason`` is the
-            # fallback when the gate accepted but the backend
-            # ``converged=False``.
+            # Reason precedence: solver-validity > physical guards >
+            # backend's own ``reason``. The kernel surfaces the
+            # FIRST gate that rejected so the Stage 10 summary
+            # writer reports the right rejection bucket.
             if not solver_outcome.accept:
                 solve_reason = (
                     f"rejected_by_solver_validity:"
                     f"{solver_outcome.reason.value}"
                     f" ({solver_outcome.detail})")
+            elif (not phys_outcome.accept
+                    and guards_mode == "hard"):
+                solve_reason = (
+                    f"rejected_by_physical_guards:"
+                    f"{phys_outcome.reason.value}"
+                    f" ({phys_outcome.detail})")
             else:
                 solve_reason = reason_
             break
@@ -735,11 +794,23 @@ def _run_damped_implicit_film(
         rejection_reason = RejectionReason.NONE
         rejection_detail = ""
     else:
-        last_solver_outcome = (
-            trial_log[-1].outcome_solver if trial_log
-            else GuardOutcome(False, RejectionReason.SOLVER_RESIDUAL,
-                              ""))
-        rejection_reason = last_solver_outcome.reason
+        # Step 7+8 — pick the FIRST gate that rejected on the
+        # last trial. Solver-validity has priority; physical guards
+        # only count when ``mode == "hard"`` (diagnostic mode warns
+        # but doesn't reject, so the reason stays NONE on that
+        # axis). Falls back to SOLVER_RESIDUAL bucket if neither
+        # gate rejected (defensive).
+        if trial_log:
+            tr = trial_log[-1]
+            if not tr.outcome_solver.accept:
+                rejection_reason = tr.outcome_solver.reason
+            elif (not tr.outcome_physical.accept
+                    and guards_cfg.mode == "hard"):
+                rejection_reason = tr.outcome_physical.reason
+            else:
+                rejection_reason = RejectionReason.SOLVER_RESIDUAL
+        else:
+            rejection_reason = RejectionReason.SOLVER_RESIDUAL
         rejection_detail = solve_reason
 
     if (backend.stateful and solve_ok and not step_clamped
