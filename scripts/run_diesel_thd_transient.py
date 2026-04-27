@@ -508,6 +508,56 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             f"{ausas_opts.get('check_every', 'default')}")
     lines.append("")
 
+    # Stage J fu-2 Step 10 — coupling diagnostics (Gate 3). Only
+    # surfaced when the per-step coupling arrays are present in
+    # the results dict (always written by ``run_transient`` from
+    # Step 10 onward; absent on older saved runs).
+    _picard_shrinks_arr = results.get("stage_j_picard_shrinks")
+    _mech_relax_arr = results.get("stage_j_mech_relax_min_seen")
+    _fp_conv_arr = results.get("stage_j_fp_converged")
+    _n_trials_arr = results.get("stage_j_n_trials")
+    _rej_reason_arr = results.get("stage_j_rejection_reason")
+    if (_picard_shrinks_arr is not None
+            and _mech_relax_arr is not None
+            and _fp_conv_arr is not None):
+        lines.append("Stage J: coupling diagnostics")
+        ps_total = int(np.sum(_picard_shrinks_arr))
+        # ``nanmin`` over the per-step array — legacy_verlet rows
+        # are all NaN (mech_relax not meaningful there) so they
+        # don't drag the global down. If the entire run is on the
+        # legacy path the result is NaN; surface "n/a".
+        valid_relax = _mech_relax_arr[
+            np.isfinite(_mech_relax_arr)]
+        if valid_relax.size > 0:
+            mr_global = float(np.nanmin(_mech_relax_arr))
+            mr_str = f"{mr_global:.5f}"
+        else:
+            mr_str = "n/a (legacy_verlet path)"
+        if _fp_conv_arr.size > 0:
+            fp_frac = float(np.mean(_fp_conv_arr))
+        else:
+            fp_frac = 0.0
+        if _n_trials_arr is not None and _n_trials_arr.size > 0:
+            p50 = int(np.percentile(_n_trials_arr, 50))
+            p99 = int(np.percentile(_n_trials_arr, 99))
+        else:
+            p50 = p99 = 0
+        lines.append(f"  picard_shrinks_total       : {ps_total}")
+        lines.append(f"  mech_relax_min_seen_global : {mr_str}")
+        lines.append(
+            f"  fixed_point_converged_frac : {fp_frac:.3f}")
+        lines.append(
+            f"  n_trials_per_step (p50/p99): {p50} / {p99}")
+        if _rej_reason_arr is not None and _rej_reason_arr.size > 0:
+            from collections import Counter
+            counts = Counter(_rej_reason_arr.flatten().tolist())
+            lines.append("  rejection_reason breakdown :")
+            # Most-frequent first, with stable ordering by count.
+            for reason, n in sorted(
+                    counts.items(), key=lambda kv: -kv[1]):
+                lines.append(f"    {reason:32s}: {n}")
+        lines.append("")
+
     # Groove geometry block — only emitted when the run actually
     # uses grooves so half-Sommerfeld dimple regressions stay quiet.
     if tex_kind == "groove" and groove_preset_resolved:
@@ -1508,6 +1558,14 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         save_field_checkpoints=bool(args.save_field_checkpoints),
         debug_first_steps=int(getattr(args, "debug_first_steps", 0) or 0),
         seed=int(getattr(args, "seed", 0) or 0),
+        # Stage J fu-2 Step 10 — CLI surface.
+        guards_profile=str(getattr(args, "guards_profile", "general")
+                           or "general"),
+        coupling_override=str(getattr(args, "coupling_policy", "auto")
+                              or "auto"),
+        max_mech_inner=getattr(args, "max_mech_inner", None),
+        mech_relax_initial=getattr(args, "mech_relax_initial", None),
+        mech_relax_min=getattr(args, "mech_relax_min", None),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -1678,7 +1736,52 @@ def main(argv=None):
                          "residual, n_inner, converged) for each Verlet "
                          "trial substep AND the accepted commit, for "
                          "the first N steps. Default 0 (off). "
-                         "Recommended N=5 for smoke debugging.")
+                         "Recommended N=5 for smoke debugging. The "
+                         "Stage J fu-2 Step 9 dump (J9-dump ENTER / "
+                         "ACCEPT / PICARD-SHRINK) is gated on the "
+                         "same flag — when 0, no per-iteration "
+                         "trace is emitted (production runs are "
+                         "silent on coupling internals).")
+    # Stage J fu-2 Step 10 — coupling policy CLI surface.
+    pa.add_argument("--guards-profile", dest="guards_profile",
+                    choices=("general", "smoke"),
+                    default="general",
+                    help="Stage J fu-2 — physical-guard threshold "
+                         "profile. ``smoke`` tightens the pressure "
+                         "cap to 200 MPa and force-ratio cap to 25 "
+                         "(early-cycle window only); ``general`` "
+                         "uses the doc 1 §3.4 production caps "
+                         "(1 GPa, 100). Default: general.")
+    pa.add_argument("--coupling-policy", dest="coupling_policy",
+                    choices=("auto", "legacy_verlet",
+                             "damped_implicit_film"),
+                    default="auto",
+                    help="Stage J fu-2 — force a specific coupling "
+                         "policy regardless of backend capability. "
+                         "``auto`` (default) selects "
+                         "POLICY_LEGACY_HS for stateless backends "
+                         "(half-Sommerfeld) and POLICY_AUSAS_DYNAMIC "
+                         "for stateful (Ausas, future PV-on-Ausas). "
+                         "Manual override is for diagnostic / "
+                         "regression runs only.")
+    pa.add_argument("--max-mech-inner", dest="max_mech_inner",
+                    type=int, default=None,
+                    help="Stage J fu-2 — override the policy's "
+                         "``max_mech_inner`` (Picard inner-iteration "
+                         "budget). Default: policy field "
+                         "(LEGACY_HS=3, AUSAS_DYNAMIC=24).")
+    pa.add_argument("--mech-relax-initial", dest="mech_relax_initial",
+                    type=float, default=None,
+                    help="Stage J fu-2 — override the policy's "
+                         "``mech_relax_initial`` (starting Picard "
+                         "blend factor). Default: policy field "
+                         "(LEGACY_HS=1.0, AUSAS_DYNAMIC=0.25).")
+    pa.add_argument("--mech-relax-min", dest="mech_relax_min",
+                    type=float, default=None,
+                    help="Stage J fu-2 — override the policy's "
+                         "``mech_relax_min`` (line-search / Picard "
+                         "shrink floor). Default: policy field "
+                         "(LEGACY_HS=1.0, AUSAS_DYNAMIC=0.03125).")
     pa.add_argument("--configs", default=None,
                     help="comma-separated keys: "
                          + ", ".join(sorted(CONFIG_KEYS)))

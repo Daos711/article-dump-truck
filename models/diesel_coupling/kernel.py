@@ -158,6 +158,13 @@ class MechanicalStepResult:
     theta_max_committed: float = 1.0
     dt_ausas_committed: float = 0.0
 
+    # Stage J fu-2 Step 10 — Picard contractivity diagnostics for
+    # Gate 3 summary block + npz schema. Both default to inert
+    # values so the legacy_verlet path (which has neither concept)
+    # writes consistent per-step arrays.
+    fixed_point_converged_flag: bool = False
+    picard_shrinks_count: int = 0
+
 
 # ─── Public kernel entry point ─────────────────────────────────────
 
@@ -497,6 +504,12 @@ def _run_legacy_verlet(
         theta_min_committed=theta_min_for_diag,
         theta_max_committed=theta_max_for_diag,
         dt_ausas_committed=dt_ausas_for_diag,
+        # Legacy_verlet has no Picard fixed-point concept and no
+        # contractivity shrink — both fields stay at their inert
+        # defaults so the per-step npz arrays remain on a single
+        # schema for both backends.
+        fixed_point_converged_flag=False,
+        picard_shrinks_count=0,
     )
 
 
@@ -614,6 +627,9 @@ def _run_damped_implicit_film(
     prev_step_vec: Optional[np.ndarray] = None
     prev_step_norm: Optional[float] = None
     best_step_norm: float = float("inf")
+    # Stage J fu-2 Step 10 — count Picard-shrink events in this
+    # mechanical step for the Gate 3 summary aggregator.
+    picard_shrinks_count: int = 0
 
     # Anchor = last accepted candidate (initial = step start).
     ex_anchor, ey_anchor = float(ex_n), float(ey_n)
@@ -999,6 +1015,7 @@ def _run_damped_implicit_film(
         # (which fires on guard reject and retreats the candidate
         # toward anchor on a rejected GPU trial).
         if too_large and relax > float(policy.mech_relax_min):
+            picard_shrinks_count += 1
             old_relax = relax
             relax = max(float(policy.mech_relax_min), 0.5 * relax)
             mech_relax_min_seen = min(mech_relax_min_seen, relax)
@@ -1213,4 +1230,6 @@ def _run_damped_implicit_film(
         theta_min_committed=theta_min_for_diag,
         theta_max_committed=theta_max_for_diag,
         dt_ausas_committed=dt_ausas_for_diag,
+        fixed_point_converged_flag=bool(fixed_point_converged),
+        picard_shrinks_count=int(picard_shrinks_count),
     )

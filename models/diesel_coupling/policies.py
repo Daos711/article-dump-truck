@@ -124,7 +124,73 @@ def resolve_policy_overrides(
     ``explicit_name`` is a documentation marker only — it does NOT
     silently swap the entire policy; callers must pass the explicit
     constant they want and then layer the overrides on top.
-
-    Step 2 — skeleton only. Step 10 wires this to the CLI.
     """
-    ...
+    overrides: dict = {}
+    if max_mech_inner is not None:
+        overrides["max_mech_inner"] = int(max_mech_inner)
+    if mech_relax_initial is not None:
+        overrides["mech_relax_initial"] = float(mech_relax_initial)
+    if mech_relax_min is not None:
+        overrides["mech_relax_min"] = float(mech_relax_min)
+    if physical_guards_mode is not None:
+        overrides["physical_guards_mode"] = physical_guards_mode
+    if max_delta_eps_inner is not None:
+        overrides["max_delta_eps_inner"] = float(max_delta_eps_inner)
+    if max_delta_eps_step is not None:
+        overrides["max_delta_eps_step"] = float(max_delta_eps_step)
+    if not overrides:
+        return base
+    return replace(base, **overrides)
+
+
+def resolve_policy(
+    backend,
+    *,
+    coupling_override: Literal[
+        "auto", "legacy_verlet", "damped_implicit_film"] = "auto",
+    max_mech_inner: Optional[int] = None,
+    mech_relax_initial: Optional[float] = None,
+    mech_relax_min: Optional[float] = None,
+    physical_guards_mode: Optional[
+        Literal["off", "diagnostic", "hard"]] = None,
+    max_delta_eps_inner: Optional[float] = None,
+    max_delta_eps_step: Optional[float] = None,
+) -> CouplingPolicy:
+    """One-shot policy resolution for the runner.
+
+    1. Pick the BASE policy:
+       * ``coupling_override == "auto"`` → ``select_policy(backend)``
+         (capability-based default — recommended).
+       * ``coupling_override == "legacy_verlet"`` → POLICY_LEGACY_HS
+         regardless of backend (diagnostic / regression).
+       * ``coupling_override == "damped_implicit_film"`` →
+         POLICY_AUSAS_DYNAMIC regardless of backend (forces the damped
+         policy on a stateless backend — expected to mis-converge,
+         that's the whole point of the override).
+    2. Layer non-None CLI overrides on top via
+       :func:`resolve_policy_overrides`.
+
+    All overrides are documented in ``scripts/run_diesel_thd_transient.py``
+    under the ``--max-mech-inner`` / ``--mech-relax-initial`` /
+    ``--mech-relax-min`` / ``--guards-profile`` flags.
+    """
+    if coupling_override == "auto":
+        base = select_policy(backend)
+    elif coupling_override == "legacy_verlet":
+        base = POLICY_LEGACY_HS
+    elif coupling_override == "damped_implicit_film":
+        base = POLICY_AUSAS_DYNAMIC
+    else:
+        raise ValueError(
+            f"resolve_policy: unknown coupling_override "
+            f"{coupling_override!r}; expected 'auto', "
+            f"'legacy_verlet', or 'damped_implicit_film'.")
+    return resolve_policy_overrides(
+        base,
+        max_mech_inner=max_mech_inner,
+        mech_relax_initial=mech_relax_initial,
+        mech_relax_min=mech_relax_min,
+        physical_guards_mode=physical_guards_mode,
+        max_delta_eps_inner=max_delta_eps_inner,
+        max_delta_eps_step=max_delta_eps_step,
+    )
