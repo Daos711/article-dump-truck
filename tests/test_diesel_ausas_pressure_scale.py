@@ -49,9 +49,12 @@ from config.oil_properties import MINERAL_OIL  # noqa: E402
 
 
 _OMEGA_DIESEL = 2.0 * np.pi * 1900.0 / 60.0
-_TOL = 1e-3
-_MAX_INNER = 500
 _ETA_DIESEL = float(MINERAL_OIL["eta_diesel"])
+# The solver's own defaults: tol=1e-6, max_inner=5000 (Jacobi).
+# We loosen tol slightly for a reliable smoke gate — the magnitude
+# / sign comparisons survive under-iteration noise.
+_TOL = 1e-5
+_MAX_INNER = 5000
 
 
 def test_p_nd_magnitude_within_one_order_of_legacy():
@@ -68,10 +71,14 @@ def test_p_nd_magnitude_within_one_order_of_legacy():
     # Half-Sommerfeld baseline.
     # Half-Sommerfeld baseline through the low-level GPU call —
     # same path the runner takes for ``cavitation='half_sommerfeld'``.
-    P_legacy_nd, _, _, _ = solve_reynolds(
+    # ``solve_reynolds`` may return a 3- or 4-tuple depending on the
+    # GPU build (the modern ``return_converged`` shape adds a flag
+    # at the end). Unpack the leading ``P`` regardless.
+    _solver_out = solve_reynolds(
         H, d_phi, d_Z, dparams.R, dparams.L,
         closure="laminar", cavitation="half_sommerfeld",
         tol=1e-7, max_iter=50000)
+    P_legacy_nd = np.asarray(_solver_out[0])
 
     # Ausas one-step with H_curr = H_prev (no squeeze).
     state = DieselAusasState.from_initial_gap(H)
@@ -112,10 +119,14 @@ def test_force_sign_agrees_with_legacy():
 
     # Half-Sommerfeld baseline through the low-level GPU call —
     # same path the runner takes for ``cavitation='half_sommerfeld'``.
-    P_legacy_nd, _, _, _ = solve_reynolds(
+    # ``solve_reynolds`` may return a 3- or 4-tuple depending on the
+    # GPU build (the modern ``return_converged`` shape adds a flag
+    # at the end). Unpack the leading ``P`` regardless.
+    _solver_out = solve_reynolds(
         H, d_phi, d_Z, dparams.R, dparams.L,
         closure="laminar", cavitation="half_sommerfeld",
         tol=1e-7, max_iter=50000)
+    P_legacy_nd = np.asarray(_solver_out[0])
     Fx_l, Fy_l = compute_hydro_forces(
         P_legacy_nd, p_scale, Phi, phi_1D, Z_1D, dparams.R, dparams.L)
 

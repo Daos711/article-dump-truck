@@ -1,16 +1,26 @@
-"""Stage J Bug 4 follow-up — force-direction sanity at runner level.
+"""Stage J Bug 4 follow-up — force-direction sanity at the adapter
+level (TZ §3.4).
 
-After Stage J adds the ``force_balance_projection`` diagnostic to
-the result dict, this test pins the contract: the median of the
-projection over the first ~120° of crank angle must be **positive**
-on a smooth-bearing low-load smoke run. A consistently negative or
-near-zero projection is the signature of a sign / coordinate
-regression that pushes the journal into the wall instead of
-resisting the external load.
+A direct test that does NOT go through the full ``run_transient``
+mechanics. Build a bearing at a known modest eccentricity, take ONE
+Ausas one-step (``H_curr = H_prev`` so the squeeze term is zero
+and the result is the steady JFO pressure for that gap), integrate
+the hydrodynamic force, and assert that:
 
-The full smoke runs ``run_transient`` with ``cavitation=
-ausas_dynamic`` and a tiny grid; it skips cleanly when the GPU
-package is absent.
+* ``|F_hyd|`` is NOT near zero (the film actually carries load);
+* ``cos(F_hyd, -F_ext_unit) > 0`` — the hydrodynamic force points
+  along the resisting direction.
+
+The classical journal-bearing argument: when the journal is
+displaced **toward** the loaded side (``eps`` aligned with
+``+F_ext``), the convergent half builds high pressure on the
+loaded side and the integrated force points back **opposite** to
+the displacement, i.e. opposite to ``F_ext`` (positive cosine
+against ``-F_ext_unit``). A negative or near-zero cosine is the
+signature of a sign / non-dim convention regression in the Ausas
+coupling.
+
+Skipped when ``cupy`` / ``GPU_reynolds`` are not installed.
 """
 from __future__ import annotations
 
@@ -23,54 +33,98 @@ solver_dynamic_gpu = pytest.importorskip(
     "reynolds_solver.cavitation.ausas.solver_dynamic_gpu")
 
 
+from models.bearing_model import setup_grid  # noqa: E402
 from models.diesel_ausas_adapter import (  # noqa: E402
+    DieselAusasState,
+    ausas_one_step_with_state,
+    ausas_result_is_physical,
     set_ausas_backend_for_tests,
 )
 from models.diesel_transient import (  # noqa: E402
-    CONFIGS, EnvelopeAbortConfig, run_transient,
+    build_H_2d, compute_hydro_forces, load_diesel,
 )
-from models.thermal_coupling import ThermalConfig  # noqa: E402
+from config import diesel_params as dparams  # noqa: E402
+from config.oil_properties import MINERAL_OIL  # noqa: E402
 
 
-def test_force_balance_projection_positive_on_smooth_smoke():
-    """Smooth + mineral, F = 0.3·F_max, low fidelity. The
-    runner's per-step ``force_balance_projection`` array is
-    ``F_hyd · (-F_ext / |F_ext|)`` — physically the projection of
-    the hydrodynamic force onto the resisting direction. Over the
-    first 120° (compression stroke pre-firing) on a healthy
-    backend the median MUST be positive: the film resists the
-    external load."""
-    # Make sure no leftover stub interferes with the real backend.
+_OMEGA_DIESEL = 2.0 * np.pi * 1900.0 / 60.0
+_ETA_DIESEL = float(MINERAL_OIL["eta_diesel"])
+_TOL = 1e-5
+# The solver's own default is 5000 (Jacobi scheme is slow). A smoke
+# test with a realistic eccentricity easily eats >2000 sweeps; use
+# the solver default so the gate is on physics, not iteration budget.
+_MAX_INNER = 5000
+
+
+def test_ausas_force_opposes_external_load_at_modest_eps():
+    """A modest eccentricity aligned with the external load should
+    produce a hydrodynamic force pointing in the **opposite**
+    direction (positive cosine against ``-F_ext_unit``)."""
     set_ausas_backend_for_tests(None)
-    thermal = ThermalConfig(
-        mode="off", T_in_C=105.0, gamma_mix=0.7,
-        cp_J_kgK=2000.0, mdot_floor_kg_s=1e-4, tau_th_s=0.5,
+    N_phi, N_z = 64, 16
+    phi_1D, Z_1D, Phi, Z, d_phi, d_Z = setup_grid(N_phi, N_z)
+
+    # Pick a crank angle where the diesel load is firmly downward.
+    # ``load_diesel`` returns (Fx, Fy); we then set the eccentricity
+    # along the SAME direction as F_ext so the bearing is loaded
+    # along its convergent half. This is the setup used in every
+    # textbook journal-bearing sanity check.
+    phi_test = 360.0   # firing TDC ish — load is large here
+    Fx_ext_arr, Fy_ext_arr = load_diesel(phi_test, F_max=255_000.0)
+    Fx_ext = float(np.asarray(Fx_ext_arr).item())
+    Fy_ext = float(np.asarray(Fy_ext_arr).item())
+    F_ext_mag = float(np.hypot(Fx_ext, Fy_ext))
+    assert F_ext_mag > 0.0
+    # Unit external-load direction.
+    ux = Fx_ext / F_ext_mag
+    uy = Fy_ext / F_ext_mag
+    # Modest eccentricity ALIGNED with the load.
+    eps = 0.30
+    eps_x = eps * ux
+    eps_y = eps * uy
+
+    H = build_H_2d(eps_x, eps_y, Phi, Z, dparams)
+    state = DieselAusasState.from_initial_gap(H)
+
+    # ``H_curr = H_prev`` zeroes the squeeze term — the result is
+    # the steady JFO pressure for this gap.
+    out = ausas_one_step_with_state(
+        state, H_curr=H,
+        dt_s=np.deg2rad(4.0) / _OMEGA_DIESEL,
+        omega_shaft=_OMEGA_DIESEL,
+        d_phi=d_phi, d_Z=d_Z,
+        R=dparams.R, L=dparams.L,
+        extra_options={"tol": _TOL, "max_inner": _MAX_INNER,
+                        "alpha": 1.0},
+        commit=True,
     )
-    res = run_transient(
-        F_max=0.3 * 850_000.0,
-        configs=[CONFIGS[0]],   # smooth + mineral
-        thermal=thermal,
-        cavitation="ausas_dynamic",
-        texture_kind="none",
-        n_grid=32,
-        n_cycles=1,
-        d_phi_base_deg=4.0,
-        d_phi_peak_deg=1.0,
-        envelope_abort=EnvelopeAbortConfig.disabled(),
-        ausas_options={"tol": 1e-3, "max_inner": 500, "alpha": 1.0},
-    )
-    assert "force_balance_projection" in res
-    proj = np.asarray(res["force_balance_projection"][0])
-    phi = np.asarray(res["phi_crank_deg"])
-    valid = np.asarray(res["valid_dynamic"][0], dtype=bool)
-    early = (phi < 120.0) & valid & np.isfinite(proj)
-    finite_proj = proj[early]
-    assert finite_proj.size > 5, (
-        f"Only {finite_proj.size} early-phi valid steps survive — "
-        "the run aborted before enough samples accumulated.")
-    median = float(np.median(finite_proj))
-    assert median > 0.0, (
-        f"Force-balance projection median over first 120° is "
-        f"{median:.3e} (≤ 0). The hydrodynamic force is not "
-        "resisting the external load — likely a sign / non-dim "
-        "regression in the Ausas pressure coupling.")
+    assert out.converged, (
+        f"Ausas did not converge in {_MAX_INNER} inner iters at "
+        f"eps={eps}; residual={out.residual}, n_inner={out.n_inner}")
+    assert ausas_result_is_physical(
+        out, tol=_TOL, max_inner=_MAX_INNER), (
+        f"physical-contract failed: residual={out.residual}, "
+        f"n_inner={out.n_inner}, theta=[{out.theta_min}, "
+        f"{out.theta_max}]")
+
+    p_scale = (6.0 * _ETA_DIESEL * _OMEGA_DIESEL
+               * (dparams.R / dparams.c) ** 2)
+    Fx_hyd, Fy_hyd = compute_hydro_forces(
+        np.asarray(out.P_nd), p_scale, Phi,
+        phi_1D, Z_1D, dparams.R, dparams.L)
+    F_hyd_mag = float(np.hypot(Fx_hyd, Fy_hyd))
+    assert F_hyd_mag > 0.05 * F_ext_mag, (
+        f"|F_hyd| = {F_hyd_mag:.3e} N is < 5% of |F_ext| = "
+        f"{F_ext_mag:.3e} N — the film is essentially not "
+        "carrying load. Likely a non-dim convention regression "
+        "or a near-zero pressure under-convergence.")
+
+    # cos(F_hyd, -F_ext_unit) — the projection of the hydrodynamic
+    # force onto the resisting direction.
+    cos_resist = (-(float(Fx_hyd) * ux + float(Fy_hyd) * uy)
+                   / F_hyd_mag)
+    assert cos_resist > 0.0, (
+        f"F_hyd points along F_ext (cos against -F_ext_unit = "
+        f"{cos_resist:.3g}); the film is NOT resisting the load. "
+        "Likely a sign / coordinate-convention regression in the "
+        "Ausas P_nd coupling.")
