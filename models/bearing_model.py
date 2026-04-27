@@ -7,6 +7,12 @@ import numpy as np
 from reynolds_solver import solve_reynolds
 from reynolds_solver.utils import create_H_with_ellipsoidal_depressions
 
+# numpy 2.x removed ``np.trapz`` in favour of ``np.trapezoid``; older
+# numpy releases only have ``np.trapz``. Use whichever is available so
+# the module is forward- and backward-compatible without spamming the
+# DeprecationWarning fired by ``np.trapz`` on numpy 1.x.
+_trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+
 DEFAULT_CLOSURE = "laminar"
 DEFAULT_CAVITATION = "half_sommerfeld"
 
@@ -234,10 +240,10 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
 
     # Несущая способность: интегрирование давления
     # Меши (N_Z, N_phi): axis=0 — Z, axis=1 — φ
-    Fx = -np.trapz(np.trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
-    Fy = -np.trapz(np.trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
-                   Z_1D, axis=0) * R * L / 2
+    Fx = -_trapz(_trapz(P_dim * np.cos(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
+    Fy = -_trapz(_trapz(P_dim * np.sin(Phi_mesh), phi_1D, axis=1),
+                 Z_1D, axis=0) * R * L / 2
     F = np.sqrt(Fx**2 + Fy**2)
 
     # Сила трения на поверхности вала
@@ -247,19 +253,79 @@ def solve_and_compute(H, d_phi, d_Z, R, L, eta, n, c,
     tau_pressure = h_dim / 2.0 * dP_dphi / R
     tau = tau_couette + tau_pressure
 
-    F_friction = np.trapz(np.trapz(np.abs(tau), phi_1D, axis=1),
-                          Z_1D, axis=0) * R * L / 2
+    F_friction = _trapz(_trapz(np.abs(tau), phi_1D, axis=1),
+                        Z_1D, axis=0) * R * L / 2
 
     # Коэффициент трения
     mu_val = F_friction / max(F, 1.0) if F > 1.0 else 0.0
 
-    # Расход смазки (утечка с торцов Z=-1 и Z=1)
-    dP_dZ = np.gradient(P_dim, Z_1D[1] - Z_1D[0], axis=0)
-    q_z0 = h_dim[0, :] ** 3 / (12.0 * eta) * np.abs(dP_dZ[0, :]) * R
-    q_z1 = h_dim[-1, :] ** 3 / (12.0 * eta) * np.abs(dP_dZ[-1, :]) * R
-    Q = (np.trapz(q_z0, phi_1D) + np.trapz(q_z1, phi_1D))
-
     h_min = np.min(h_dim)
     p_max = np.max(P_dim)
 
+    Q = compute_axial_leakage_m3_s(
+        P_dim=P_dim, h_dim=h_dim,
+        phi_1D=phi_1D, Z_1D=Z_1D,
+        eta=eta, R=R, L=L,
+    )
+
     return P, F, mu_val, Q, h_min, p_max, F_friction, n_outer, theta, cav_frac
+
+
+def compute_axial_leakage_m3_s(
+    P_dim: np.ndarray,
+    h_dim: np.ndarray,
+    phi_1D: np.ndarray,
+    Z_1D: np.ndarray,
+    eta: float,
+    R: float,
+    L: float,
+) -> float:
+    """Axial side leakage (m^3/s) at z = ±L/2.
+
+    Uses the **physical** axial coordinate ``z = (L/2) * Z`` so
+
+        ∂p/∂z = (2 / L) * ∂p/∂Z_nondim
+
+    For each end:
+
+        q_z(φ) = h^3 / (12 η) * |∂p/∂z|
+
+    and the total leakage is
+
+        Q = R * (∫ q_z(z=-L/2) dφ  +  ∫ q_z(z=+L/2) dφ).
+
+    Historically this helper was inlined and missed the 2/L Jacobian,
+    which under-counted Q by a factor of 2/L (≈ 25 for an 80 mm
+    BelAZ bearing, ≈ 36 for a 55 mm pump shoe). That bug is what
+    pushed the THD-0 fixed-point iteration to 220–290 °C; see
+    Stage THD-0B notes.
+
+    Notes
+    -----
+    * ``Z_1D`` is the dimensionless axial coordinate in [-1, 1].
+      Length element along z is dz = (L/2) dZ; the integral over Z
+      is converted using that Jacobian implicitly through dP_dz.
+    * ``P_dim`` and ``h_dim`` are dimensional (Pa, m).
+    * The integrand is taken in absolute value (the leakage flows
+      outward at both ends regardless of pressure-gradient sign).
+    """
+    if Z_1D.size < 2:
+        return 0.0
+    dZ = float(Z_1D[1] - Z_1D[0])
+    if not np.isfinite(dZ) or dZ <= 0.0:
+        return 0.0
+
+    dP_dZ_nd = np.gradient(P_dim, dZ, axis=0)
+
+    # Z_1D is dimensionless [-1, 1]; physical z = (L / 2) * Z, so
+    # dp/dz = (2 / L) * dp/dZ.  Without this Jacobian Q is silently
+    # under-counted by 2/L.
+    dP_dz = (2.0 / float(L)) * dP_dZ_nd
+
+    q_z_lo = h_dim[0, :] ** 3 / (12.0 * float(eta)) * np.abs(dP_dz[0, :])
+    q_z_hi = h_dim[-1, :] ** 3 / (12.0 * float(eta)) * np.abs(dP_dz[-1, :])
+
+    Q = float(R) * (
+        _trapz(q_z_lo, phi_1D) + _trapz(q_z_hi, phi_1D)
+    )
+    return float(Q)
