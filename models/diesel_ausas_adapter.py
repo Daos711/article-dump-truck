@@ -171,10 +171,24 @@ def set_ausas_backend_for_tests(
     backend so contract tests can verify the adapter without a GPU.
 
     Pass ``None`` to clear the override and return to lazy
-    auto-discovery."""
+    auto-discovery — the next call to :func:`_resolve_ausas_backend`
+    will re-probe for the real GPU backend.
+
+    Stage J integration regression follow-up — the previous
+    implementation set ``_AUSAS_BACKEND_PROBED = True`` even when
+    ``fn is None``, which permanently locked the resolver onto
+    ``None``. Any contract test that installed a stub and then
+    cleaned up with ``set_ausas_backend_for_tests(None)`` left the
+    real-backend integration tests unable to ever discover the GPU
+    package. Clearing the cache is the only correct semantics here.
+    """
     global _AUSAS_ONE_STEP_BACKEND, _AUSAS_BACKEND_PROBED
-    _AUSAS_ONE_STEP_BACKEND = fn
-    _AUSAS_BACKEND_PROBED = True
+    if fn is None:
+        _AUSAS_ONE_STEP_BACKEND = None
+        _AUSAS_BACKEND_PROBED = False
+    else:
+        _AUSAS_ONE_STEP_BACKEND = fn
+        _AUSAS_BACKEND_PROBED = True
 
 
 # ─── Commit-once one-step wrapper ──────────────────────────────────

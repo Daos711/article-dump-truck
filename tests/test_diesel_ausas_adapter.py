@@ -210,3 +210,32 @@ def test_half_sommerfeld_path_does_not_require_ausas_state():
     assert sig.parameters["groove_preset"].default is None
     assert sig.parameters["fidelity"].default is None
     assert sig.parameters["ausas_options"].default is None
+
+
+def test_set_backend_none_clears_cache_for_re_probe():
+    """``set_ausas_backend_for_tests(None)`` must clear the resolver
+    cache so the next call re-probes for the real GPU backend.
+
+    Stage J integration regression follow-up — the previous test
+    hook set ``_AUSAS_BACKEND_PROBED = True`` even when ``fn is
+    None``, which permanently locked the resolver onto ``None``.
+    Contract tests that installed a stub and then cleaned up with
+    ``set_ausas_backend_for_tests(None)`` left the real-backend
+    integration tests unable to ever discover the GPU package.
+    """
+    from models import diesel_ausas_adapter as _m
+    backend = _make_backend()
+    set_ausas_backend_for_tests(backend)
+    assert _m._AUSAS_BACKEND_PROBED is True
+    assert _m._AUSAS_ONE_STEP_BACKEND is backend
+    # Clearing must reset BOTH cache slots so the resolver re-probes.
+    set_ausas_backend_for_tests(None)
+    assert _m._AUSAS_BACKEND_PROBED is False, (
+        "set_ausas_backend_for_tests(None) must clear the cache, "
+        "not lock _AUSAS_ONE_STEP_BACKEND as None.")
+    assert _m._AUSAS_ONE_STEP_BACKEND is None
+    # And re-installing a different stub afterwards still works.
+    backend2 = _make_backend()
+    set_ausas_backend_for_tests(backend2)
+    assert _m._AUSAS_ONE_STEP_BACKEND is backend2
+    set_ausas_backend_for_tests(None)
