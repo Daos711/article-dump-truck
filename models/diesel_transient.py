@@ -1128,6 +1128,7 @@ def run_transient(F_max=None, debug=False,
                   ausas_options: Optional[Dict[str, Any]] = None,
                   save_field_checkpoints: bool = False,
                   debug_first_steps: int = 0,
+                  debug_from_step: int = 0,
                   seed: int = 0,
                   # Stage J fu-2 Step 10 — coupling policy CLI surface.
                   guards_profile: str = "general",
@@ -1601,7 +1602,9 @@ def run_transient(F_max=None, debug=False,
                 # damped-policy per-iteration dump while the runner
                 # is still inside the operator's debug window.
                 debug_dump=(use_ausas_dynamic
-                            and step < int(debug_first_steps)),
+                            and step >= int(debug_from_step)
+                            and step < int(debug_from_step)
+                            + int(debug_first_steps)),
             )
 
             # Apply kernel result to runner state — preserves
@@ -1659,7 +1662,9 @@ def run_transient(F_max=None, debug=False,
                 # ``--debug-first-steps N`` — stream per-trial
                 # diagnostic lines from the kernel's trial_log, plus
                 # one ACCEPTED line summarising the committed step.
-                if step < int(debug_first_steps):
+                if (step >= int(debug_from_step)
+                        and step < int(debug_from_step)
+                        + int(debug_first_steps)):
                     for k_idx, tr in enumerate(_ms.trial_log):
                         _print_ausas_debug_step(
                             f"step={step:03d} TRIAL k={k_idx}",

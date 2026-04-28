@@ -1579,6 +1579,7 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         ausas_options=(ausas_options if ausas_options else None),
         save_field_checkpoints=bool(args.save_field_checkpoints),
         debug_first_steps=int(getattr(args, "debug_first_steps", 0) or 0),
+        debug_from_step=int(getattr(args, "debug_from_step", 0) or 0),
         seed=int(getattr(args, "seed", 0) or 0),
         # Stage J fu-2 Step 10 — CLI surface.
         guards_profile=str(getattr(args, "guards_profile", "general")
@@ -1764,6 +1765,13 @@ def main(argv=None):
                          "same flag — when 0, no per-iteration "
                          "trace is emitted (production runs are "
                          "silent on coupling internals).")
+    pa.add_argument("--debug-from-step", dest="debug_from_step",
+                    type=int, default=0,
+                    help="Stage J followup debug window offset: start "
+                         "--debug-first-steps output from this 0-based "
+                         "mechanical step instead of step 0. Example: "
+                         "--debug-from-step 195 --debug-first-steps 8 "
+                         "dumps steps 195..202.")
     # Stage J fu-2 Step 10 — coupling policy CLI surface.
     pa.add_argument("--guards-profile", dest="guards_profile",
                     choices=("general", "smoke"),
