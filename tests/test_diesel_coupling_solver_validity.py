@@ -198,12 +198,14 @@ def test_damped_kernel_breaks_on_n_inner_at_max():
     state = DieselAusasState.from_initial_gap(
         np.ones((8, 16), dtype=float))
     backend = AusasDynamicBackend(ausas_options=None)
-    P_const = 0.1 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
-
     def fake(**kwargs):
         # n_inner intentionally HITS max_inner=5000 so
-        # check_solver_validity flags SOLVER_BUDGET.
+        # check_solver_validity flags SOLVER_BUDGET. Returns
+        # padded ``(N_z, N_phi+2)`` shape per Stage J fu-2
+        # ghost-grid migration.
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_const = 0.1 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-12, 5000)
 
     set_ausas_backend_for_tests(fake)
@@ -259,10 +261,11 @@ def test_damped_kernel_breaks_on_negative_pressure():
     state = DieselAusasState.from_initial_gap(
         np.ones((8, 16), dtype=float))
     backend = AusasDynamicBackend(ausas_options=None)
-    P_neg = -1.0 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
-
     def fake(**kwargs):
+        # Padded shape per Stage J fu-2 ghost-grid migration.
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_neg = -1.0 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_neg, theta_const, 1e-12, 100)
 
     set_ausas_backend_for_tests(fake)

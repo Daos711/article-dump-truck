@@ -1,50 +1,116 @@
 # Stage J followup-2 Step 12 — ghost-grid contract mismatch
 
-**Status:** open. Recorded by `tests/test_diesel_ausas_ghost_grid_contract.py::test_ausas_adapter_phi_ghost_grid_contract` (currently `@pytest.mark.xfail(strict=True)`).
+**Status:** open. Recorded by
+`tests/test_diesel_ausas_ghost_grid_contract.py::test_ausas_adapter_phi_ghost_grid_contract`,
+currently marked `xfail(strict=True)`.
 
-## Mismatch
+## Contract
 
-The expert-mandated pipeline-side contract requires:
+Diesel pipeline state is physical / endpoint-free in the circumferential
+direction:
 
-| Surface | Shape & responsibility |
+| Object | Shape |
 |---|---|
-| `DieselAusasState.{P, theta, H_prev}` | physical `(N_z, N_phi)` |
-| `ausas_one_step_with_state` input args | physical `(N_z, N_phi)` |
-| **adapter → backend kwargs** | **padded `(N_z, N_phi+2)` with `seam[:, 0]=phys[:, -1]`, `seam[:, -1]=phys[:, 0]`** |
-| backend → adapter return | padded `(N_z, N_phi+2)` |
-| `ausas_one_step_with_state` return + commit | physical `(N_z, N_phi)` |
-| explicit kwargs to backend | `periodic_phi=True`, `periodic_z=False`, `p_bc_z0=p_bc_zL=0`, `theta_bc_z0=theta_bc_zL=1` |
+| `DieselAusasState.P` | `(N_z, N_phi)` |
+| `DieselAusasState.theta` | `(N_z, N_phi)` |
+| `DieselAusasState.H_prev` | `(N_z, N_phi)` |
+| `ausas_one_step_with_state(H_curr=...)` input | `(N_z, N_phi)` |
 
-The current adapter (`models/diesel_ausas_adapter.py`, "Bug 3" fix) does **not** pad. It ships unpadded `(N_z, N_phi)` to `ausas_unsteady_one_step_gpu`, which performs `_pack_ghosts(..., periodic_phi=True)` internally on the solver side. The docstring on `pad_phi_for_ausas` and the ctor of `DieselAusasState` explicitly warn that pre-padding here triggers a **double-wrap** that corrupts every step.
+The Ausas dynamic GPU solver uses one seam ghost column on each
+circumferential side. Therefore the adapter/backend boundary must be:
 
-The two architectures are mutually exclusive: only one of {adapter, solver} may own the padding.
+| Boundary object | Shape / convention |
+|---|---|
+| backend `H_curr` | `(N_z, N_phi + 2)` |
+| backend `H_prev` | `(N_z, N_phi + 2)` |
+| backend `P_prev` | `(N_z, N_phi + 2)` |
+| backend `theta_prev` | `(N_z, N_phi + 2)` |
+| left phi ghost | `padded[:, 0] = physical[:, -1]` |
+| right phi ghost | `padded[:, -1] = physical[:, 0]` |
+| backend return `P`, `theta` | padded `(N_z, N_phi + 2)` |
+| adapter return / commit | physical `(N_z, N_phi)` |
 
-## Why this matters
+`d_phi` remains the physical spacing:
 
-Adapter-side padding (the expert-mandated contract) is the cleaner pipeline boundary — it makes the adapter the single locus of pad/unpad knowledge, lets the solver assume "your input is already padded with seam ghosts", and removes the runtime coupling between `extra_options` and solver-internal `_pack_ghosts` semantics. It also unblocks future PV-on-Ausas backends (Stage K) that may not want a hard-wired `_pack_ghosts(periodic_phi=True)` call.
+```python
+d_phi = 2π / N_phi
+```
 
-## Open questions for the expert
+It must not be computed from the padded width.
 
-1. **Migration scope.** Should the fix land as part of Step 12 (this PR) or as a separate adapter / solver migration PR after Stage J fu-2 closes?
-2. **Solver-side coordination.** Disabling solver-side `_pack_ghosts` requires a change in `reynolds_solver.cavitation.ausas.solver_dynamic_gpu.ausas_unsteady_one_step_gpu` (likely a `seam_ghosts_already_packed=True` kwarg). Who owns that change? Is the kwarg already in flight in `reynolds_solver`?
-3. **Acceptance order.** Do we need to re-run the GPU smoke (Gate 2) and bit-for-bit Gate 1 invariance after the migration? Both legacy_verlet HS path and damped Ausas path touch this code.
-4. **`d_phi` semantics.** Should `d_phi` stay at the physical spacing `2π / N_phi` (test asserts this), or does the solver expect `2π / (N_phi + 2)` after the migration? Current test pins the physical value.
+The adapter must also pass the boundary convention explicitly:
 
-## Proposed plan (subject to expert review)
+```
+periodic_phi = True
+periodic_z = False
+p_bc_z0 = p_bc_zL = 0.0
+theta_bc_z0 = theta_bc_zL = 1.0
+```
 
-1. Add `seam_ghosts_already_packed: bool = False` kwarg to `ausas_unsteady_one_step_gpu`. When `True`, skip the internal `_pack_ghosts` call.
-2. In `models/diesel_ausas_adapter.py:ausas_one_step_with_state`:
-   * Pad all four input arrays via `pad_phi_for_ausas` immediately before the backend call.
-   * Pass `seam_ghosts_already_packed=True` in the kwargs.
-   * Pass `periodic_phi=True`, `periodic_z=False`, `p_bc_z0=p_bc_zL=0`, `theta_bc_z0=theta_bc_zL=1` explicitly (defaults already match but explicit-is-better for the contract).
-   * Unpad the backend's return arrays via `unpad_phi_from_ausas` before storing in `DieselAusasState` / `DieselAusasStepResult`.
-3. Update `DieselAusasState` docstring: `P`/`theta`/`H_prev` stay on physical `(N_z, N_phi)`; the adapter handles all padding.
-4. Remove the "Bug 3" warnings from `pad_phi_for_ausas` / `unpad_phi_from_ausas` / `DieselAusasState` docstrings.
-5. Drop `@pytest.mark.xfail` from `test_ausas_adapter_phi_ghost_grid_contract`.
-6. Re-run Gate 1 (legacy invariance, HS path — should be unaffected, HS doesn't use the Ausas adapter) and Gate 2 (smoke, damped Ausas path — must reach φ ≥ 120°).
+## Observed mismatch
 
-## What's needed from the user
+The current adapter sends unpadded `(N_z, N_phi)` arrays directly to
+`ausas_unsteady_one_step_gpu`.
 
-* Approval of the plan above (or replacement plan).
-* Confirmation on solver-side coordination: is `seam_ghosts_already_packed` (or equivalent) already available in `reynolds_solver`, or does this require a separate solver-side PR?
-* Final text for this document — current content is the agent's best-effort summary of the mismatch; the expert prescribed minimal content that should be substituted in.
+The solver-side dynamic Ausas kernel treats column 0 and column -1
+as seam ghost columns when `periodic_phi=True`; the interior physical
+columns are `1:-1`. As a result, passing an endpoint-free physical
+diesel grid causes the first and last real diesel columns to be treated
+as ghost cells, and the effective physical circumferential grid becomes
+`N_phi - 2`.
+
+This is the mismatch captured by the xfailed contract test.
+
+## Solver-side note
+
+The current solver-side `_pack_ghosts(...)` routine is an in-place ghost
+refresh:
+
+```python
+arr[:, 0] = arr[:, N_phi - 2]
+arr[:, -1] = arr[:, 1]
+```
+
+It does not allocate a second ghost layer. Therefore adapter-side padding
+to `(N_z, N_phi + 2)` is compatible with the current solver: `_pack_ghosts`
+will simply refresh the seam ghosts.
+
+No `seam_ghosts_already_packed` kwarg exists in the current solver
+archive. A solver-side PR is not required for the Stage J adapter
+migration unless we choose to add an explicit API guard later.
+
+## Migration plan
+
+1. In `models/diesel_ausas_adapter.ausas_one_step_with_state`:
+   * keep state arrays physical;
+   * pad `H_curr`, `H_prev`, `P_prev`, and `theta_prev` immediately before
+     the backend call;
+   * keep `d_phi = 2π / N_phi_physical`;
+   * pass `periodic_phi=True`, `periodic_z=False`, and the Z boundary
+     values explicitly;
+   * do not pass unknown solver kwargs such as `seam_ghosts_already_packed`
+     unless the solver-side API actually supports them;
+   * unpad backend `P` and `theta` before returning or committing.
+2. Update docstrings that currently claim the adapter must not pre-pad.
+3. Remove `xfail(strict=True)` from
+   `test_ausas_adapter_phi_ghost_grid_contract`.
+4. Update `tests/test_diesel_ausas_real_backend.py` so Bug 3 means:
+   physical state/result, padded backend boundary.
+5. Re-run:
+   * adapter unit tests;
+   * ghost-grid contract test;
+   * real backend smoke if GPU/CuPy is available;
+   * Gate 1 legacy invariance;
+   * Gate 2 damped Ausas smoke to at least φ >= 120°.
+
+## Acceptance
+
+The migration is accepted when:
+
+* `DieselAusasState` remains physical `(N_z, N_phi)`;
+* backend kwargs are padded `(N_z, N_phi + 2)`;
+* returned `P_nd` / `theta` are physical `(N_z, N_phi)`;
+* `d_phi` is still `2π / N_phi`;
+* the xfailed ghost-grid test becomes a normal passing test;
+* Gate 1 remains invariant;
+* Gate 2 Ausas smoke passes the agreed early-cycle threshold.

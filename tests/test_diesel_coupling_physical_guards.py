@@ -220,12 +220,16 @@ def _make_step_ctx(N_phi: int = 16, N_z: int = 8) -> StepContext:
 
 def _huge_pressure_stub(cap_pa: float = 2.0e9):
     """Stub that returns a converged-looking solve with P_dim above
-    the supplied cap (default 2 GPa)."""
+    the supplied cap (default 2 GPa). Returns whatever shape the
+    adapter handed in (post Stage J ghost-grid migration the
+    backend boundary is padded ``(N_z, N_phi+2)``; matching the
+    incoming shape keeps the stub forwards-compatible)."""
     p_nd = cap_pa / 8.3e6
-    P_const = np.full((8, 16), p_nd, dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
 
     def fake(**kwargs):
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_const = np.full(H_pad.shape, p_nd, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)

@@ -93,20 +93,6 @@ def test_pad_phi_for_ausas_seam_wrap():
 # ─── 2. Live adapter contract ─────────────────────────────────────
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Stage J fu-2 Step 12 — known adapter-vs-solver mismatch. "
-        "The expert-mandated contract has the adapter pad arrays "
-        "to (N_z, N_phi+2) BEFORE handing them to the Ausas "
-        "backend, but the current adapter (Bug 3 fix) ships "
-        "unpadded (N_z, N_phi) and relies on solver-side "
-        "_pack_ghosts(..., periodic_phi=True) to add the seam. "
-        "The two architectures are mutually exclusive — flipping "
-        "the adapter without coordinating with reynolds_solver "
-        "creates a double-wrap that corrupts every step. See "
-        "STAGE_J_GHOST_GRID_FOLLOWUP.md for the migration plan."),
-    strict=True,
-)
 def test_ausas_adapter_phi_ghost_grid_contract():
     """Live ``ausas_one_step_with_state`` MUST hand the backend
     ghost-padded arrays AND explicit periodic / Z-boundary

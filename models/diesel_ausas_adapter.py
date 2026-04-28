@@ -38,11 +38,13 @@ class DieselAusasState:
 
     ``P``, ``theta`` and ``H_prev`` live on the **unpadded physical
     grid** ``(N_z, N_phi)`` — same shape and indexing as the diesel
-    ``setup_grid`` output. ``ausas_unsteady_one_step_gpu`` does its
-    own ``_pack_ghosts(..., periodic_phi=True)`` internally so the
-    adapter must NOT pre-pad the seam ghost columns; doing so
-    triggers a double-wrap that corrupts every step (Stage J
-    integration regression, Bug 3).
+    ``setup_grid`` output. The adapter (Stage J fu-2 ghost-grid
+    migration) is the single locus of pad/unpad knowledge: it pads
+    these arrays to ``(N_z, N_phi+2)`` immediately before forwarding
+    to ``ausas_unsteady_one_step_gpu`` and unpads the backend's
+    returned padded arrays before storing them back. Pipeline state
+    therefore stays on the physical grid for forces, summary,
+    npz schema, and runner-side bookkeeping.
     """
     P: np.ndarray
     theta: np.ndarray
@@ -235,20 +237,19 @@ def pad_phi_for_ausas(field: np.ndarray) -> np.ndarray:
     """Mirror one ghost column on each circumferential side of a
     ``(N_z, N_phi)`` field, returning ``(N_z, N_phi + 2)``.
 
-    .. note::
-        Stage J integration regression (Bug 3) — this helper is
-        **not** called inside the live ``ausas_one_step_with_state``
-        path. ``ausas_unsteady_one_step_gpu`` performs
-        ``_pack_ghosts(..., periodic_phi=True)`` internally, so
-        pre-padding triggers a double-wrap. The helper survives
-        only as a debug utility for offline introspection.
-
-    Diesel ``setup_grid`` is endpoint-free on phi, so column 0 and
-    column ``N_phi`` are conjugate (``Phi[N_phi] == Phi[0] + 2π``).
-    The seam wrap is::
+    Called by ``ausas_one_step_with_state`` immediately before the
+    backend call. Diesel ``setup_grid`` is endpoint-free on phi,
+    so column 0 and column ``N_phi`` are conjugate
+    (``Phi[N_phi] == Phi[0] + 2π``). The seam wrap is::
 
         col_left_ghost  = field[:, -1]        # phi = -dphi
         col_right_ghost = field[:, 0]         # phi = 2π
+
+    The current solver-side ``_pack_ghosts(..., periodic_phi=True)``
+    is an idempotent in-place refresh
+    (``arr[:, 0] = arr[:, N-2]; arr[:, -1] = arr[:, 1]``) and is
+    compatible with adapter-side padding — it will simply re-mirror
+    the seam ghosts on top of the values this helper already wrote.
     """
     a = np.asarray(field)
     if a.ndim != 2:
@@ -265,9 +266,10 @@ def pad_phi_for_ausas(field: np.ndarray) -> np.ndarray:
 
 def unpad_phi_from_ausas(field_pad: np.ndarray) -> np.ndarray:
     """Inverse of :func:`pad_phi_for_ausas`. Drops the two ghost
-    columns; returns the physical ``(N_z, N_phi)`` array. Same
-    note as ``pad_phi_for_ausas``: not called by the live path
-    after Bug 3."""
+    columns; returns the physical ``(N_z, N_phi)`` array. Called
+    by ``ausas_one_step_with_state`` immediately after the backend
+    call to restore physical-grid arrays for state commit and the
+    ``DieselAusasStepResult`` payload."""
     a = np.asarray(field_pad)
     if a.ndim != 2:
         raise ValueError(
@@ -382,10 +384,20 @@ def ausas_one_step_with_state(
       ``n_inner < max_inner`` AND ``residual <= tol`` (legacy
       shapes that already report a ``converged`` flag still honour
       it).
-    * **Bug 3** — state arrays live on the unpadded physical grid
-      ``(N_z, N_phi)``; the adapter does NOT pre-pad. The GPU
-      solver does its own ``_pack_ghosts(..., periodic_phi=True)``,
-      so adding ghost columns here would double-wrap.
+    * **Bug 3 (Stage J fu-2 ghost-grid migration)** — state arrays
+      stay on the unpadded physical grid ``(N_z, N_phi)``, but the
+      adapter is the single locus of pad/unpad: it calls
+      :func:`pad_phi_for_ausas` on ``H_curr``, ``H_prev``,
+      ``P_prev``, ``theta_prev`` immediately before the backend
+      call (so the backend sees padded ``(N_z, N_phi+2)``), and
+      :func:`unpad_phi_from_ausas` on the backend's returned
+      ``P`` and ``theta`` before commit / return. ``d_phi`` stays
+      at the physical spacing ``2π/N_phi``. The boundary
+      convention (``periodic_phi=True``, ``periodic_z=False``,
+      ``p_bc_z0=p_bc_zL=0``, ``theta_bc_z0=theta_bc_zL=1``) is
+      passed explicitly. The current solver-side
+      ``_pack_ghosts`` is idempotent so this is compatible
+      without a solver-side change.
 
     Parameters
     ----------
@@ -436,23 +448,43 @@ def ausas_one_step_with_state(
             "``models.diesel_ausas_adapter.set_ausas_backend_for_tests``."
         )
 
-    # Unpadded physical grid in / out — solver pads internally.
-    H_curr_arr = np.asarray(H_curr)
+    # Stage J fu-2 ghost-grid migration — adapter-side padding.
+    # State arrays live on the unpadded physical grid; the adapter
+    # pads them to ``(N_z, N_phi+2)`` immediately before the
+    # backend call (``padded[:, 0] = phys[:, -1]``,
+    # ``padded[:, -1] = phys[:, 0]``) and unpads the backend's
+    # padded return arrays before storing in ``state`` /
+    # ``DieselAusasStepResult``. ``d_phi`` is the PHYSICAL spacing
+    # ``2π / N_phi``, NOT divided by the padded width.
+    H_curr_phys = np.asarray(H_curr, dtype=float)
+    H_prev_phys = np.asarray(state.H_prev, dtype=float)
+    P_prev_phys = np.asarray(state.P, dtype=float)
+    theta_prev_phys = np.asarray(state.theta, dtype=float)
 
     # Stage J Bug 4 — convert physical timestep to Ausas non-dim
     # ``τ`` units before forwarding to the GPU backend.
     dt_ausas = ausas_dt_from_physical(dt_s, omega_shaft)
 
     kwargs = dict(
-        H_curr=H_curr_arr,
-        H_prev=state.H_prev,
-        P_prev=state.P,
-        theta_prev=state.theta,
+        H_curr=pad_phi_for_ausas(H_curr_phys),
+        H_prev=pad_phi_for_ausas(H_prev_phys),
+        P_prev=pad_phi_for_ausas(P_prev_phys),
+        theta_prev=pad_phi_for_ausas(theta_prev_phys),
         dt=float(dt_ausas),
-        d_phi=float(d_phi),
+        d_phi=float(d_phi),          # physical spacing 2π/N_phi
         d_Z=float(d_Z),
         R=float(R),
         L=float(L),
+        # Boundary convention — explicit per the ghost-grid contract.
+        # The current solver-side ``_pack_ghosts`` is an idempotent
+        # in-place refresh, so passing already-padded arrays is
+        # compatible (it just refreshes the seam ghosts).
+        periodic_phi=True,
+        periodic_z=False,
+        p_bc_z0=0.0,
+        p_bc_zL=0.0,
+        theta_bc_z0=1.0,
+        theta_bc_zL=1.0,
     )
     if extra_options:
         kwargs.update(extra_options)
@@ -484,13 +516,30 @@ def ausas_one_step_with_state(
             P_nd=None, theta=None,
             residual=float("nan"), n_inner=0,
             converged=False,
-            H_curr=H_curr_arr,
+            H_curr=H_curr_phys,
             dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
             reason=f"ausas_one_step_failed: {type(exc).__name__}: {exc}",
         )
 
-    P_nd, theta_phys, residual, n_inner, ok_explicit = (
+    P_pad, theta_pad, residual, n_inner, ok_explicit = (
         _unpack_ausas_return(out))
+
+    # Stage J fu-2 ghost-grid migration — shape-validate the
+    # backend's padded return AND unpad before any consumer sees
+    # the arrays. The diesel pipeline (forces, summary, npz, state
+    # commit) all expect physical ``(N_z, N_phi)``.
+    expected_pad_shape = (
+        H_curr_phys.shape[0], H_curr_phys.shape[1] + 2)
+    if P_pad.shape != expected_pad_shape:
+        raise ValueError(
+            f"Ausas backend returned P shape {P_pad.shape}, "
+            f"expected padded {expected_pad_shape}")
+    if theta_pad.shape != expected_pad_shape:
+        raise ValueError(
+            f"Ausas backend returned theta shape {theta_pad.shape}, "
+            f"expected padded {expected_pad_shape}")
+    P_nd = unpad_phi_from_ausas(P_pad)
+    theta_phys = unpad_phi_from_ausas(theta_pad)
 
     # Derive ``ok``:
     # * If the solver explicitly returned a convergence flag, honour
@@ -524,7 +573,7 @@ def ausas_one_step_with_state(
                 if np.isfinite(residual) else float("nan"),
             n_inner=int(n_inner),
             converged=False,
-            H_curr=H_curr_arr,
+            H_curr=H_curr_phys,
             dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
             reason="ausas_returned_nonfinite",
         )
@@ -537,7 +586,7 @@ def ausas_one_step_with_state(
         else:
             state.P = np.asarray(P_nd)
             state.theta = np.asarray(theta_phys)
-            state.H_prev = H_curr_arr
+            state.H_prev = H_curr_phys
             state.step_index += 1
             state.time_s += float(dt_s)
             state.dt_last_s = float(dt_s)
@@ -550,7 +599,7 @@ def ausas_one_step_with_state(
             if np.isfinite(residual) else float("nan"),
         n_inner=int(n_inner),
         converged=bool(converged),
-        H_curr=H_curr_arr,
+        H_curr=H_curr_phys,
         dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
         reason=("ok" if converged else "ausas_not_converged"),
     )

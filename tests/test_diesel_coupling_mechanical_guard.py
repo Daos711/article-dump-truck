@@ -253,13 +253,16 @@ def test_damped_kernel_mech_guard_skips_gpu_on_bad_candidate():
     state = DieselAusasState.from_initial_gap(np.ones((8, 16)))
     backend = AusasDynamicBackend(ausas_options=None)
 
-    # Sanity stub: would converge if called, returns small finite P.
-    P_const = 0.01 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
+    # Sanity stub: would converge if called, returns small finite P
+    # on the padded ``(N_z, N_phi+2)`` boundary that the adapter
+    # now uses (Stage J fu-2 ghost-grid migration).
     n_calls = {"k": 0}
 
     def fake(**kwargs):
+        H_pad = np.asarray(kwargs["H_curr"])
         n_calls["k"] += 1
+        P_const = 0.01 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)
@@ -315,11 +318,14 @@ def test_damped_kernel_line_search_shrinks_relax_on_physical_reject():
     backend = AusasDynamicBackend(ausas_options=None)
 
     # Converged-looking solve with P_dim = 2 GPa (above 1 GPa cap).
+    # Output shape matches the padded ``(N_z, N_phi+2)`` boundary
+    # the adapter uses post Stage J ghost-grid migration.
     p_nd_huge = 2.0e9 / ctx.p_scale
-    P_const = np.full((8, 16), p_nd_huge, dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
 
     def fake(**kwargs):
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_const = np.full(H_pad.shape, p_nd_huge, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)
@@ -375,11 +381,12 @@ def test_damped_kernel_no_shrink_when_all_trials_accept():
     state = DieselAusasState.from_initial_gap(np.ones((8, 16)))
     backend = AusasDynamicBackend(ausas_options=None)
 
-    # Tiny p_nd → all gates pass on every trial.
-    p_const = 1e-3 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
-
+    # Tiny p_nd → all gates pass on every trial. Padded shape per
+    # Stage J fu-2 ghost-grid migration.
     def fake(**kwargs):
+        H_pad = np.asarray(kwargs["H_curr"])
+        p_const = 1e-3 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (p_const, theta_const, 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)

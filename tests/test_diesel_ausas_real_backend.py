@@ -9,9 +9,15 @@ adapter end-to-end on a tiny grid so the regressions cannot recur:
   solver — the adapter must NOT forward them.
 * Bug 2: the real solver returns ``(P, theta, residual, n_inner)``,
   not ``(P, theta, n_inner, converged)``.
-* Bug 3: the solver does its own ``_pack_ghosts(...,
-  periodic_phi=True)``; the adapter must pass the **unpadded**
-  physical grid.
+* Bug 3 (Stage J fu-2 ghost-grid migration): physical state /
+  result on the diesel side, padded ``(N_z, N_phi+2)`` boundary at
+  the adapter→backend interface. The adapter pads on the way in
+  (``pad_phi_for_ausas`` on ``H_curr`` / ``H_prev`` / ``P_prev`` /
+  ``theta_prev``) and unpads on the way out (returned ``P``,
+  ``theta``); ``DieselAusasState`` and ``DieselAusasStepResult.P_nd``
+  / ``.theta`` stay on the unpadded physical grid. The current
+  solver-side ``_pack_ghosts`` is idempotent so this is compatible
+  without a solver-side change.
 * Bug 4: physical seconds must NOT be forwarded as ``dt`` — the
   adapter converts to non-dim ``dt_ausas = ω·dt_s`` first.
 * Bug 5: state initialisation from the actual first accepted gap
@@ -106,7 +112,10 @@ def test_real_ausas_backend_one_step_runs_clean():
         f"physical-contract failed: residual={out.residual}, "
         f"n_inner={out.n_inner}, theta=[{out.theta_min}, "
         f"{out.theta_max}]")
-    # Bug 3 guard: physical (unpadded) grid shape on output.
+    # Bug 3 guard: adapter unpads the backend's padded return so
+    # ``out.P_nd`` / ``out.theta`` are physical ``(N_z, N_phi)``
+    # for the diesel pipeline. The adapter handles padding on the
+    # way in; this assertion pins the unpad on the way out.
     assert out.P_nd.shape == (N_z, N_phi)
     assert out.theta.shape == (N_z, N_phi)
     assert state.step_index == 1

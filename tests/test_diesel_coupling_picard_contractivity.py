@@ -34,6 +34,7 @@ from models.diesel_coupling import (
 )
 from models.diesel_ausas_adapter import (
     DieselAusasState,
+    pad_phi_for_ausas,
     set_ausas_backend_for_tests,
 )
 
@@ -82,11 +83,16 @@ def _make_per_call_backend(P_per_call: list,
     calls = {"n": 0}
 
     def fake(**kwargs):
+        # Stage J fu-2 ghost-grid migration — pad the user-supplied
+        # physical (N_z, N_phi) field to padded (N_z, N_phi+2) so
+        # the adapter's unpad path produces the user-visible
+        # physical fields back.
         i = min(calls["n"], len(P_per_call) - 1)
-        P = np.asarray(P_per_call[i], dtype=float)
-        theta = np.asarray(theta_per_call[i], dtype=float)
+        P_phys = np.asarray(P_per_call[i], dtype=float)
+        theta_phys = np.asarray(theta_per_call[i], dtype=float)
         calls["n"] += 1
-        return (P, theta, 1e-9, 100)
+        return (pad_phi_for_ausas(P_phys),
+                pad_phi_for_ausas(theta_phys), 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)
     return calls
