@@ -354,6 +354,28 @@ def _save_data(run_dir, results, thermal, retry_cfg):
         ausas_rejected_commit_count=results.get(
             "ausas_rejected_commit_count",
             np.zeros(len(results["configs"]), dtype=np.int32)),
+        # Stage J fu-2 Step 10 — per-step coupling diagnostics.
+        # Defaults preserve schema on regenerated runs that pre-date
+        # Step 10 (zeros / NaN / "none" map to "no shrink, no
+        # rejection, n_trials unknown" — consistent with how
+        # legacy_verlet would populate them).
+        stage_j_picard_shrinks=results.get(
+            "stage_j_picard_shrinks",
+            np.zeros_like(results["contact_clamp"], dtype=np.int32)),
+        stage_j_mech_relax_min_seen=results.get(
+            "stage_j_mech_relax_min_seen",
+            np.full_like(results["contact_clamp"],
+                          np.nan, dtype=float)),
+        stage_j_fp_converged=results.get(
+            "stage_j_fp_converged",
+            np.zeros_like(results["contact_clamp"], dtype=bool)),
+        stage_j_n_trials=results.get(
+            "stage_j_n_trials",
+            np.zeros_like(results["contact_clamp"], dtype=np.int32)),
+        stage_j_rejection_reason=results.get(
+            "stage_j_rejection_reason",
+            np.full_like(results["contact_clamp"], "none",
+                          dtype=object)),
         retry_used=results["retry_used"],
         retry_omega_used=results["retry_omega_used"],
         contact_clamp_count=results["contact_clamp_count"],
