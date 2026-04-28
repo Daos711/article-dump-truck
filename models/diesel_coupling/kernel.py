@@ -1153,6 +1153,18 @@ def _run_damped_implicit_film(
             rejection_reason = RejectionReason.SOLVER_RESIDUAL
         rejection_detail = solve_reason
 
+    # Stage J fu-2 fixup-3 — Picard no-advance flag.
+    # For a stateful Ausas backend, pressure / theta state and the
+    # mechanical state form ONE coupled object. Advancing mechanics
+    # while the Ausas commit is blocked (Picard didn't reach a fixed
+    # point) leaves ``state.H_prev`` lagging behind the orbit; the
+    # next step's predictor then drives an artificially huge
+    # ∂h/∂t = (H_curr - H_prev)/dt squeeze impulse and the solver
+    # honestly returns 250+ MPa from a desync, not a real peak. The
+    # fix: when fixed_point_converged=False on a stateful backend,
+    # do a FULL no-advance — no pressure commit AND mechanical state
+    # rolls back to step start. Set in the elif branch below.
+    picard_no_advance = False
     if (backend.stateful and solve_ok and not step_clamped
             and fixed_point_converged and H_last is not None):
         commit_result = backend.solve_trial(
@@ -1199,9 +1211,37 @@ def _run_damped_implicit_film(
             f"last_delta_eps="
             f"{prev_step_norm if prev_step_norm is not None else 0.0:.3e}"
         )
+        # Stage J fu-2 fixup-3 — full no-advance.
+        # Diagnosis: smoke 190-209 showed steps 190-196 with
+        # fixed_point_converged=False and mech_relax_min_seen=0.0625
+        # (relax floor). Mechanics still advanced to ex_anchor;
+        # Ausas commit was blocked. After 6 such steps state.H_prev
+        # lagged the orbit by ~7 dt, so step 197's ∂h/∂t had a
+        # 7-dt numerator over a 1-dt denominator → artificial
+        # squeeze impulse → 250+ MPa peak that the smoke pressure
+        # cap then rejected on k=0. The PDE was correct, the
+        # H_curr/H_prev pair was desynced. Fix: roll mechanics back
+        # to step start and zero out trial outputs so nothing leaks
+        # downstream as warm-start or a fake hydrodynamic state.
+        picard_no_advance = True
+        solve_ok = False
+        P_last = None
+        H_last = None
+        theta_for_diag = None
+        Fx_hyd = float("nan")
+        Fy_hyd = float("nan")
+        residual_for_diag = float("nan")
+        p_warm_local = None
+        # Roll mechanical state back to the input of this kernel
+        # call (last accepted state from the previous mechanical
+        # step). Overwrites the ex_new/vx_new/ax_new currently
+        # holding the post-clamp anchor values from the Picard loop.
+        ex_new, ey_new = float(ex_n), float(ey_n)
+        vx_new, vy_new = float(vx_n), float(vy_n)
+        ax_new, ay_new = float(ax_prev), float(ay_prev)
 
     return MechanicalStepResult(
-        accepted=True,
+        accepted=not bool(picard_no_advance),
         eps_x_new=ex_new, eps_y_new=ey_new,
         vx_new=vx_new, vy_new=vy_new,
         ax_new=ax_new, ay_new=ay_new,

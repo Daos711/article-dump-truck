@@ -140,7 +140,18 @@ class EnvelopeAbortConfig:
     enabled: bool = True
     clamp_frac_max: float = 0.30
     solver_fail_frac_max: float = 0.30
-    consecutive_invalid_max: int = 30
+    # Stage J fu-2 fixup-3 — bumped from 30 to 50. The damped-Picard
+    # no-advance fix makes ``solver_success_all[ic, step] = False``
+    # on Picard-budget-exhausted steps (instead of the old false-
+    # positive ``True`` from a state-desynced "advance" with poisoned
+    # H_curr/H_prev). On a stiff combustion peak this can produce a
+    # short streak of legitimately-non-converged steps while the
+    # Picard contractivity detector finds the right relax floor; 30
+    # would abort the run mid-stabilisation. 50 leaves headroom for
+    # the existing detector budget without masking a true runaway
+    # (the OR'd ``solver_fail_frac_max=0.30`` still fires if the run
+    # is genuinely unrecoverable).
+    consecutive_invalid_max: int = 50
     save_partial_on_abort: bool = True
     warmup_steps: int = 5
 

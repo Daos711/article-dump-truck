@@ -122,7 +122,10 @@ def test_envelope_abort_defaults():
     assert cfg.enabled is True
     assert cfg.clamp_frac_max == pytest.approx(0.30)
     assert cfg.solver_fail_frac_max == pytest.approx(0.30)
-    assert cfg.consecutive_invalid_max == 30
+    # Stage J fu-2 fixup-3 — bumped from 30 to 50 to give the
+    # damped-Picard contractivity detector room to stabilise on
+    # combustion-peak transients without aborting the run.
+    assert cfg.consecutive_invalid_max == 50
     assert cfg.save_partial_on_abort is True
     d = cfg.to_dict()
     for k in ("enabled", "clamp_frac_max", "solver_fail_frac_max",
