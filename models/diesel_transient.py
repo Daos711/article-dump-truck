@@ -1128,7 +1128,14 @@ def run_transient(F_max=None, debug=False,
                   ausas_options: Optional[Dict[str, Any]] = None,
                   save_field_checkpoints: bool = False,
                   debug_first_steps: int = 0,
-                  seed: int = 0):
+                  debug_from_step: int = 0,
+                  seed: int = 0,
+                  # Stage J fu-2 Step 10 — coupling policy CLI surface.
+                  guards_profile: str = "general",
+                  coupling_override: str = "auto",
+                  max_mech_inner: Optional[int] = None,
+                  mech_relax_initial: Optional[float] = None,
+                  mech_relax_min: Optional[float] = None):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -1346,6 +1353,25 @@ def run_transient(F_max=None, debug=False,
     # for sanity / convergence-quality diagnostics.
     ausas_residual_all = np.full((n_cfg, n_steps), np.nan, dtype=float)
     ausas_dt_tau_all = np.zeros((n_cfg, n_steps), dtype=float)
+    # Stage J fu-2 Step 10 — per-step coupling diagnostics for the
+    # Gate 3 summary block + npz schema. Both legacy and damped
+    # paths populate these so the post-fact analysis script gets a
+    # uniform schema. ``picard_shrinks`` and
+    # ``fixed_point_converged`` are damped-only (zeros / False on
+    # the legacy path); ``mech_relax_min_seen`` and ``n_trials``
+    # are on both.
+    coupling_picard_shrinks_all = np.zeros(
+        (n_cfg, n_steps), dtype=np.int32)
+    coupling_mech_relax_min_seen_all = np.full(
+        (n_cfg, n_steps), np.nan, dtype=float)
+    coupling_fp_converged_all = np.zeros(
+        (n_cfg, n_steps), dtype=bool)
+    coupling_n_trials_all = np.zeros(
+        (n_cfg, n_steps), dtype=np.int32)
+    # ``rejection_reason`` is a variable-length enum string per
+    # step. Stored as object dtype (numpy will pickle on save).
+    coupling_rejection_reason_all = np.full(
+        (n_cfg, n_steps), "none", dtype=object)
     # Stage J Bug 4 follow-up — per-step force-balance diagnostics.
     F_hyd_x_all = np.zeros((n_cfg, n_steps), dtype=float)
     F_hyd_y_all = np.zeros((n_cfg, n_steps), dtype=float)
@@ -1433,6 +1459,27 @@ def run_transient(F_max=None, debug=False,
                 textured_for_retry=bool(cfg["textured"]),
             )
 
+        # Stage J fu-2 Step 10 — resolve once per config. CLI flags
+        # ``--coupling-policy`` / ``--max-mech-inner`` /
+        # ``--mech-relax-initial`` / ``--mech-relax-min`` layer
+        # overrides on top of the capability-based default.
+        _coupling_policy = _coupling.resolve_policy(
+            _backend,
+            coupling_override=str(coupling_override),
+            max_mech_inner=max_mech_inner,
+            mech_relax_initial=mech_relax_initial,
+            mech_relax_min=mech_relax_min,
+        )
+        # Mode default: ``hard`` for damped Ausas (per
+        # POLICY_AUSAS_DYNAMIC.physical_guards_mode), ``diagnostic``
+        # for legacy_verlet (preserves Gate 1 invariance —
+        # diagnostic warns but does NOT reject).
+        _guards_mode = (
+            "hard" if _coupling_policy.name == "damped_implicit_film"
+            else "diagnostic")
+        _guards_cfg = _coupling.PhysicalGuardsConfig.from_profile(
+            _guards_mode, str(guards_profile))
+
         def _clamp(ex_, ey_, vx_, vy_):
             clamped = False
             eps_mag_ = np.hypot(ex_, ey_) / params.c
@@ -1519,6 +1566,17 @@ def run_transient(F_max=None, debug=False,
                     groove_relief=groove_relief,
                 )
 
+            # Stage J fu-2 Step 9 fixup — propagate the user's
+            # ``--ausas-tol`` / ``--ausas-max-inner`` (carried in
+            # ``ausas_options``) to the kernel's solver-validity
+            # cap. Hard-coding 1e-6 / 5000 turned every legitimate
+            # ``residual <= user_tol`` solve into a false
+            # ``SOLVER_RESIDUAL`` reject and stalled the Picard loop.
+            # The HS path ignores both, so threading is safe.
+            _kernel_ausas_tol = float(
+                (ausas_options or {}).get("tol", 1e-6))
+            _kernel_ausas_max_inner = int(
+                (ausas_options or {}).get("max_inner", 5000))
             _ms = _coupling.advance_mechanical_step(
                 ex_n=ex_n, ey_n=ey_n,
                 vx_n=vx_n, vy_n=vy_n,
@@ -1526,17 +1584,12 @@ def run_transient(F_max=None, debug=False,
                 dt_phys_s=float(dt_step),
                 backend=_backend,
                 backend_state=ausas_state,
-                # Stage J fu-2 Step 6 — capability-based dispatch.
-                # Stateless backends (HS) → POLICY_LEGACY_HS;
-                # stateful backends (Ausas, future PV-on-Ausas) →
-                # POLICY_AUSAS_DYNAMIC. The runner never branches
-                # on backend name; future PV plugs in via the same
-                # protocol.
-                policy=_coupling.select_policy(_backend),
-                guards_cfg=_coupling.PhysicalGuardsConfig.from_profile(
-                    "diagnostic", "general"),
-                ausas_tol=1e-6,
-                ausas_max_inner=5000,
+                # Stage J fu-2 Step 10 — policy + guards resolved
+                # once per config; the kernel never sees the CLI.
+                policy=_coupling_policy,
+                guards_cfg=_guards_cfg,
+                ausas_tol=_kernel_ausas_tol,
+                ausas_max_inner=_kernel_ausas_max_inner,
                 extra_options=(ausas_options if use_ausas_dynamic
                                else None),
                 context=step_ctx,
@@ -1545,6 +1598,13 @@ def run_transient(F_max=None, debug=False,
                 clamp_fn=_clamp,
                 build_H_fn=_build_H_for_kernel,
                 p_warm_init=P_prev,
+                # Stage J fu-2 Step 9 diagnostic — only emit the
+                # damped-policy per-iteration dump while the runner
+                # is still inside the operator's debug window.
+                debug_dump=(use_ausas_dynamic
+                            and step >= int(debug_from_step)
+                            and step < int(debug_from_step)
+                            + int(debug_first_steps)),
             )
 
             # Apply kernel result to runner state — preserves
@@ -1552,6 +1612,21 @@ def run_transient(F_max=None, debug=False,
             contact_count += int(_ms.n_contact_events)
             step_event_count = int(_ms.n_contact_events)
             P_prev = _ms.p_warm_out
+
+            # Stage J fu-2 Step 10 — per-step coupling diagnostics
+            # for the Gate 3 summary block. Both backend paths
+            # populate these so the per-step npz arrays remain on
+            # a uniform schema (legacy_verlet returns 0 / False /
+            # 1.0 for the damped-only fields per kernel defaults).
+            coupling_picard_shrinks_all[ic, step] = int(
+                _ms.picard_shrinks_count)
+            coupling_mech_relax_min_seen_all[ic, step] = float(
+                _ms.mech_relax_min_seen)
+            coupling_fp_converged_all[ic, step] = bool(
+                _ms.fixed_point_converged_flag)
+            coupling_n_trials_all[ic, step] = int(_ms.n_trials)
+            coupling_rejection_reason_all[ic, step] = (
+                _ms.rejection_reason.value)
             ex, ey = _ms.eps_x_new, _ms.eps_y_new
             vx, vy = _ms.vx_new, _ms.vy_new
             ax_prev, ay_prev = _ms.ax_new, _ms.ay_new
@@ -1587,7 +1662,9 @@ def run_transient(F_max=None, debug=False,
                 # ``--debug-first-steps N`` — stream per-trial
                 # diagnostic lines from the kernel's trial_log, plus
                 # one ACCEPTED line summarising the committed step.
-                if step < int(debug_first_steps):
+                if (step >= int(debug_from_step)
+                        and step < int(debug_from_step)
+                        + int(debug_first_steps)):
                     for k_idx, tr in enumerate(_ms.trial_log):
                         _print_ausas_debug_step(
                             f"step={step:03d} TRIAL k={k_idx}",
@@ -2096,6 +2173,15 @@ def run_transient(F_max=None, debug=False,
         "ausas_rejected_commit_count": ausas_rejected_commit_count,
         "ausas_residual": ausas_residual_all,
         "ausas_dt_tau": ausas_dt_tau_all,
+        # Stage J fu-2 Step 10 — per-step coupling diagnostics
+        # (Gate 3 schema). Globals are computed at write-time by
+        # the summary writer; per-step arrays are written here for
+        # post-fact analysis.
+        "stage_j_picard_shrinks": coupling_picard_shrinks_all,
+        "stage_j_mech_relax_min_seen": coupling_mech_relax_min_seen_all,
+        "stage_j_fp_converged": coupling_fp_converged_all,
+        "stage_j_n_trials": coupling_n_trials_all,
+        "stage_j_rejection_reason": coupling_rejection_reason_all,
         "F_hyd_x": F_hyd_x_all,
         "F_hyd_y": F_hyd_y_all,
         "F_ext_x": F_ext_x_all,

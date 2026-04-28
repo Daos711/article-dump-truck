@@ -394,22 +394,63 @@ def check_mechanical_candidate(
     max_delta_eps_inner: Optional[float],
     max_delta_eps_step: Optional[float],
 ) -> GuardOutcome:
-    """Active only when ``policy.max_delta_eps_inner`` /
-    ``max_delta_eps_step`` are set (i.e. damped policy).
+    """Stage J fu-2 §3.3 / doc 1 §4.3 — mechanical candidate guards.
 
-    Composition (doc 1 §3.3 + §4.3):
-        * ``|Δε_inner|  = hypot(eps_x_cand - eps_x_curr,
-                                 eps_y_cand - eps_y_curr)
-                         <= max_delta_eps_inner``
-        * ``|Δε_step|   = hypot(eps_x_cand - eps_x_step_start,
-                                 eps_y_cand - eps_y_step_start)
-                         <= max_delta_eps_step``
-        * ``hypot(eps_x_cand, eps_y_cand) < eps_max``
+    Three priority-ordered checks:
 
-    On violation the **kernel** must shrink ``mech_relax`` and
-    re-blend the candidate, NOT push the violating candidate to
-    the solver.
+    1. ``|Δε_inner| <= max_delta_eps_inner`` — bounds the per-trial
+       jump from the LAST accepted (or anchor) candidate to the new
+       blended candidate. Catches squeeze-driven Verlet runaway
+       within one mechanical step.
+    2. ``|Δε_step| <= max_delta_eps_step`` — bounds the cumulative
+       drift from the start of the mechanical step to the current
+       candidate. Catches a slow accumulation that individually
+       passes the inner bound but globally exceeds the step
+       envelope.
+    3. ``|ε| < eps_max`` — the candidate must NOT have been pushed
+       to (or past) the absolute eccentricity clamp. Hitting
+       ``eps_max`` means a Verlet jump put the journal on the
+       wall; the kernel should shrink relax and re-blend rather
+       than commit a clamped candidate.
 
-    Step 2 — skeleton only. Step 9 implements the body.
+    Both Δε bounds are skipped when their corresponding policy
+    field is ``None`` (legacy_verlet uses neither). The inputs are
+    expected in NON-DIMENSIONAL ε units (i.e., ``ex / c``).
+
+    On violation the **kernel** shrinks ``mech_relax`` and
+    re-blends; the violating candidate is NEVER pushed to the
+    pressure backend. Guard-only — does not touch state.
     """
-    ...
+    if max_delta_eps_inner is not None:
+        delta_inner = float(np.hypot(
+            float(eps_x_cand) - float(eps_x_curr),
+            float(eps_y_cand) - float(eps_y_curr),
+        ))
+        if delta_inner > float(max_delta_eps_inner):
+            return GuardOutcome(
+                False,
+                RejectionReason.MECHANICAL_DELTA_EPS_INNER,
+                f"|Δε_inner|={delta_inner:.4f} > "
+                f"cap={float(max_delta_eps_inner):.4f}",
+            )
+    if max_delta_eps_step is not None:
+        delta_step = float(np.hypot(
+            float(eps_x_cand) - float(eps_x_step_start),
+            float(eps_y_cand) - float(eps_y_step_start),
+        ))
+        if delta_step > float(max_delta_eps_step):
+            return GuardOutcome(
+                False,
+                RejectionReason.MECHANICAL_DELTA_EPS_STEP,
+                f"|Δε_step|={delta_step:.4f} > "
+                f"cap={float(max_delta_eps_step):.4f}",
+            )
+    eps_mag = float(np.hypot(float(eps_x_cand), float(eps_y_cand)))
+    if eps_mag >= float(eps_max):
+        return GuardOutcome(
+            False,
+            RejectionReason.MECHANICAL_EPS_MAX,
+            f"|ε|={eps_mag:.4f} >= eps_max={float(eps_max):.4f} "
+            "— candidate pushed to clamp; shrink relax instead",
+        )
+    return GuardOutcome(True, RejectionReason.NONE, "ok")

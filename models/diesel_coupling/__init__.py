@@ -5,7 +5,7 @@ Public API re-exports::
     PressureBackend, PressureSolveResult, StepContext
     HalfSommerfeldBackend, AusasDynamicBackend
     CouplingPolicy, POLICY_LEGACY_HS, POLICY_AUSAS_DYNAMIC
-    select_policy, resolve_policy_overrides
+    select_policy, resolve_policy, resolve_policy_overrides
     PhysicalGuardsConfig, GuardsMode, GuardsProfile, RejectionReason
     GuardOutcome
     check_solver_validity, check_physical_guards, check_mechanical_candidate
@@ -52,6 +52,7 @@ from .policies import (
     CouplingPolicy,
     POLICY_AUSAS_DYNAMIC,
     POLICY_LEGACY_HS,
+    resolve_policy,
     resolve_policy_overrides,
     select_policy,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "check_mechanical_candidate",
     "check_physical_guards",
     "check_solver_validity",
+    "resolve_policy",
     "resolve_policy_overrides",
     "select_policy",
 ]

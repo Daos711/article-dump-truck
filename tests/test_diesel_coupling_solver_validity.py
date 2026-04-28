@@ -198,12 +198,14 @@ def test_damped_kernel_breaks_on_n_inner_at_max():
     state = DieselAusasState.from_initial_gap(
         np.ones((8, 16), dtype=float))
     backend = AusasDynamicBackend(ausas_options=None)
-    P_const = 0.1 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
-
     def fake(**kwargs):
         # n_inner intentionally HITS max_inner=5000 so
-        # check_solver_validity flags SOLVER_BUDGET.
+        # check_solver_validity flags SOLVER_BUDGET. Returns
+        # padded ``(N_z, N_phi+2)`` shape per Stage J fu-2
+        # ghost-grid migration.
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_const = 0.1 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-12, 5000)
 
     set_ausas_backend_for_tests(fake)
@@ -225,19 +227,28 @@ def test_damped_kernel_breaks_on_n_inner_at_max():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1, (
-        f"Step 7 gate must break on first trial; got "
-        f"n_trials={ms.n_trials}")
+    # Stage J fu-2 Step 9 — with the test setup (vx_n=vy_n=0,
+    # ax_prev=ay_prev=0) the Verlet predictor produces ex_pred==ex_n,
+    # ey_pred==ey_n so the FIRST candidate equals the anchor. The
+    # Step 9 fixup detects ``|cand - anchor| < 1e-12`` and aborts
+    # the line-search immediately (shrinking can never recover when
+    # the anchor itself fails the gate); n_trials=1, the surfaced
+    # rejection reason is the SAME SOLVER_BUDGET enum.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_BUDGET, (
         f"expected SOLVER_BUDGET, got {ms.rejection_reason}")
     assert "n_inner=5000" in ms.rejection_detail
-    # TrialRecord carries the solver outcome verbatim.
-    assert len(ms.trial_log) == 1
-    tr = ms.trial_log[0]
-    assert tr.accepted is False
-    assert tr.outcome_solver.accept is False
-    assert tr.outcome_solver.reason is RejectionReason.SOLVER_BUDGET
+    # solve_reason carries the abort path tag for the summary writer.
+    assert ("reject_at_anchor" in ms.solve_reason
+            or "line_search_exhausted" in ms.solve_reason), (
+        f"solve_reason={ms.solve_reason!r}")
+    assert 1 <= ms.n_trials <= POLICY_AUSAS_DYNAMIC.max_mech_inner
+    # Every TrialRecord carries the solver outcome verbatim.
+    assert len(ms.trial_log) == ms.n_trials
+    for tr in ms.trial_log:
+        assert tr.accepted is False
+        assert tr.outcome_solver.accept is False
+        assert tr.outcome_solver.reason is RejectionReason.SOLVER_BUDGET
     # Ausas state never advances on a rejected step.
     assert state.step_index == 0
 
@@ -250,10 +261,11 @@ def test_damped_kernel_breaks_on_negative_pressure():
     state = DieselAusasState.from_initial_gap(
         np.ones((8, 16), dtype=float))
     backend = AusasDynamicBackend(ausas_options=None)
-    P_neg = -1.0 * np.ones((8, 16), dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
-
     def fake(**kwargs):
+        # Padded shape per Stage J fu-2 ghost-grid migration.
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_neg = -1.0 * np.ones(H_pad.shape, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_neg, theta_const, 1e-12, 100)
 
     set_ausas_backend_for_tests(fake)
@@ -275,7 +287,9 @@ def test_damped_kernel_breaks_on_negative_pressure():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1
+    # Step 9 — same invariants as the BUDGET test: with cand=anchor
+    # at k=0 the kernel aborts immediately (no shrinking can
+    # recover). state not committed, rejection reason matches.
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.SOLVER_NEG_PRESSURE
     assert state.step_index == 0

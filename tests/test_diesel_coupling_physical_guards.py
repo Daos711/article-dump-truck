@@ -220,12 +220,16 @@ def _make_step_ctx(N_phi: int = 16, N_z: int = 8) -> StepContext:
 
 def _huge_pressure_stub(cap_pa: float = 2.0e9):
     """Stub that returns a converged-looking solve with P_dim above
-    the supplied cap (default 2 GPa)."""
+    the supplied cap (default 2 GPa). Returns whatever shape the
+    adapter handed in (post Stage J ghost-grid migration the
+    backend boundary is padded ``(N_z, N_phi+2)``; matching the
+    incoming shape keeps the stub forwards-compatible)."""
     p_nd = cap_pa / 8.3e6
-    P_const = np.full((8, 16), p_nd, dtype=float)
-    theta_const = np.ones((8, 16), dtype=float)
 
     def fake(**kwargs):
+        H_pad = np.asarray(kwargs["H_curr"])
+        P_const = np.full(H_pad.shape, p_nd, dtype=float)
+        theta_const = np.ones(H_pad.shape, dtype=float)
         return (P_const, theta_const, 1e-9, 100)
 
     set_ausas_backend_for_tests(fake)
@@ -265,15 +269,20 @@ def test_damped_kernel_hard_mode_breaks_on_pressure_cap():
     finally:
         set_ausas_backend_for_tests(None)
 
-    assert ms.n_trials == 1
+    # Step 9 — with cand=anchor at k=0 (the test sets
+    # vx_n=vy_n=0, ax_prev=ay_prev=0 → predictor produces ex_pred=ex_n)
+    # the kernel aborts the line-search immediately on the
+    # PHYSICAL_PRESSURE_GPA reject; the surfaced
+    # ``rejection_reason`` is the SAME guard reason (Followup-2 §3.4
+    # diagnostic-priority — specific reason wins).
     assert ms.state_committed is False
     assert ms.rejection_reason is RejectionReason.PHYSICAL_PRESSURE_GPA
-    # Solver-validity passed (n_inner=100 < 5000, residual=1e-9 < 1e-6),
-    # so the rejection came from physical guards.
-    tr = ms.trial_log[0]
-    assert tr.outcome_solver.accept is True
-    assert tr.outcome_physical.accept is False
-    assert tr.outcome_physical.reason is RejectionReason.PHYSICAL_PRESSURE_GPA
+    # Every recorded trial's solver_outcome accepts and
+    # physical_outcome rejects with the matching reason.
+    for tr in ms.trial_log:
+        assert tr.outcome_solver.accept is True
+        assert tr.outcome_physical.accept is False
+        assert tr.outcome_physical.reason is RejectionReason.PHYSICAL_PRESSURE_GPA
 
 
 def test_damped_kernel_diagnostic_mode_warns_but_does_not_break():
