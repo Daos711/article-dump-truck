@@ -152,18 +152,47 @@ def _per_step_rows(
     max_mech_inner: int, mech_relax_min: float,
 ) -> List[StepDiagnosticRow]:
     """Build ``StepDiagnosticRow`` instances for steps
-    ``[step_lo, step_hi)`` of config ``ic``."""
-    rejection_reasons = np.asarray(npz["stage_j_rejection_reason"])
-    fp_conv = np.asarray(npz["stage_j_fp_converged"])
-    n_trials = np.asarray(npz["stage_j_n_trials"])
-    mech_relax_min_seen = np.asarray(npz["stage_j_mech_relax_min_seen"])
-    ausas_n_inner = np.asarray(npz["ausas_n_inner"])
-    ausas_residual = np.asarray(npz["ausas_residual"])
-    ausas_converged = np.asarray(npz["ausas_converged"])
+    ``[step_lo, step_hi)`` of config ``ic``.
+
+    Defensive against archived npz files written before the
+    Step 10 / Bug-2 schema additions: each per-step array is
+    pulled with ``npz.get(...)`` and substituted with a same-
+    shape default (NaN / zero / True / False) if absent. The
+    classifier then bucket-shifts whatever signal IS available
+    (e.g. without ``ausas_residual``, residual-based rules don't
+    fire and the step routes through Picard / rejection-reason
+    rules instead). The full bucket contract still holds — the
+    sentinel ``unknown`` stays meaningful as "no rule matched in
+    the available signals."
+    """
     pmax = np.asarray(npz["pmax"])
+    n_cfg, n_steps_total = pmax.shape
+    rejection_reasons = np.asarray(npz.get(
+        "stage_j_rejection_reason",
+        np.full((n_cfg, n_steps_total), "", dtype=object)))
+    fp_conv = np.asarray(npz.get(
+        "stage_j_fp_converged",
+        np.zeros((n_cfg, n_steps_total), dtype=bool)))
+    n_trials = np.asarray(npz.get(
+        "stage_j_n_trials",
+        np.zeros((n_cfg, n_steps_total), dtype=np.int32)))
+    mech_relax_min_seen = np.asarray(npz.get(
+        "stage_j_mech_relax_min_seen",
+        np.full((n_cfg, n_steps_total), np.nan, dtype=float)))
+    ausas_n_inner = np.asarray(npz.get(
+        "ausas_n_inner",
+        np.zeros((n_cfg, n_steps_total), dtype=np.int32)))
+    ausas_residual = np.asarray(npz.get(
+        "ausas_residual",
+        np.full((n_cfg, n_steps_total), np.nan, dtype=float)))
+    # Stage J Bug 5 archives lack ``ausas_converged``; derive
+    # convergence from ``solver_success`` as a best-effort fallback
+    # so the rule set still bucketises something.
+    solver_success = np.asarray(npz["solver_success"])
+    ausas_converged = np.asarray(npz.get(
+        "ausas_converged", solver_success))
     theta_max = np.asarray(
         npz.get("ausas_theta_max", np.ones_like(pmax)))
-    solver_success = np.asarray(npz["solver_success"])
 
     rows: List[StepDiagnosticRow] = []
     for step in range(step_lo, step_hi):

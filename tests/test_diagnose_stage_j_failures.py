@@ -235,3 +235,36 @@ def test_diagnose_unknown_config_raises(tmp_path):
 def test_diagnose_missing_data_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         diagnose_run(str(tmp_path), config_filter="all")
+
+
+# ─── Archived-schema fallback (Stage J fu-2 Task 14 fixup) ─────────
+
+
+def test_diagnose_handles_archived_npz_without_ausas_residual(tmp_path):
+    """Archives written before the Bug-2 ``ausas_residual`` save
+    must not crash — defensive ``npz.get(..., default)`` lets the
+    classifier fall through to the Picard / rejection-reason rules
+    instead of KeyError'ing on a missing field."""
+    out = tmp_path / "archive_run"
+    out.mkdir()
+    n_steps = 10
+    np.savez(
+        os.path.join(str(out), "data.npz"),
+        labels=np.array(["legacy_cfg"], dtype=object),
+        phi_crank_deg=np.linspace(0.0, 360.0, n_steps),
+        last_start=int(n_steps // 2),
+        n_steps_per_cycle=int(n_steps // 2),
+        steps_completed=np.array([n_steps], dtype=np.int32),
+        steps_attempted=np.array([n_steps], dtype=np.int32),
+        aborted=np.array([False], dtype=bool),
+        abort_reason=np.array([""], dtype=object),
+        pmax=np.full((1, n_steps), 1e6, dtype=float),
+        solver_success=np.ones((1, n_steps), dtype=bool),
+        # Deliberately OMIT ausas_residual / ausas_converged /
+        # ausas_n_inner / stage_j_* — what an old archive looks
+        # like.
+    )
+    report = diagnose_run(str(out), config_filter="all")
+    assert "Config: legacy_cfg" in report
+    # No KeyError; report still produced.
+    assert "-- failures --" in report
