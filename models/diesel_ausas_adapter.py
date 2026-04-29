@@ -634,15 +634,51 @@ def _unpack_ausas_return(
         ``(P, theta, residual, n_inner, converged)``
             future-proofing extension that does include an explicit
             convergence flag.
-        ``dict(P=..., theta=..., residual=..., n_inner=...,
+        ``dict(P=..., theta=..., residual_linf=..., residual_rms=...,
+               residual_l2_abs=..., residual=..., n_inner=...,
                converged=...)``
-            keyword shape — every field optional except ``P`` and
-            ``theta``.
+            **canonical post-Task-12 dict shape** from the
+            gpu-reynolds Stage J fu-2 sync. Required keys:
+            ``P`` and ``theta``. Optional residual variants in
+            preference order:
+
+            * ``residual_linf``  — L∞ (max) norm. **Canonical** —
+              what the kernel's solver-validity gate compares
+              against ``ausas_tol`` (Task 12 contract); pre-Task-12
+              callers used a max-norm residual under the legacy
+              ``residual`` key, so the meaning is preserved.
+            * ``residual_rms``    — diagnostic RMS norm
+              (currently unused downstream).
+            * ``residual_l2_abs`` — diagnostic absolute L2 norm
+              (currently unused downstream).
+            * ``residual``       — legacy alias kept for
+              backward compatibility with shipping code that
+              hasn't migrated yet.
+
+            The canonical scalar returned in position 2 of the
+            5-tuple is, in order: ``residual_linf`` if present,
+            else ``residual``, else NaN. ``residual_rms`` and
+            ``residual_l2_abs`` are read but currently discarded
+            (the kernel only consumes one residual scalar — see
+            ``models.diesel_coupling.guards.check_solver_validity``);
+            adding them to ``DieselAusasStepResult`` would let the
+            npz schema surface them, but that's a follow-up that
+            depends on the kernel actually using either.
     """
     if isinstance(out, dict):
         P = np.asarray(out["P"])
         theta = np.asarray(out["theta"])
-        residual = float(out.get("residual", float("nan")))
+        # Canonical post-Task-12: ``residual_linf`` is the max-norm
+        # residual that the kernel's solver-validity gate compares
+        # against ``ausas_tol``. Fall back to legacy ``residual``
+        # (same semantics in shipping code) if the new key isn't
+        # present, then NaN as last resort.
+        if "residual_linf" in out:
+            residual = float(out["residual_linf"])
+        elif "residual" in out:
+            residual = float(out["residual"])
+        else:
+            residual = float("nan")
         n_inner = int(out.get("n_inner", 0))
         ok_explicit: Optional[bool] = (
             bool(out["converged"]) if "converged" in out else None)

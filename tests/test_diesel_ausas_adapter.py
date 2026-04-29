@@ -309,3 +309,131 @@ def test_set_backend_none_clears_cache_for_re_probe():
     set_ausas_backend_for_tests(backend2)
     assert _m._AUSAS_ONE_STEP_BACKEND is backend2
     set_ausas_backend_for_tests(None)
+
+
+# ─── Stage J fu-2 Task 12 sync — dict-API from gpu-reynolds ────────
+
+
+def test_unpack_canonical_dict_with_residual_linf():
+    """Post-Task-12 dict shape: ``residual_linf`` is the canonical
+    max-norm residual, mapped to position 2 of the 5-tuple."""
+    from models.diesel_ausas_adapter import _unpack_ausas_return
+    P_in = np.full((4, 8), 0.123)
+    theta_in = np.full((4, 8), 0.987)
+    out = dict(
+        P=P_in, theta=theta_in,
+        residual_linf=2.5e-7,
+        residual_rms=1.1e-7,
+        residual_l2_abs=4.2e-6,
+        n_inner=42,
+        converged=True,
+    )
+    P, theta, residual, n_inner, ok = _unpack_ausas_return(out)
+    assert np.array_equal(P, P_in)
+    assert np.array_equal(theta, theta_in)
+    assert residual == pytest.approx(2.5e-7)
+    assert n_inner == 42
+    assert ok is True
+
+
+def test_unpack_dict_residual_linf_wins_over_legacy_residual():
+    """When both ``residual_linf`` and the legacy ``residual`` are
+    present, ``residual_linf`` is canonical (Task 12 contract).
+    This avoids silent ambiguity in transitional builds that emit
+    both keys for backward compatibility."""
+    from models.diesel_ausas_adapter import _unpack_ausas_return
+    out = dict(
+        P=np.zeros((2, 4)),
+        theta=np.ones((2, 4)),
+        residual_linf=1e-9,
+        residual=1e-3,         # different value — must be ignored
+        n_inner=10, converged=True,
+    )
+    _, _, residual, _, _ = _unpack_ausas_return(out)
+    assert residual == pytest.approx(1e-9)
+
+
+def test_unpack_legacy_dict_residual_only():
+    """Pre-Task-12 dict shape: only the legacy ``residual`` key.
+    Mapped through to position 2 unchanged."""
+    from models.diesel_ausas_adapter import _unpack_ausas_return
+    out = dict(
+        P=np.zeros((2, 4)),
+        theta=np.ones((2, 4)),
+        residual=3.7e-5,
+        n_inner=15, converged=False,
+    )
+    _, _, residual, n_inner, ok = _unpack_ausas_return(out)
+    assert residual == pytest.approx(3.7e-5)
+    assert n_inner == 15
+    assert ok is False
+
+
+def test_unpack_dict_no_residual_keys_yields_nan():
+    """If neither ``residual_linf`` nor ``residual`` is present,
+    the canonical scalar falls back to NaN (no silent zero)."""
+    from models.diesel_ausas_adapter import _unpack_ausas_return
+    out = dict(
+        P=np.zeros((2, 4)),
+        theta=np.ones((2, 4)),
+        n_inner=5,
+    )
+    _, _, residual, _, ok = _unpack_ausas_return(out)
+    assert np.isnan(residual)
+    assert ok is None  # no ``converged`` key → derive downstream
+
+
+def test_unpack_dict_without_converged_flag():
+    """``converged`` key absent → ``ok_explicit=None`` so the
+    caller derives convergence from ``n_inner < max_inner`` and
+    ``residual <= tol`` (legacy contract preserved alongside the
+    new dict shape)."""
+    from models.diesel_ausas_adapter import _unpack_ausas_return
+    out = dict(
+        P=np.zeros((2, 4)),
+        theta=np.ones((2, 4)),
+        residual_linf=1e-7,
+        n_inner=8,
+    )
+    _, _, _, _, ok = _unpack_ausas_return(out)
+    assert ok is None
+
+
+def test_unpack_dict_via_live_adapter_call():
+    """End-to-end: install a fake backend that returns the new
+    dict-shape and verify ``ausas_one_step_with_state`` packages
+    the result correctly into ``DieselAusasStepResult``."""
+    def fake_dict_backend(**kwargs):
+        H = kwargs["H_curr"]
+        return dict(
+            P=0.25 * H,
+            theta=np.clip(H, 0.0, 1.0),
+            residual_linf=8.4e-8,
+            residual_rms=2.2e-8,
+            residual_l2_abs=9.1e-7,
+            n_inner=23,
+            converged=True,
+        )
+    set_ausas_backend_for_tests(fake_dict_backend)
+    try:
+        N_z, N_phi = 4, 8
+        H = np.full((N_z, N_phi), 0.5)
+        state = DieselAusasState.from_initial_gap(H)
+        result = ausas_one_step_with_state(
+            state,
+            H_curr=H, dt_s=1e-5, omega_shaft=200.0,
+            d_phi=2.0 * np.pi / N_phi, d_Z=2.0 / (N_z - 1),
+            R=0.1, L=0.14,
+            extra_options={"tol": 1e-6, "max_inner": 5000},
+            commit=True,
+        )
+        # The canonical residual stored in the result is
+        # ``residual_linf`` from the backend dict.
+        assert result.residual == pytest.approx(8.4e-8)
+        assert result.n_inner == 23
+        assert result.converged is True
+        # Shape on the unpadded physical grid (Bug 3 contract).
+        assert result.P_nd.shape == (N_z, N_phi)
+        assert result.theta.shape == (N_z, N_phi)
+    finally:
+        set_ausas_backend_for_tests(None)
