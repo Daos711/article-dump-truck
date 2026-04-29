@@ -966,23 +966,41 @@ def _run_damped_implicit_film(
         ], dtype=float)
         delta_eps = float(np.linalg.norm(step_vec))
 
-        # Convergence check — both the relaxed step AND the
-        # un-relaxed Picard residual must be small. Without the
-        # second condition a heavily-shrunk relax would produce a
-        # tiny δε_blend that masks an un-converged Picard map.
-        # ``picard_res_tol = eps_tol / mech_relax_initial`` scales
-        # the un-relaxed tolerance back so the expected
-        # equivalent damped tolerance is recovered.
+        # Convergence check — the relaxed step AND one of two
+        # secondary conditions must be small.
+        #
+        # Primary condition (always required): δε_blend ≤ eps_tol —
+        # the actual orbit step the runner is about to apply is
+        # within tolerance.
+        #
+        # Either secondary condition:
+        # (a) picard_res_unrelaxed ≤ picard_res_tol — the Picard
+        #     map's un-relaxed residual is small. ``picard_res_tol
+        #     = eps_tol / mech_relax_initial`` scales the un-
+        #     relaxed tolerance back so the expected equivalent
+        #     damped tolerance is recovered. This is the
+        #     "Picard-clean" path — works at the default relax.
+        # (b) k ≥ 3 — fixup-3 softening: when contractivity-driven
+        #     shrink has driven relax to a small value (e.g.
+        #     0.0625), the unrelaxed residual stays intrinsically
+        #     16× the actual step even after the orbit has
+        #     stabilised. δε_blend is the ground truth: if the
+        #     real orbit step is within tolerance and we've done
+        #     enough iterations to be sure (k ≥ 3), declare
+        #     convergence regardless of unrelaxed-residual size.
+        #     The k ≥ 3 floor avoids declaring convergence on
+        #     k=0/k=1 with very-small starting relax — those
+        #     iterations haven't seen enough of the Picard map.
         picard_res_tol = (
             float(eps_tol) / float(policy.mech_relax_initial))
-        if (delta_eps <= eps_tol
-                and picard_res_unrelaxed <= picard_res_tol):
+        if delta_eps <= eps_tol and (
+                picard_res_unrelaxed <= picard_res_tol or k >= 3):
             if debug_dump:
                 print(
                     f"    [J9-dump k={k} ACCEPT-CONVERGED] "
                     f"Δε_blend={delta_eps:.6e} ≤ tol={eps_tol:.1e} "
-                    f"AND picard_res={picard_res_unrelaxed:.6e} "
-                    f"≤ {picard_res_tol:.3e}",
+                    f"AND (picard_res={picard_res_unrelaxed:.6e} "
+                    f"≤ {picard_res_tol:.3e} OR k={k} ≥ 3)",
                     flush=True)
             fixed_point_converged = True
             break

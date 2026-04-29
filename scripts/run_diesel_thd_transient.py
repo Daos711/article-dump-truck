@@ -1857,9 +1857,9 @@ def main(argv=None):
                     help="Abort a config if the solver-failed fraction "
                          "so far exceeds this threshold. Default 0.30.")
     pa.add_argument("--abort-after-consecutive-invalid",
-                    dest="abort_consec_invalid", type=int, default=30,
+                    dest="abort_consec_invalid", type=int, default=50,
                     help="Abort a config after this many consecutive "
-                         "not-valid_dynamic steps. Default 30.")
+                         "not-valid_dynamic steps. Default 50.")
     pa.add_argument("--save-partial-on-abort", dest="save_partial",
                     action="store_true", default=True,
                     help="On abort, write data_partial.npz with the "

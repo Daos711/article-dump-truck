@@ -1638,9 +1638,40 @@ def run_transient(F_max=None, debug=False,
             coupling_n_trials_all[ic, step] = int(_ms.n_trials)
             coupling_rejection_reason_all[ic, step] = (
                 _ms.rejection_reason.value)
-            ex, ey = _ms.eps_x_new, _ms.eps_y_new
-            vx, vy = _ms.vx_new, _ms.vy_new
-            ax_prev, ay_prev = _ms.ax_new, _ms.ay_new
+            # Stage J fu-2 fixup-3 — runner-side reaction to kernel
+            # Picard no-advance. On ``_ms.accepted=False`` the kernel
+            # already rolled mechanics back to start-of-step values
+            # (ex_n/ey_n/vx_n/vy_n/ax_prev/ay_prev) and zeroed the
+            # trial outputs, but the per-step plotting arrays
+            # (eps_x_all etc.) are written unconditionally below
+            # from ``ex/ey/Fx_hyd/Fy_hyd``. Without this branch the
+            # rollback step is silently logged as "orbit at the
+            # previous accepted point" — looks like a successful
+            # zero-Δε advance to envelope classification, which then
+            # never trips ``solver_fail_frac_max`` and lets the run
+            # continue indefinitely with a frozen orbit. Branch
+            # explicitly so the no-advance intent is visible to the
+            # reader (and to skip silent state mutation when both
+            # the kernel and the runner already agree the step
+            # didn't happen).
+            if _ms.accepted:
+                ex, ey = _ms.eps_x_new, _ms.eps_y_new
+                vx, vy = _ms.vx_new, _ms.vy_new
+                ax_prev, ay_prev = _ms.ax_new, _ms.ay_new
+            else:
+                # Pre-call values: ``ex_n / ey_n / vx_n / vy_n``
+                # were saved at start-of-step (≈line 1535-1536);
+                # ``ax_prev / ay_prev`` are still the inputs to
+                # this kernel call (the lines that overwrote them
+                # were skipped). Explicit assignment from the
+                # pre-call vars rather than ``_ms.*_new`` makes
+                # the no-advance intent obvious and avoids relying
+                # on the kernel's identity echo to keep state in
+                # sync.
+                ex, ey = ex_n, ey_n
+                vx, vy = vx_n, vy_n
+                # ``ax_prev / ay_prev`` are unchanged — the
+                # rollback assignment is a no-op.
             P = _ms.P_nd_committed
             H = _ms.H_committed
             Fx_hyd = _ms.Fx_hyd_committed
@@ -1788,6 +1819,27 @@ def run_transient(F_max=None, debug=False,
             Nloss_all[ic, step] = P_loss_step
             Fx_hyd_all[ic, step] = Fx_hyd
             Fy_hyd_all[ic, step] = Fy_hyd
+            # Stage J fu-2 fixup-3 — Picard no-advance: explicit
+            # NaN on the per-step plotting arrays so envelope
+            # classification (valid_dynamic, AUC, max-ε) treats
+            # the step as invalid. h_min/p_max/F_friction/mu_val/
+            # Fx_hyd/Fy_hyd are already NaN via the
+            # ``solve_ok=False`` else branch above and the kernel's
+            # rollback returns; eps_x_all / eps_y_all are written
+            # from ``ex / ey`` which on rollback equal the pre-call
+            # orbit position (last accepted point), so they need
+            # an explicit override. The redundant NaN-writes for
+            # the other six are intentional — they make the
+            # rollback contract independent of upstream details.
+            if not _ms.accepted:
+                eps_x_all[ic, step] = float("nan")
+                eps_y_all[ic, step] = float("nan")
+                hmin_all[ic, step] = float("nan")
+                pmax_all[ic, step] = float("nan")
+                f_all[ic, step] = float("nan")
+                Ftr_all[ic, step] = float("nan")
+                Fx_hyd_all[ic, step] = float("nan")
+                Fy_hyd_all[ic, step] = float("nan")
             # Stage J Bug 4 follow-up — record both force vectors and
             # the dot-product projection of F_hyd onto the resisting
             # direction (-F_ext). A physically scaled hydrodynamic
