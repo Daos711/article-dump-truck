@@ -33,6 +33,13 @@ from .backends import (
     PressureSolveResult,
     StepContext,
 )
+from .failure_classifier import (
+    BucketCounts,
+    FAILURE_BUCKETS,
+    StepDiagnosticRow,
+    aggregate_buckets,
+    classify_failure,
+)
 from .guards import (
     GuardOutcome,
     GuardsMode,
@@ -59,7 +66,9 @@ from .policies import (
 
 __all__ = [
     "AusasDynamicBackend",
+    "BucketCounts",
     "CouplingPolicy",
+    "FAILURE_BUCKETS",
     "GuardOutcome",
     "GuardsMode",
     "GuardsProfile",
@@ -72,11 +81,14 @@ __all__ = [
     "PressureSolveResult",
     "RejectionReason",
     "StepContext",
+    "StepDiagnosticRow",
     "TrialRecord",
     "advance_mechanical_step",
+    "aggregate_buckets",
     "check_mechanical_candidate",
     "check_physical_guards",
     "check_solver_validity",
+    "classify_failure",
     "resolve_policy",
     "resolve_policy_overrides",
     "select_policy",

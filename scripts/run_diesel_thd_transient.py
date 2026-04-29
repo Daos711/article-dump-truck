@@ -43,6 +43,11 @@ import matplotlib.pyplot as plt
 from models.diesel_transient import (
     CONFIGS, CONFIG_KEYS, EnvelopeAbortConfig, run_transient,
 )
+from models.diesel_coupling import (
+    FAILURE_BUCKETS,
+    StepDiagnosticRow,
+    aggregate_buckets,
+)
 from models.thermal_coupling import ThermalConfig
 from models.diesel_quasistatic import SolverRetryConfig
 from config import diesel_params as params
@@ -620,6 +625,124 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             for reason, n in sorted(
                     counts.items(), key=lambda kv: -kv[1]):
                 lines.append(f"    {reason:32s}: {n}")
+        lines.append("")
+
+    # Stage J fu-2 Task 14.1 — per-config failure-bucket breakdown.
+    # The classifier needs every per-step diagnostic array PLUS the
+    # solver-side scalars. We emit the block only when the per-step
+    # arrays are present (i.e. modern run; old saved runs that
+    # pre-date Step 10 don't have them and the block stays silent).
+    _solver_success_arr = results.get("solver_success")
+    _ausas_n_inner_arr = results.get("ausas_n_inner")
+    _ausas_residual_arr = results.get("ausas_residual")
+    _ausas_converged_arr = results.get("ausas_converged")
+    _theta_max_arr = results.get("ausas_theta_max")
+    _pmax_arr = results.get("pmax")
+    if (_picard_shrinks_arr is not None
+            and _solver_success_arr is not None
+            and _ausas_n_inner_arr is not None
+            and _ausas_residual_arr is not None
+            and _ausas_converged_arr is not None
+            and _pmax_arr is not None
+            and _fp_conv_arr is not None
+            and _n_trials_arr is not None
+            and _rej_reason_arr is not None
+            and _mech_relax_arr is not None):
+        # Resolve scalar thresholds from the run's ausas_options /
+        # observed-relax envelope. Conservative defaults if absent —
+        # mirrors the diagnose_stage_j_failures.py logic.
+        _aopts = results.get("ausas_options") or {}
+        _ausas_tol_run = float(_aopts.get("tol", 1e-6))
+        _ausas_max_inner_run = int(_aopts.get("max_inner", 5000))
+        _max_mech_inner_run = (int(np.max(_n_trials_arr))
+                                if _n_trials_arr.size > 0
+                                else 8)
+        if _max_mech_inner_run < 8:
+            _max_mech_inner_run = 8
+        _finite_relax = _mech_relax_arr[np.isfinite(_mech_relax_arr)]
+        _mech_relax_min_run = (float(np.min(_finite_relax))
+                                if _finite_relax.size > 0
+                                else 0.03125)
+        if _mech_relax_min_run >= 0.03125:
+            _mech_relax_min_run = 0.03125
+
+        cfgs_local = results["configs"]
+        steps_completed_arr = np.asarray(
+            results.get("steps_completed",
+                          np.array([_solver_success_arr.shape[1]]
+                                   * len(cfgs_local), dtype=int)))
+        phi_crank_deg_arr = np.asarray(results["phi_crank_deg"])
+        # Firing sector — same default as the runner CLI.
+        _firing_lo = float(results.get("peak_lo_deg", 330.0))
+        _firing_hi = float(results.get("peak_hi_deg", 480.0))
+        _last_start = int(results.get("last_start", 0))
+
+        lines.append("Stage J: failure breakdown (per config)")
+        lines.append(
+            "  bucket                        full    last    firing")
+        for ic, cfg in enumerate(cfgs_local):
+            n_real = int(steps_completed_arr[ic])
+            if n_real <= 0:
+                continue
+            rows_full = []
+            for step in range(n_real):
+                rr_raw = _rej_reason_arr[ic, step]
+                rr = "" if rr_raw is None else str(rr_raw)
+                rows_full.append(StepDiagnosticRow(
+                    is_failure=not bool(_solver_success_arr[ic, step]),
+                    rejection_reason=rr,
+                    ausas_n_inner=int(_ausas_n_inner_arr[ic, step]),
+                    ausas_residual=float(
+                        _ausas_residual_arr[ic, step]),
+                    ausas_converged=bool(
+                        _ausas_converged_arr[ic, step]),
+                    p_max=float(_pmax_arr[ic, step]),
+                    theta_max=(float(_theta_max_arr[ic, step])
+                                if _theta_max_arr is not None
+                                else 1.0),
+                    fp_converged=bool(_fp_conv_arr[ic, step]),
+                    n_trials=int(_n_trials_arr[ic, step]),
+                    mech_relax_min_seen=float(
+                        _mech_relax_arr[ic, step]),
+                    ausas_tol=_ausas_tol_run,
+                    ausas_max_inner=_ausas_max_inner_run,
+                    max_mech_inner=_max_mech_inner_run,
+                    mech_relax_min=_mech_relax_min_run,
+                ))
+            last_lo = max(_last_start, 0)
+            rows_last = rows_full[last_lo:n_real]
+            phi = phi_crank_deg_arr[:n_real] % 720.0
+            firing_mask = ((phi >= _firing_lo) & (phi <= _firing_hi))
+            rows_firing = [r for r, m in zip(rows_full, firing_mask)
+                            if m]
+            counts_full = aggregate_buckets(rows_full)
+            counts_last = aggregate_buckets(rows_last)
+            counts_firing = aggregate_buckets(rows_firing)
+            lines.append(f"  -- {cfg['label']!r} --")
+            for bucket in FAILURE_BUCKETS:
+                if bucket == "ok":
+                    continue
+                nf = counts_full.per_bucket.get(bucket, 0)
+                nl = counts_last.per_bucket.get(bucket, 0)
+                nfir = counts_firing.per_bucket.get(bucket, 0)
+                if nf == 0 and nl == 0 and nfir == 0:
+                    continue
+                lines.append(
+                    f"    {bucket:<26} {nf:>5d}   "
+                    f"{nl:>5d}   {nfir:>5d}")
+            lines.append(
+                f"    {'-- failures --':<26} "
+                f"{counts_full.n_failures:>5d}   "
+                f"{counts_last.n_failures:>5d}   "
+                f"{counts_firing.n_failures:>5d}")
+            dom = counts_full.dominant_failure_bucket()
+            if dom is not None:
+                n_dom = counts_full.per_bucket.get(dom, 0)
+                frac = counts_full.frac_of_failures(dom)
+                lines.append(
+                    f"    dominant (full)            : {dom} "
+                    f"({n_dom}/{counts_full.n_failures}"
+                    f" = {frac:.0%})")
         lines.append("")
 
     # Groove geometry block — only emitted when the run actually
