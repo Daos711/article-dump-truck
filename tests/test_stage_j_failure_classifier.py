@@ -207,17 +207,16 @@ def test_classifier_unknown_sentinel():
 # ─── Priority / tie-break tests ────────────────────────────────────
 
 
-def test_solver_budget_wins_over_picard():
-    """If both Ausas budget exhausted AND Picard fp_converged=False,
-    the classifier reports the underlying solver issue rather than
-    the symptom on the Picard side. That's what the rule order in
-    the docstring promises (solver before Picard before tags)."""
+def test_explicit_picard_reason_wins_over_numerical_budget():
+    """The kernel's emitted ``damped_picard_not_converged`` rejection
+    reason is the canonical signal — even when numerical signals
+    look like solver_budget. The kernel knows whether the budget
+    exhaustion drove the Picard failure or the Picard failure was
+    independent; we trust its tag."""
     s = _make_step(
         ausas_n_inner=5000, ausas_max_inner=5000,
         ausas_residual=1e-3, ausas_tol=1e-4,
         ausas_converged=False,
-        # Picard side ALSO looks bad — but the solver issue is
-        # the root cause.
         rejection_reason=(
             "damped_picard_not_converged after 64/64 trials; "
             "min_relax=0.0156; last_delta_eps=1e-2"),
@@ -225,16 +224,50 @@ def test_solver_budget_wins_over_picard():
         mech_relax_min_seen=0.015625,
         mech_relax_min=0.015625,
     )
-    assert classify_failure(s) == "solver_budget"
+    assert classify_failure(s) == "picard_not_converged"
 
 
-def test_solver_nonfinite_wins_over_solver_budget():
-    """Non-finite outputs are reported even if budget was also
-    exhausted — non-finite is more specific."""
+def test_numerical_solver_budget_wins_over_picard_when_no_reason():
+    """Without an explicit rejection_reason, numerical signals
+    drive the classification. Budget exhaustion (n_inner == max
+    AND residual > tol) wins over Picard's fp_converged=False
+    via fallback rule order."""
     s = _make_step(
         ausas_n_inner=5000, ausas_max_inner=5000,
         ausas_residual=1e-3, ausas_tol=1e-4,
         ausas_converged=False,
+        rejection_reason="",  # no explicit tag
+        fp_converged=False, n_trials=64, max_mech_inner=64,
+        mech_relax_min_seen=0.015625,
+        mech_relax_min=0.015625,
+    )
+    assert classify_failure(s) == "solver_budget"
+
+
+def test_explicit_solver_budget_reason_wins_over_nonfinite_pmax():
+    """The runner sets pmax=NaN on every failed step regardless of
+    cause. When the kernel ALSO emits an explicit
+    ``solver_n_inner_at_max`` tag, the explicit tag must win — not
+    the numerical "p_max is NaN" fallback. This is the regression
+    that the B'-result diagnose surfaced (every step bucketed as
+    solver_nonfinite when the truth was solver_budget)."""
+    s = _make_step(
+        ausas_n_inner=5000, ausas_max_inner=5000,
+        ausas_residual=1e-3, ausas_tol=1e-4,
+        ausas_converged=False,
+        rejection_reason="solver_n_inner_at_max",
+        p_max=float("nan"),
+        theta_max=float("nan"),
+    )
+    assert classify_failure(s) == "solver_budget"
+
+
+def test_numerical_nonfinite_fallback_when_no_reason(tmp_path=None):
+    """If pmax/theta_max non-finite AND no explicit reason, fall
+    back to ``solver_nonfinite`` (best-effort signal for archived
+    runs)."""
+    s = _make_step(
+        rejection_reason="",
         p_max=float("nan"),
     )
     assert classify_failure(s) == "solver_nonfinite"
