@@ -508,30 +508,90 @@ def get_step_deg(phi_deg, *, d_phi_base_deg: Optional[float] = None,
 
 def texture_resolution_diagnostic(
     N_phi: int, N_z: int,
+    *,
     R: float, L: float,
-    a_dim: float, b_dim: float,
+    texture_kind: str = "dimple",
+    a_dim: Optional[float] = None,
+    b_dim: Optional[float] = None,
+    w_branch_angle_rad: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Diagnose whether a (Nφ × N_Z) grid resolves the elliptical
-    texture pocket. ``a_dim`` and ``b_dim`` are physical axial and
-    circumferential semi-axes (meters), matching ``DieselParams``.
-    Pocket full angular width = 2·b_dim/R rad; full non-dim axial
-    width = 4·a_dim/L (since physical z = (L/2)·Z so Z ∈ [-1, +1]).
-    Returns cells per pocket in each direction, a categorical
-    ``resolution_status`` ('ok' / 'marginal' / 'insufficient'), and
-    the minimum Nφ at which cells_per_pocket_phi reaches 4.
+    """Diagnose whether a (Nφ × N_Z) grid resolves the active texture
+    feature. Branches on ``texture_kind``:
+
+    * ``"dimple"`` — elliptical pocket geometry. Requires the
+      DieselParams semi-axes ``a_dim`` (axial, meters) and ``b_dim``
+      (circumferential, meters). Pocket full angular width is
+      ``2·b_dim/R`` rad; full non-dim axial width is ``4·a_dim/L``
+      (physical z = (L/2)·Z, Z ∈ [-1, +1]). Returns
+      ``cells_per_pocket_phi`` / ``cells_per_pocket_z``.
+    * ``"groove"`` — herringbone branch geometry. Requires
+      ``w_branch_angle_rad`` (the angular branch width on the Phi
+      grid; numerically equal to ``w_g_m / R_m``, see
+      ``config/diesel_groove_presets.py``). Returns
+      ``cells_per_groove_width_phi`` (axial direction is
+      well-resolved by L_branch ≈ 0.85·half-shell at any reasonable
+      N_z, so it isn't a binding constraint).
+
+    Returned ``resolution_status`` is the same three-level enum on
+    both paths: ``ok`` (≥6 cells across the small length-scale),
+    ``marginal`` (4–5), ``insufficient`` (<4). The
+    ``recommended_n_phi_min`` is the smallest N_phi giving 4 cells
+    across the active feature width.
     """
     N_phi = int(N_phi)
     N_z = int(N_z)
-    cells_per_pocket_phi = float(N_phi) * float(b_dim) / (np.pi * float(R))
-    cells_per_pocket_z = 2.0 * float(N_z) * float(a_dim) / float(L)
+    R = float(R)
+    L = float(L)
+    if texture_kind == "groove":
+        if w_branch_angle_rad is None:
+            raise ValueError(
+                "texture_resolution_diagnostic(texture_kind='groove')"
+                " requires w_branch_angle_rad (the angular branch "
+                "width in radians, = w_g/R; see "
+                "config.diesel_groove_presets.resolve_groove_preset).")
+        w_rad = float(w_branch_angle_rad)
+        if w_rad <= 0.0:
+            raise ValueError(
+                "w_branch_angle_rad must be positive; got "
+                f"{w_rad}")
+        cells_per_groove_width_phi = (
+            float(N_phi) * w_rad / (2.0 * np.pi))
+        if cells_per_groove_width_phi >= 6.0:
+            status = "ok"
+        elif cells_per_groove_width_phi >= 4.0:
+            status = "marginal"
+        else:
+            status = "insufficient"
+        recommended_n_phi_min = int(np.ceil(
+            4.0 * 2.0 * np.pi / w_rad))
+        return {
+            "texture_kind": "groove",
+            "N_phi": N_phi,
+            "N_z": N_z,
+            "w_branch_angle_rad": w_rad,
+            "cells_per_groove_width_phi": cells_per_groove_width_phi,
+            "resolution_status": status,
+            "recommended_n_phi_min": recommended_n_phi_min,
+        }
+    # Default / dimple path — preserves the legacy contract.
+    if a_dim is None or b_dim is None:
+        raise ValueError(
+            "texture_resolution_diagnostic(texture_kind='dimple') "
+            "requires a_dim and b_dim (DieselParams pocket semi-"
+            "axes in meters).")
+    a_dim_f = float(a_dim)
+    b_dim_f = float(b_dim)
+    cells_per_pocket_phi = float(N_phi) * b_dim_f / (np.pi * R)
+    cells_per_pocket_z = 2.0 * float(N_z) * a_dim_f / L
     if cells_per_pocket_phi >= 6.0:
         status = "ok"
     elif cells_per_pocket_phi >= 4.0:
         status = "marginal"
     else:
         status = "insufficient"
-    recommended_n_phi_min = int(np.ceil(4.0 * np.pi * float(R) / float(b_dim)))
+    recommended_n_phi_min = int(np.ceil(4.0 * np.pi * R / b_dim_f))
     return {
+        "texture_kind": "dimple",
         "N_phi": N_phi,
         "N_z": N_z,
         "cells_per_pocket_phi": cells_per_pocket_phi,
@@ -1266,22 +1326,56 @@ def run_transient(F_max=None, debug=False,
                 f"{groove_relief_stats['relief_min']:.3e}).")
 
     # Stage Diesel Transient PeakWindow GridDiagnostic — diagnose
-    # whether the chosen Nφ × N_Z grid resolves the elliptical
-    # texture pocket. The diagnostic depends only on grid + global
+    # whether the chosen Nφ × N_Z grid resolves the active texture
+    # feature. The diagnostic depends only on grid + global
     # bearing geometry, so it is the same for every textured config.
-    texture_res_diag = texture_resolution_diagnostic(
-        N_phi_eff, N_z_eff,
-        R=params.R, L=params.L,
-        a_dim=params.a_dim, b_dim=params.b_dim,
-    )
-    if texture_res_diag["resolution_status"] == "insufficient":
-        print(
-            "  [WARN] texture pocket under-resolved: "
-            f"cells_per_pocket_phi="
-            f"{texture_res_diag['cells_per_pocket_phi']:.2f} < 4 "
-            f"(N_phi={N_phi_eff}; recommend N_phi >= "
-            f"{texture_res_diag['recommended_n_phi_min']})"
+    #
+    # Stage J fu-2 fixup-1: branch on ``texture_kind`` so groove
+    # runs are evaluated against the actual herringbone branch
+    # width (``w_branch_angle_rad`` from the preset), not the
+    # legacy dimple semi-axes ``params.a_dim`` / ``params.b_dim``
+    # which describe a different texture model entirely.
+    if texture_kind == "groove" and groove_preset_resolved is not None:
+        texture_res_diag = texture_resolution_diagnostic(
+            N_phi_eff, N_z_eff,
+            R=params.R, L=params.L,
+            texture_kind="groove",
+            w_branch_angle_rad=float(
+                groove_preset_resolved["w_branch_angle_rad"]),
         )
+        if texture_res_diag["resolution_status"] == "insufficient":
+            print(
+                "  [WARN] groove branch width under-resolved: "
+                f"cells_per_groove_width_phi="
+                f"{texture_res_diag['cells_per_groove_width_phi']:.2f}"
+                " < 4 "
+                f"(N_phi={N_phi_eff}; recommend N_phi >= "
+                f"{texture_res_diag['recommended_n_phi_min']})"
+            )
+        elif texture_res_diag["resolution_status"] == "marginal":
+            print(
+                "  [WARN] groove branch width marginal: "
+                f"cells_per_groove_width_phi="
+                f"{texture_res_diag['cells_per_groove_width_phi']:.2f}"
+                " in [4, 6) — consider N_phi >= "
+                f"{texture_res_diag['recommended_n_phi_min']}*1.5 "
+                "for production accuracy."
+            )
+    else:
+        texture_res_diag = texture_resolution_diagnostic(
+            N_phi_eff, N_z_eff,
+            R=params.R, L=params.L,
+            texture_kind="dimple",
+            a_dim=params.a_dim, b_dim=params.b_dim,
+        )
+        if texture_res_diag["resolution_status"] == "insufficient":
+            print(
+                "  [WARN] dimple pocket under-resolved: "
+                f"cells_per_pocket_phi="
+                f"{texture_res_diag['cells_per_pocket_phi']:.2f} < 4 "
+                f"(N_phi={N_phi_eff}; recommend N_phi >= "
+                f"{texture_res_diag['recommended_n_phi_min']})"
+            )
 
     omega = 2 * np.pi * params.n / 60.0
     U = omega * params.R

@@ -421,7 +421,13 @@ def ausas_one_step_with_state(
     extra_options
         Optional dict merged into the solver kwargs (e.g.
         ``omega_p``, ``omega_theta``, ``alpha``, ``tol``,
-        ``max_inner``, ``check_every``, ``scheme``).
+        ``max_inner``, ``check_every``). ``scheme`` is intentionally
+        NOT documented here — the one-step GPU solver implements
+        only Jacobi sweeps; passing ``scheme`` would either be
+        ignored or raise on the GPU side, depending on the
+        ``ausas_unsteady_one_step_gpu`` signature in the active
+        ``gpu-reynolds`` build. Stage J fu-2 fixup-1 removed the
+        corresponding ``--ausas-scheme`` CLI flag.
     commit
         When ``False`` the state is **not** mutated — used for the
         Verlet trial path. When ``True`` the wrapper writes the new

@@ -90,12 +90,16 @@ def resolve_groove_preset(
     """Resolve a named preset against the diesel bearing geometry.
 
     Returns a dict that ``build_herringbone_groove_relief`` accepts
-    directly — depth_nondim = dg/c, w_branch_nondim = wg / D.
+    directly — depth_nondim = dg/c, w_branch_nondim = wg / R (the
+    angular branch width in radians on the Phi grid).
 
-    The diagnostic ratios ``d_g_over_c`` and ``w_g_over_D`` are
-    included so the summary writer can echo them back. The original
-    metric inputs (``d_g_um``, ``w_g_mm``) are echoed verbatim so the
-    user can check them at a glance.
+    The diagnostic ratios ``d_g_over_c``, ``w_g_over_D``, and
+    ``w_branch_angle_rad`` are included so the summary writer can
+    echo them back. ``w_branch_angle_rad`` is numerically equal to
+    ``w_branch_nondim`` and exists to make the unit (radians)
+    obvious to the reader. The original metric inputs
+    (``d_g_um``, ``w_g_mm``) are echoed verbatim so the user can
+    check them at a glance.
     """
     if name not in GROOVE_PRESETS:
         raise KeyError(
@@ -107,14 +111,24 @@ def resolve_groove_preset(
     w_g_m = float(src["w_g_mm"]) * 1e-3
     D_m = 2.0 * float(R_m)
     depth_nondim = d_g_m / float(c_m)
-    # w_branch_nondim is non-dimensionalised by the bearing diameter
-    # (matches the v4 builder's wg / D convention; the builder
-    # measures circumferential angular width in radians via ``phi`` so
-    # w_branch_nondim is treated as a half-angle multiplier — the
-    # v4 builder applies it as |dphi| <= 0.5 * w_local in radians on
-    # a unit circle, which is consistent with wg / D after scaling
-    # by 2π).
-    w_branch_nondim = (w_g_m / D_m) * 2.0 * 3.141592653589793
+    # Stage J fu-2 — geometry-fixup-1 (expert review).
+    # ``w_branch_nondim`` is the **circumferential angular width**
+    # of one groove branch, in radians, on the Phi grid that the
+    # builder operates on (φ ∈ [0, 2π)). The builder compares
+    # ``|Phi - phi_c| <= 0.5 * w_local`` directly against ``Phi``,
+    # so the unit must be radians.
+    #
+    # Physical mapping: arc_length = angle × R. So for a groove of
+    # physical circumferential width ``w_g`` on a journal of radius
+    # ``R``, the angular width in radians is ``w_g / R``.
+    #
+    # The previous formula ``(w_g / D) * 2π = π * w_g / R`` produced
+    # a width π× too large (e.g. on the diesel R=100 mm bearing,
+    # ``w_g=14.8 mm`` came out as 0.465 rad ≈ 26.6° instead of the
+    # honest 0.148 rad ≈ 8.5°). With every branch swallowing ~3×
+    # the protected sector, the textured smoke at F=0.3 aborted on
+    # the firing peak — a geometry bug, not a physics result.
+    w_branch_nondim = w_g_m / float(R_m)
     out = dict(
         # Pass-through builder kwargs.
         variant=str(src["variant"]),
@@ -135,6 +149,13 @@ def resolve_groove_preset(
         w_g_mm=float(src["w_g_mm"]),
         d_g_over_c=depth_nondim,
         w_g_over_D=w_g_m / D_m,
+        # Stage J fu-2 — geometry-fixup-1: explicit angular-width
+        # echo so the diagnostic / summary writer can quote the
+        # physical groove footprint without re-deriving from
+        # w_branch_nondim. Numerically equal to w_branch_nondim,
+        # named differently to make the unit (radians) obvious to
+        # the reader.
+        w_branch_angle_rad=w_branch_nondim,
         preset_name=name,
     )
     return out

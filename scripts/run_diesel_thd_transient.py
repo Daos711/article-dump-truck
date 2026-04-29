@@ -471,27 +471,67 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     # pocket resolution block (independent of configs; same for all
     # textured rows since geometry + grid are run-global).
     if tex_diag:
-        cpp_phi = float(tex_diag.get("cells_per_pocket_phi", float("nan")))
-        cpp_z = float(tex_diag.get("cells_per_pocket_z", float("nan")))
+        # Stage J fu-2 fixup-1 — branch on which texture feature was
+        # actually diagnosed (dimple pocket vs. groove branch width).
+        tex_diag_kind = str(tex_diag.get("texture_kind", "dimple"))
         status_str = str(tex_diag.get("resolution_status", "unknown"))
         rec_n_phi = int(tex_diag.get("recommended_n_phi_min", 0))
         lines.append("texture resolution :")
-        lines.append(
-            f"  cells_per_pocket_phi : {cpp_phi:.2f}  "
-            f"(N_phi={n_phi_grid})"
-        )
-        lines.append(
-            f"  cells_per_pocket_z   : {cpp_z:.2f}  "
-            f"(N_z={n_z_grid})"
-        )
-        lines.append(f"  resolution_status    : {status_str}")
-        lines.append(f"  recommended_N_phi_min (cells>=4) : {rec_n_phi}")
-        if status_str == "insufficient":
+        if tex_diag_kind == "groove":
+            cgw_phi = float(tex_diag.get(
+                "cells_per_groove_width_phi", float("nan")))
+            w_rad = float(tex_diag.get(
+                "w_branch_angle_rad", float("nan")))
             lines.append(
-                "  [WARN] texture pocket under-resolved "
-                f"(cells_per_pocket_phi={cpp_phi:.2f} < 4); "
-                f"increase --n-phi to >= {rec_n_phi}."
+                f"  texture_kind             : groove  "
+                f"(w_branch_angle_rad={w_rad:.4f} rad ≈ "
+                f"{np.rad2deg(w_rad):.2f}°)"
             )
+            lines.append(
+                f"  cells_per_groove_width_phi : {cgw_phi:.2f}  "
+                f"(N_phi={n_phi_grid})"
+            )
+            lines.append(f"  resolution_status        : {status_str}")
+            lines.append(
+                f"  recommended_N_phi_min (≥4 cells) : {rec_n_phi}")
+            if status_str == "insufficient":
+                lines.append(
+                    "  [WARN] groove branch width under-resolved "
+                    f"(cells_per_groove_width_phi={cgw_phi:.2f} < 4); "
+                    f"increase --n-phi to >= {rec_n_phi}."
+                )
+            elif status_str == "marginal":
+                lines.append(
+                    "  [WARN] groove branch width marginal "
+                    f"(cells_per_groove_width_phi={cgw_phi:.2f} in "
+                    "[4, 6)); for production accuracy consider "
+                    f"--n-phi >= {int(round(1.5 * rec_n_phi))}."
+                )
+        else:
+            cpp_phi = float(tex_diag.get(
+                "cells_per_pocket_phi", float("nan")))
+            cpp_z = float(tex_diag.get(
+                "cells_per_pocket_z", float("nan")))
+            lines.append(
+                f"  texture_kind         : dimple"
+            )
+            lines.append(
+                f"  cells_per_pocket_phi : {cpp_phi:.2f}  "
+                f"(N_phi={n_phi_grid})"
+            )
+            lines.append(
+                f"  cells_per_pocket_z   : {cpp_z:.2f}  "
+                f"(N_z={n_z_grid})"
+            )
+            lines.append(f"  resolution_status    : {status_str}")
+            lines.append(
+                f"  recommended_N_phi_min (cells>=4) : {rec_n_phi}")
+            if status_str == "insufficient":
+                lines.append(
+                    "  [WARN] dimple pocket under-resolved "
+                    f"(cells_per_pocket_phi={cpp_phi:.2f} < 4); "
+                    f"increase --n-phi to >= {rec_n_phi}."
+                )
         lines.append("")
 
     # Stage J — Ausas + groove block (echoed regardless of cavitation
@@ -514,9 +554,11 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
     if fidelity_used:
         lines.append(f"  fidelity preset       : {fidelity_used}")
     if cav_model == "ausas_dynamic":
-        lines.append(
-            "  Ausas scheme          : "
-            f"{ausas_opts.get('scheme', 'rb')}")
+        # Stage J fu-2 fixup-1 — ``Ausas scheme: rb`` line removed.
+        # The one-step solver path uses Jacobi sweeps; the previous
+        # hard-coded ``rb`` echo did not reflect the actual code
+        # path. Re-add once ``ausas_unsteady_one_step_gpu`` exposes
+        # an honest ``scheme`` parameter.
         lines.append(
             "  Ausas omega_p/theta   : "
             f"{ausas_opts.get('omega_p', 'default')} / "
@@ -1551,7 +1593,11 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         ("ausas_tol", "tol"),
         ("ausas_max_inner", "max_inner"),
         ("ausas_check_every", "check_every"),
-        ("ausas_scheme", "scheme"),
+        # ``ausas_scheme`` removed (Stage J fu-2 fixup-1 Task 3
+        # Variant B): the one-step solver implements only the
+        # Jacobi sweep, so passing ``scheme="rb"`` would either be
+        # silently ignored or raise on the GPU side. Re-add when
+        # RB lands in ``ausas_unsteady_one_step_gpu``.
     ):
         v = getattr(args, src_attr, None)
         if v is not None:
@@ -1703,8 +1749,11 @@ def main(argv=None):
     pa.add_argument("--n-phi", dest="n_phi", type=int, default=None,
                     help="Circumferential grid resolution Nφ. If "
                          "unspecified, falls back to --n-grid (legacy "
-                         "isotropic). Use a larger Nφ to resolve the "
-                         "texture pocket (cells_per_pocket >= 4).")
+                         "isotropic). Choose Nφ so the active texture "
+                         "feature is resolved with at least 4 cells "
+                         "across its small length-scale (dimple "
+                         "pocket: cells_per_pocket_phi >= 4; groove "
+                         "branch: cells_per_groove_width_phi >= 4).")
     pa.add_argument("--n-z", dest="n_z", type=int, default=None,
                     help="Axial grid resolution N_Z. If unspecified, "
                          "falls back to --n-grid (legacy isotropic).")
@@ -1743,8 +1792,20 @@ def main(argv=None):
                     type=int, default=None)
     pa.add_argument("--ausas-check-every", dest="ausas_check_every",
                     type=int, default=None)
-    pa.add_argument("--ausas-scheme", dest="ausas_scheme",
-                    choices=["rb", "jacobi"], default=None)
+    # Stage J fu-2 fixup-1 — ``--ausas-scheme`` removed.
+    # The CLI used to accept ``rb`` / ``jacobi`` and the summary
+    # writer hardcoded ``Ausas scheme: rb`` regardless of what
+    # ``ausas_unsteady_one_step_gpu`` actually does. In the
+    # one-step (Verlet) path the GPU solver implements only
+    # ``jacobi``-style sweeps; the RB code lives on the
+    # prescribed-h / journal-dynamic loop and was never plumbed
+    # through to ``ausas_unsteady_one_step_gpu``. Exposing the
+    # flag without a real implementation produced misleading
+    # summary lines and would have failed downstream as
+    # ``unexpected keyword argument 'scheme'``. Re-introduce only
+    # after RB is implemented in
+    # ``reynolds_solver/cavitation/ausas/solver_dynamic_gpu.py``
+    # (Stage J fu-2 plan, Task 3 Variant A — gpu-reynolds repo).
     pa.add_argument("--save-field-checkpoints",
                     dest="save_field_checkpoints",
                     action="store_true", default=False,

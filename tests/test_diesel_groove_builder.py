@@ -141,6 +141,64 @@ def test_g4_scaled_ratio_conversion():
     assert pr["chirality"] == "pump_to_edge"
 
 
+# ─── 3a. Angular branch-width contract (Stage J fu-2 fixup-1) ──────
+
+
+def test_groove_angular_branch_width_in_radians():
+    """The preset must hand the builder an *angular* branch width
+    (radians on the Phi grid), not a width-over-diameter ratio.
+
+    The builder ``build_half_herringbone_ramped_relief`` compares
+    ``|Phi - phi_c| <= 0.5 * w_local`` where ``Phi`` is in radians
+    and ``w_local`` is derived from ``w_branch_nondim``. The
+    physical mapping arc_length = angle × R requires
+    ``w_branch_nondim = w_g / R``.
+
+    This test pins both the conversion and the new diagnostic field
+    ``w_branch_angle_rad`` so a regression to the old
+    ``(w_g / D) * 2π`` formula (which produced widths π× too large)
+    cannot pass silently.
+    """
+    pr = resolve_groove_preset(
+        "g4_same_depth_safe",
+        R_m=params.R, L_m=params.L, c_m=params.c)
+    # Diagnostic-only ratio still expressed against D.
+    assert pr["w_g_over_D"] == pytest.approx(
+        14.8e-3 / (2.0 * params.R), rel=1e-12)
+    # The actual builder argument is an angle in radians = w_g / R.
+    assert pr["w_branch_nondim"] == pytest.approx(
+        14.8e-3 / params.R, rel=1e-12)
+    # Explicit echo field — same value, different name, exists so
+    # callers reading the preset don't have to re-derive the unit.
+    assert pr["w_branch_angle_rad"] == pytest.approx(
+        14.8e-3 / params.R, rel=1e-12)
+    assert pr["w_branch_angle_rad"] == pr["w_branch_nondim"]
+    # The bug we're guarding against: the old formula
+    # (w_g/D) * 2π = π × (w_g/R) inflated the angle by π.
+    assert pr["w_branch_nondim"] != pytest.approx(
+        (14.8e-3 / (2.0 * params.R)) * 2.0 * np.pi, rel=1e-9)
+
+
+def test_diesel_g4_same_depth_safe_geometry_echo():
+    """The summary-writer-facing diagnostic fields for
+    ``g4_same_depth_safe`` on the diesel R=100 mm bearing match
+    the physical preset declaration:
+        w_g = 14.8 mm  →  w_g/D ≈ 0.074, w_branch_angle_rad ≈ 0.148.
+    """
+    pr = resolve_groove_preset(
+        "g4_same_depth_safe",
+        R_m=0.100, L_m=params.L, c_m=120e-6)
+    assert pr["w_g_mm"] == pytest.approx(14.8, rel=1e-12)
+    assert pr["w_g_over_D"] == pytest.approx(14.8 / 200.0, rel=1e-12)
+    assert pr["w_branch_angle_rad"] == pytest.approx(
+        14.8e-3 / 0.100, rel=1e-12)
+    # Sanity on absolute magnitude — 0.148 rad ≈ 8.5°, well below
+    # the cell span of 2π/10 ≈ 0.628 rad ≈ 36°, so 10 branches
+    # don't overlap.
+    assert pr["w_branch_angle_rad"] < (2.0 * np.pi
+                                        / pr["N_branch_per_side"])
+
+
 # ─── 4. Geometry safety at the eccentricity cap ────────────────────
 
 
