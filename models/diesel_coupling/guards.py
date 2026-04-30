@@ -174,6 +174,15 @@ class RejectionReason(str, Enum):
     MECHANICAL_DELTA_EPS_STEP = "mechanical_delta_eps_step_exceeded"
     MECHANICAL_EPS_MAX = "mechanical_eps_at_clamp"
 
+    # Stage J fu-2 Task 27 — Picard fixed-point coupling reasons.
+    # Distinct from ``SOLVER_RESIDUAL`` so failure_classifier can
+    # bucket Picard-non-convergence as ``picard_noncontractive``
+    # rather than mislabelling it as a solver issue. Emitted by the
+    # damped path when ``solve_ok=True`` (Ausas converged on the
+    # last trial) but the Picard map didn't reach a fixed point
+    # within ``max_mech_inner`` iterations.
+    PICARD_NOT_CONVERGED = "damped_picard_not_converged"
+
 
 @dataclass
 class GuardOutcome:

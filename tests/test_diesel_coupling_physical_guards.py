@@ -369,10 +369,15 @@ def test_damped_kernel_off_mode_silent():
     assert tr.outcome_physical.accept is True
     # Either committed (Picard converged trivially with eps_tol=10)
     # or not committed (max_mech_inner=1 didn't satisfy fixed-point);
-    # either way no rejection.
+    # either way no PHYSICAL rejection (the test-specific contract).
+    # Stage J fu-2 Task 27 — Picard non-convergence now uses
+    # ``PICARD_NOT_CONVERGED``; the legacy ``SOLVER_RESIDUAL`` for
+    # this case stays valid for older artefacts but the kernel
+    # emits the new enum on current code.
     assert ms.rejection_reason in (
         RejectionReason.NONE,
-        RejectionReason.SOLVER_RESIDUAL,   # damped_picard_not_converged
+        RejectionReason.PICARD_NOT_CONVERGED,
+        RejectionReason.SOLVER_RESIDUAL,   # legacy alias
     )
 
 

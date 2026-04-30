@@ -1221,7 +1221,13 @@ def _run_damped_implicit_film(
         # summary writer can flag iterations that stalled at the
         # min relax (pathology) vs. ran out of budget on a
         # productively contracting δε (just need bigger budget).
-        rejection_reason = RejectionReason.SOLVER_RESIDUAL
+        # Stage J fu-2 Task 27 — use the dedicated
+        # ``PICARD_NOT_CONVERGED`` enum so failure_classifier
+        # buckets this as ``picard_noncontractive`` rather than
+        # mislabelling it as ``solver_residual``. The Ausas trials
+        # all returned converged + finite; the failure is on the
+        # coupling Picard side, not the solver.
+        rejection_reason = RejectionReason.PICARD_NOT_CONVERGED
         rejection_detail = (
             f"damped_picard_not_converged after "
             f"{n_trials}/{max_mech_inner} trials; "

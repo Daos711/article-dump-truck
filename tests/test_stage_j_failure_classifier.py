@@ -39,6 +39,9 @@ def _make_step(
     ausas_max_inner: int = 5000,
     max_mech_inner: int = 64,
     mech_relax_min: float = 0.015625,
+    failure_kind: str = "",
+    nonfinite_count: int = 0,
+    force_nonfinite: bool = False,
 ) -> StepDiagnosticRow:
     """Defaults describe a healthy converged step. Tests override
     only the fields relevant to the bucket they exercise."""
@@ -57,6 +60,9 @@ def _make_step(
         ausas_max_inner=ausas_max_inner,
         max_mech_inner=max_mech_inner,
         mech_relax_min=mech_relax_min,
+        failure_kind=failure_kind,
+        nonfinite_count=nonfinite_count,
+        force_nonfinite=force_nonfinite,
     )
 
 
@@ -102,9 +108,9 @@ def test_classifier_solver_nonfinite_theta():
     assert classify_failure(s) == "solver_nonfinite"
 
 
-def test_classifier_picard_not_converged_via_reason_string():
+def test_classifier_picard_noncontractive_via_reason_string():
     """The kernel emits ``damped_picard_not_converged after ...``;
-    that prefix dispatches to ``picard_not_converged`` even when
+    that prefix dispatches to ``picard_noncontractive`` even when
     the structural counters look fine."""
     s = _make_step(
         rejection_reason=(
@@ -114,13 +120,13 @@ def test_classifier_picard_not_converged_via_reason_string():
         n_trials=64, max_mech_inner=64,
         mech_relax_min_seen=0.0625,
     )
-    assert classify_failure(s) == "picard_not_converged"
+    assert classify_failure(s) == "picard_noncontractive"
 
 
-def test_classifier_picard_not_converged_structural_fallback():
+def test_classifier_picard_noncontractive_structural_fallback():
     """If the rejection_reason text is empty (e.g. partial-result
     rows from before the runner wrote it), the classifier still
-    picks ``picard_not_converged`` from ``fp_converged=False`` AND
+    picks ``picard_noncontractive`` from ``fp_converged=False`` AND
     ``n_trials >= max_mech_inner``."""
     s = _make_step(
         rejection_reason="",
@@ -128,7 +134,7 @@ def test_classifier_picard_not_converged_structural_fallback():
         n_trials=64, max_mech_inner=64,
         mech_relax_min_seen=0.5,  # not at floor
     )
-    assert classify_failure(s) == "picard_not_converged"
+    assert classify_failure(s) == "picard_noncontractive"
 
 
 def test_classifier_picard_relax_floor():
@@ -224,7 +230,7 @@ def test_explicit_picard_reason_wins_over_numerical_budget():
         mech_relax_min_seen=0.015625,
         mech_relax_min=0.015625,
     )
-    assert classify_failure(s) == "picard_not_converged"
+    assert classify_failure(s) == "picard_noncontractive"
 
 
 def test_numerical_solver_budget_wins_over_picard_when_no_reason():
@@ -244,22 +250,109 @@ def test_numerical_solver_budget_wins_over_picard_when_no_reason():
     assert classify_failure(s) == "solver_budget"
 
 
-def test_explicit_solver_budget_reason_wins_over_nonfinite_pmax():
-    """The runner sets pmax=NaN on every failed step regardless of
-    cause. When the kernel ALSO emits an explicit
-    ``solver_n_inner_at_max`` tag, the explicit tag must win — not
-    the numerical "p_max is NaN" fallback. This is the regression
-    that the B'-result diagnose surfaced (every step bucketed as
-    solver_nonfinite when the truth was solver_budget)."""
+def test_nonfinite_residual_wins_over_solver_budget_reason():
+    """Task 27 — when the rejection reason says ``solver_n_inner_at_max``
+    (budget exhausted) BUT ``ausas_residual`` is NaN, the underlying
+    state IS non-finite — the budget exhaustion is a symptom, not
+    the root cause. Classifier must report ``solver_nonfinite`` so
+    the operator looks for the real problem (NaN in P/theta/state)
+    rather than just bumping ``--ausas-max-inner``.
+
+    This is the contract that the B'-result diagnose under-reported
+    after Task 14 fixup-2 (which routed everything with
+    ``solver_n_inner_at_max`` tag straight to ``solver_budget``,
+    hiding the NaN-residual cases).
+    """
     s = _make_step(
         ausas_n_inner=5000, ausas_max_inner=5000,
-        ausas_residual=1e-3, ausas_tol=1e-4,
+        ausas_residual=float("nan"),     # nonfinite — the key signal
+        ausas_tol=1e-4,
         ausas_converged=False,
         rejection_reason="solver_n_inner_at_max",
         p_max=float("nan"),
         theta_max=float("nan"),
     )
+    assert classify_failure(s) == "solver_nonfinite"
+
+
+def test_finite_solver_budget_with_finite_residual_routes_to_budget():
+    """Mirror image — when residual IS finite (just above tol) AND
+    ``n_inner == max``, that's a genuine budget exhaustion: the
+    solver did real work, just couldn't reach tol. ``solver_budget``
+    wins. Pmax / theta_max stay finite by default so the
+    nonfinite-first rule doesn't fire."""
+    s = _make_step(
+        ausas_n_inner=5000, ausas_max_inner=5000,
+        ausas_residual=1e-3,             # finite, > tol
+        ausas_tol=1e-4,
+        ausas_converged=False,
+        rejection_reason="solver_n_inner_at_max",
+    )
     assert classify_failure(s) == "solver_budget"
+
+
+# ─── Task 27 new signals (gpu-reynolds Task 12 dict-API) ───────────
+
+
+def test_classifier_nonfinite_via_failure_kind_nonfinite_state():
+    """``failure_kind='nonfinite_state'`` from gpu-reynolds is the
+    most specific signal — bucket immediately, even if everything
+    else looks healthy. The solver explicitly told us the state
+    went pathological."""
+    s = _make_step(
+        failure_kind="nonfinite_state",
+        # All other fields finite — only failure_kind drives this.
+        ausas_residual=1e-7, ausas_converged=True,
+        p_max=1.0, theta_max=1.0,
+        rejection_reason="",
+    )
+    assert classify_failure(s) == "solver_nonfinite"
+
+
+def test_classifier_nonfinite_via_failure_kind_invalid_input():
+    """``failure_kind='invalid_input'`` likewise — the solver
+    refused to run because its input was already broken."""
+    s = _make_step(failure_kind="invalid_input")
+    assert classify_failure(s) == "solver_nonfinite"
+
+
+def test_classifier_nonfinite_via_nonfinite_count():
+    """``nonfinite_count > 0`` — solver-side hard-stop reported
+    a non-finite cell count. Routes to nonfinite even without
+    explicit failure_kind."""
+    s = _make_step(nonfinite_count=12, failure_kind="")
+    assert classify_failure(s) == "solver_nonfinite"
+
+
+def test_classifier_nonfinite_via_residual_nan():
+    """The B'-bug regression. ``ausas_residual=NaN`` triggers
+    nonfinite EVEN WHEN ``rejection_reason`` says budget
+    or residual."""
+    for reason in (
+        "solver_n_inner_at_max",
+        "solver_residual_above_tol",
+        "",
+    ):
+        s = _make_step(
+            ausas_residual=float("nan"),
+            rejection_reason=reason,
+        )
+        assert classify_failure(s) == "solver_nonfinite", reason
+
+
+def test_classifier_nonfinite_via_force_nonfinite():
+    """Runner-detected NaN F_hyd despite Ausas converged=True
+    (Task 32 commit-semantics surface this case via the
+    ``force_nonfinite`` flag — solver returned finite P but the
+    integrated force is non-finite, e.g. from a pathological
+    grid integration)."""
+    s = _make_step(
+        force_nonfinite=True,
+        # Solver-side healthy.
+        ausas_residual=1e-7, ausas_converged=True,
+        p_max=1.0, theta_max=1.0,
+    )
+    assert classify_failure(s) == "solver_nonfinite"
 
 
 def test_numerical_nonfinite_fallback_when_no_reason(tmp_path=None):
@@ -290,7 +383,7 @@ def test_aggregate_buckets_counts_and_dominant():
             ausas_residual=1e-3, ausas_tol=1e-4,
             ausas_converged=False,
         ) for _ in range(5)],
-        # 2 picard_not_converged
+        # 2 picard_noncontractive
         _make_step(
             rejection_reason="damped_picard_not_converged after 64/64",
             fp_converged=False, n_trials=64, max_mech_inner=64,
@@ -306,7 +399,7 @@ def test_aggregate_buckets_counts_and_dominant():
     assert bc.n_failures == 7
     assert bc.per_bucket["ok"] == 3
     assert bc.per_bucket["solver_budget"] == 5
-    assert bc.per_bucket["picard_not_converged"] == 2
+    assert bc.per_bucket["picard_noncontractive"] == 2
     assert bc.dominant_failure_bucket() == "solver_budget"
     # frac semantics — over total vs. over failures.
     assert bc.frac("solver_budget") == pytest.approx(0.5)
@@ -332,7 +425,7 @@ def test_failure_buckets_listed():
     assert "solver_budget" in FAILURE_BUCKETS
     assert "solver_residual" in FAILURE_BUCKETS
     assert "solver_nonfinite" in FAILURE_BUCKETS
-    assert "picard_not_converged" in FAILURE_BUCKETS
+    assert "picard_noncontractive" in FAILURE_BUCKETS
     assert "picard_relax_floor" in FAILURE_BUCKETS
     assert "reject_at_anchor" in FAILURE_BUCKETS
     assert "mechanical_guard" in FAILURE_BUCKETS

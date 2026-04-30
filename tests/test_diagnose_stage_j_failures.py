@@ -162,9 +162,10 @@ def test_diagnose_solver_budget_dominant(tmp_path):
                for ln in report.splitlines())
 
 
-def test_diagnose_picard_not_converged_dominant(tmp_path):
+def test_diagnose_picard_noncontractive_dominant(tmp_path):
     """Failures driven by ``damped_picard_not_converged`` rejection
-    text → dominant bucket = picard_not_converged."""
+    text → dominant bucket = ``picard_noncontractive`` (Task 27
+    rename — was ``picard_not_converged`` pre-Task-27)."""
     def pat(step):
         if step < 3:
             return None
@@ -177,9 +178,9 @@ def test_diagnose_picard_not_converged_dominant(tmp_path):
     run_dir = _build_synthetic_npz(
         tmp_path, n_steps=15, failure_pattern=pat)
     report = diagnose_run(run_dir, config_filter="all")
-    assert "picard_not_converged" in report
+    assert "picard_noncontractive" in report
     assert any(
-        "dominant (full)" in ln and "picard_not_converged" in ln
+        "dominant (full)" in ln and "picard_noncontractive" in ln
         for ln in report.splitlines())
 
 

@@ -193,11 +193,45 @@ def _per_step_rows(
         "ausas_converged", solver_success))
     theta_max = np.asarray(
         npz.get("ausas_theta_max", np.ones_like(pmax)))
+    # Stage J fu-2 Task 27 — gpu-reynolds Task 12 explicit nonfinite
+    # signals. Optional in the archive: empty/zero defaults preserve
+    # the legacy fall-through (solver_residual / solver_budget rules
+    # still fire if these are absent). When the runner saves them,
+    # the classifier uses them as the highest-priority signals.
+    failure_kind = np.asarray(npz.get(
+        "ausas_failure_kind",
+        np.full((n_cfg, n_steps_total), "", dtype=object)))
+    nonfinite_count = np.asarray(npz.get(
+        "ausas_nonfinite_count",
+        np.zeros((n_cfg, n_steps_total), dtype=np.int32)))
+    F_hyd_x_arr = npz.get("Fx_hyd")
+    F_hyd_y_arr = npz.get("Fy_hyd")
+    if F_hyd_x_arr is None:
+        F_hyd_x_arr = npz.get("F_hyd_x")
+    if F_hyd_y_arr is None:
+        F_hyd_y_arr = npz.get("F_hyd_y")
 
     rows: List[StepDiagnosticRow] = []
     for step in range(step_lo, step_hi):
         rr_raw = rejection_reasons[ic, step]
         rr = "" if rr_raw is None else str(rr_raw)
+        fk_raw = failure_kind[ic, step] if failure_kind.size else ""
+        fk = "" if fk_raw is None else str(fk_raw)
+        # Force-balance non-finite signal: True when the saved
+        # F_hyd has a NaN/Inf component AND the runner marked the
+        # step as failed (so we don't false-positive on a clean
+        # ``Fx_hyd=NaN`` placeholder before the loop runs).
+        force_nonfinite = False
+        if F_hyd_x_arr is not None and F_hyd_y_arr is not None:
+            try:
+                fx_v = float(np.asarray(F_hyd_x_arr)[ic, step])
+                fy_v = float(np.asarray(F_hyd_y_arr)[ic, step])
+                force_nonfinite = (
+                    not bool(solver_success[ic, step])
+                    and (not np.isfinite(fx_v)
+                          or not np.isfinite(fy_v)))
+            except (IndexError, ValueError, TypeError):
+                force_nonfinite = False
         rows.append(StepDiagnosticRow(
             is_failure=not bool(solver_success[ic, step]),
             rejection_reason=rr,
@@ -213,6 +247,10 @@ def _per_step_rows(
             ausas_max_inner=ausas_max_inner,
             max_mech_inner=max_mech_inner,
             mech_relax_min=mech_relax_min,
+            failure_kind=fk,
+            nonfinite_count=int(nonfinite_count[ic, step])
+            if nonfinite_count.size else 0,
+            force_nonfinite=force_nonfinite,
         ))
     return rows
 
@@ -305,12 +343,36 @@ def _format_first_failing(
     phi_crank_deg: np.ndarray,
     step_lo: int,
     n_max: int,
+    extra_npz: Optional[Dict[str, Any]] = None,
+    config_index: int = 0,
 ) -> List[str]:
+    """Detail dump for the first ``n_max`` failing steps.
+
+    Stage J fu-2 Task 27 — opportunistically pulls the gpu-reynolds
+    Task 12 dump signals (``ausas_failure_kind``,
+    ``ausas_first_nan_field``, ``ausas_first_nan_index``,
+    ``ausas_nan_iter``) when present in ``extra_npz`` and surfaces
+    them as additional columns. Old archives without these fields
+    show ``-`` placeholders; the column header stays the same so
+    text-grep workflows don't break.
+    """
     lines = [f"First {n_max} failing steps:"]
     lines.append(
-        "  step   phi      bucket               n_inner  residual    "
-        "fp_converged  relax_min  reason")
+        "  step   phi      bucket                 n_inner  residual    "
+        "fp_conv  relax_min   failure_kind        nan_field           "
+        "nan_iter  reason")
     n_emitted = 0
+
+    fk_arr = (np.asarray(extra_npz.get("ausas_failure_kind"))
+              if extra_npz is not None
+              and "ausas_failure_kind" in extra_npz else None)
+    fnf_arr = (np.asarray(extra_npz.get("ausas_first_nan_field"))
+               if extra_npz is not None
+               and "ausas_first_nan_field" in extra_npz else None)
+    nan_iter_arr = (np.asarray(extra_npz.get("ausas_nan_iter"))
+                    if extra_npz is not None
+                    and "ausas_nan_iter" in extra_npz else None)
+
     for k, r in enumerate(rows):
         if not r.is_failure:
             continue
@@ -321,15 +383,36 @@ def _format_first_failing(
         residual_s = (f"{r.ausas_residual:9.3e}"
                       if np.isfinite(r.ausas_residual) else "  nan    ")
         relax_s = (f"{r.mech_relax_min_seen:8.5f}"
-                   if np.isfinite(r.mech_relax_min_seen) else "    nan ")
+                   if np.isfinite(r.mech_relax_min_seen)
+                   else "    nan ")
+        # Optional columns from the gpu-reynolds dump signals.
+        fk_s = "-"
+        if fk_arr is not None:
+            fk_v = fk_arr[config_index, step_lo + k]
+            if fk_v is not None and str(fk_v):
+                fk_s = str(fk_v)[:18]
+        fnf_s = "-"
+        if fnf_arr is not None:
+            fnf_v = fnf_arr[config_index, step_lo + k]
+            if fnf_v is not None and str(fnf_v):
+                fnf_s = str(fnf_v)[:18]
+        nit_s = "-"
+        if nan_iter_arr is not None:
+            try:
+                nit_v = int(nan_iter_arr[config_index, step_lo + k])
+                if nit_v >= 0:
+                    nit_s = str(nit_v)
+            except (ValueError, TypeError):
+                pass
         rr_short = (r.rejection_reason[:60]
                     if len(r.rejection_reason) <= 60
                     else r.rejection_reason[:57] + "...")
         lines.append(
             f"  {step_lo + k:>4d}  {phi:>6.1f}°  "
-            f"{bucket:<20} {r.ausas_n_inner:>6d}  {residual_s}  "
-            f"{str(r.fp_converged):>5}        "
-            f"{relax_s}  {rr_short}")
+            f"{bucket:<22} {r.ausas_n_inner:>6d}  {residual_s}  "
+            f"{str(r.fp_converged):>5}    "
+            f"{relax_s}  {fk_s:<18}  {fnf_s:<18}  "
+            f"{nit_s:>7}  {rr_short}")
         n_emitted += 1
     if n_emitted == 0:
         lines.append("  (no failing steps in this slice)")
@@ -433,6 +516,8 @@ def diagnose_run(
             phi_crank_deg=phi_crank_deg,
             step_lo=step_lo,
             n_max=first_n_failing,
+            extra_npz=npz,
+            config_index=ic,
         ))
         out.append("")
 

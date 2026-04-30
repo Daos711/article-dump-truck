@@ -685,9 +685,41 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
             if n_real <= 0:
                 continue
             rows_full = []
+            # Stage J fu-2 Task 27 — opportunistically pull the
+            # gpu-reynolds Task 12 nonfinite signals (if the runner
+            # populated them in ``results``). Without them the
+            # classifier still works through its numerical-fallback
+            # rules; with them, NaN-residual / failure_kind cases
+            # bucket into ``solver_nonfinite`` rather than
+            # ``solver_residual``.
+            _failure_kind_arr = results.get("ausas_failure_kind")
+            _nonfinite_count_arr = results.get(
+                "ausas_nonfinite_count")
+            _F_hyd_x_arr = results.get("Fx_hyd")
+            _F_hyd_y_arr = results.get("Fy_hyd")
             for step in range(n_real):
                 rr_raw = _rej_reason_arr[ic, step]
                 rr = "" if rr_raw is None else str(rr_raw)
+                fk_v = ""
+                if _failure_kind_arr is not None:
+                    fk_raw = _failure_kind_arr[ic, step]
+                    fk_v = "" if fk_raw is None else str(fk_raw)
+                nfc_v = (int(_nonfinite_count_arr[ic, step])
+                          if _nonfinite_count_arr is not None else 0)
+                # ``force_nonfinite`` only fires on a *failed* step
+                # whose committed F_hyd has a NaN/Inf component —
+                # avoids false positives on placeholder Fx_hyd=NaN
+                # rows the runner writes before the per-step loop
+                # sets a real value.
+                f_nonfinite = False
+                if (_F_hyd_x_arr is not None
+                        and _F_hyd_y_arr is not None):
+                    fx = float(_F_hyd_x_arr[ic, step])
+                    fy = float(_F_hyd_y_arr[ic, step])
+                    f_nonfinite = (
+                        not bool(_solver_success_arr[ic, step])
+                        and (not np.isfinite(fx)
+                              or not np.isfinite(fy)))
                 rows_full.append(StepDiagnosticRow(
                     is_failure=not bool(_solver_success_arr[ic, step]),
                     rejection_reason=rr,
@@ -708,6 +740,9 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                     ausas_max_inner=_ausas_max_inner_run,
                     max_mech_inner=_max_mech_inner_run,
                     mech_relax_min=_mech_relax_min_run,
+                    failure_kind=fk_v,
+                    nonfinite_count=nfc_v,
+                    force_nonfinite=f_nonfinite,
                 ))
             last_lo = max(_last_start, 0)
             rows_last = rows_full[last_lo:n_real]
