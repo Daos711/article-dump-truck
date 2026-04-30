@@ -381,6 +381,37 @@ def _save_data(run_dir, results, thermal, retry_cfg):
             "stage_j_rejection_reason",
             np.full_like(results["contact_clamp"], "none",
                           dtype=object)),
+        # Stage J fu-2 Task 32 — commit-semantics state-machine
+        # arrays. Defaults match the kernel's MechanicalStepResult
+        # so older runs missing these stay readable by the
+        # postprocessor (defensive ``npz.get`` falls back through
+        # the legacy fallback rules).
+        final_trial_status=results.get(
+            "final_trial_status",
+            np.full_like(results["contact_clamp"], "no_attempt",
+                          dtype=object)),
+        committed_state_status=results.get(
+            "committed_state_status",
+            np.full_like(results["contact_clamp"], "rejected_no_commit",
+                          dtype=object)),
+        accepted_state_source=results.get(
+            "accepted_state_source",
+            np.full_like(results["contact_clamp"], "none",
+                          dtype=object)),
+        committed_state_is_finite=results.get(
+            "committed_state_is_finite",
+            np.zeros_like(results["contact_clamp"], dtype=bool)),
+        final_trial_failure_kind=results.get(
+            "final_trial_failure_kind",
+            np.full_like(results["contact_clamp"], "",
+                          dtype=object)),
+        final_trial_residual=results.get(
+            "final_trial_residual",
+            np.full_like(results["contact_clamp"], np.nan,
+                          dtype=float)),
+        final_trial_n_inner=results.get(
+            "final_trial_n_inner",
+            np.zeros_like(results["contact_clamp"], dtype=np.int32)),
         retry_used=results["retry_used"],
         retry_omega_used=results["retry_omega_used"],
         contact_clamp_count=results["contact_clamp_count"],
@@ -778,6 +809,61 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                     f"    dominant (full)            : {dom} "
                     f"({n_dom}/{counts_full.n_failures}"
                     f" = {frac:.0%})")
+        lines.append("")
+
+    # Stage J fu-2 Task 32 — commit-semantics breakdown. Distinguishes
+    # ``committed_converged`` (final trial passed all gates) from
+    # ``committed_last_valid`` (final trial failed; trajectory keeps
+    # the last finite trial) from ``rolled_back_previous`` (no
+    # finite trial; mechanics reset to step start). The
+    # ``committed_state_nonfinite`` count must be 0 for a published
+    # run — anything else means the runner kept a NaN-tainted state
+    # in the trajectory.
+    _committed_status_arr = results.get("committed_state_status")
+    _committed_finite_arr = results.get("committed_state_is_finite")
+    if (_committed_status_arr is not None
+            and _committed_finite_arr is not None):
+        cfgs_local = results["configs"]
+        steps_completed_arr = np.asarray(
+            results.get("steps_completed",
+                          np.array([_committed_status_arr.shape[1]]
+                                   * len(cfgs_local), dtype=int)))
+        lines.append("Stage J: commit semantics")
+        for ic, cfg in enumerate(cfgs_local):
+            n_real = int(steps_completed_arr[ic])
+            if n_real <= 0:
+                continue
+            sl = slice(0, n_real)
+            statuses = _committed_status_arr[ic, sl]
+            finite = _committed_finite_arr[ic, sl]
+            status_strs = [str(s) for s in np.asarray(statuses)
+                            .flatten().tolist()]
+            n_committed_converged = sum(
+                1 for s in status_strs
+                if s == "committed_converged")
+            n_committed_last_valid = sum(
+                1 for s in status_strs
+                if s == "committed_last_valid")
+            n_rolled_back = sum(
+                1 for s in status_strs
+                if s == "rolled_back_previous")
+            n_rejected = sum(
+                1 for s in status_strs
+                if s == "rejected_no_commit")
+            n_nonfinite = int(np.sum(~np.asarray(finite, dtype=bool)))
+            lines.append(f"  -- {cfg['label']!r} --")
+            lines.append(
+                f"    committed_converged      : "
+                f"{n_committed_converged}")
+            lines.append(
+                f"    committed_last_valid     : "
+                f"{n_committed_last_valid}")
+            lines.append(
+                f"    rolled_back_previous     : {n_rolled_back}")
+            lines.append(
+                f"    rejected_no_commit       : {n_rejected}")
+            lines.append(
+                f"    committed_state_nonfinite: {n_nonfinite}")
         lines.append("")
 
     # Groove geometry block — only emitted when the run actually

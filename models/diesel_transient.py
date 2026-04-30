@@ -1477,6 +1477,24 @@ def run_transient(F_max=None, debug=False,
     # step. Stored as object dtype (numpy will pickle on save).
     coupling_rejection_reason_all = np.full(
         (n_cfg, n_steps), "none", dtype=object)
+    # Stage J fu-2 Task 32 — commit-semantics state-machine arrays.
+    # Defaults match the kernel's ``MechanicalStepResult`` defaults
+    # so the runner-side schema stays uniform across legacy and
+    # damped paths and across older runs that pre-date Task 32.
+    final_trial_status_all = np.full(
+        (n_cfg, n_steps), "no_attempt", dtype=object)
+    committed_state_status_all = np.full(
+        (n_cfg, n_steps), "rejected_no_commit", dtype=object)
+    accepted_state_source_all = np.full(
+        (n_cfg, n_steps), "none", dtype=object)
+    committed_state_is_finite_all = np.zeros(
+        (n_cfg, n_steps), dtype=bool)
+    final_trial_failure_kind_all = np.full(
+        (n_cfg, n_steps), "", dtype=object)
+    final_trial_residual_all = np.full(
+        (n_cfg, n_steps), np.nan, dtype=float)
+    final_trial_n_inner_all = np.zeros(
+        (n_cfg, n_steps), dtype=np.int32)
     # Stage J Bug 4 follow-up — per-step force-balance diagnostics.
     F_hyd_x_all = np.zeros((n_cfg, n_steps), dtype=float)
     F_hyd_y_all = np.zeros((n_cfg, n_steps), dtype=float)
@@ -1732,6 +1750,25 @@ def run_transient(F_max=None, debug=False,
             coupling_n_trials_all[ic, step] = int(_ms.n_trials)
             coupling_rejection_reason_all[ic, step] = (
                 _ms.rejection_reason.value)
+            # Stage J fu-2 Task 32 — commit-semantics state-machine
+            # passthrough. Per-step arrays for the postprocessor /
+            # summary writer to surface ``committed_converged`` vs.
+            # ``committed_last_valid`` vs. ``rolled_back_previous``
+            # vs. ``rejected_no_commit`` distinctions.
+            final_trial_status_all[ic, step] = (
+                str(_ms.final_trial_status))
+            committed_state_status_all[ic, step] = (
+                str(_ms.committed_state_status))
+            accepted_state_source_all[ic, step] = (
+                str(_ms.accepted_state_source))
+            committed_state_is_finite_all[ic, step] = bool(
+                _ms.committed_state_is_finite)
+            final_trial_failure_kind_all[ic, step] = (
+                str(_ms.final_trial_failure_kind))
+            final_trial_residual_all[ic, step] = float(
+                _ms.final_trial_residual)
+            final_trial_n_inner_all[ic, step] = int(
+                _ms.final_trial_n_inner)
             # Stage J fu-2 fixup-3 — runner-side reaction to kernel
             # Picard no-advance. On ``_ms.accepted=False`` the kernel
             # already rolled mechanics back to start-of-step values
@@ -1832,8 +1869,48 @@ def run_transient(F_max=None, debug=False,
                                       else 0.0),
                         ),
                     )()
+                    # Stage J fu-2 Task 32 — split misleading
+                    # ``ACCEPTED`` into separate FINAL-TRIAL-* /
+                    # COMMITTED-* / ROLLED-BACK lines so a NaN
+                    # F_hyd / nan residual / converged=False step
+                    # never prints under the same label as a
+                    # genuinely converged commit.
+                    _ftrial_status = str(getattr(
+                        _ms, "final_trial_status", "no_attempt"))
+                    _committed_status = str(getattr(
+                        _ms, "committed_state_status",
+                        "rejected_no_commit"))
+                    if _ftrial_status != "converged":
+                        # Separate FINAL-TRIAL-FAILED line — names
+                        # the failure cause for the operator.
+                        _print_ausas_debug_step(
+                            f"step={step:03d} "
+                            f"FINAL-TRIAL-FAILED({_ftrial_status})",
+                            phi_deg=phi_deg, dt_s=dt_step,
+                            aw_result=_accepted,
+                            eps_x=ex / params.c, eps_y=ey / params.c,
+                            p_scale=p_scale_step,
+                            Fx_hyd=Fx_hyd, Fy_hyd=Fy_hyd,
+                            F_max=F_max,
+                        )
+                    if _committed_status == "committed_converged":
+                        _committed_label = (
+                            f"step={step:03d} "
+                            "COMMITTED(converged_trial)")
+                    elif _committed_status == "committed_last_valid":
+                        _committed_label = (
+                            f"step={step:03d} "
+                            "COMMITTED(last_valid_trial)")
+                    elif _committed_status == "rolled_back_previous":
+                        _committed_label = (
+                            f"step={step:03d} "
+                            f"ROLLED-BACK(reason={_ftrial_status})")
+                    else:
+                        _committed_label = (
+                            f"step={step:03d} "
+                            f"REJECTED-NO-COMMIT(reason={_ftrial_status})")
                     _print_ausas_debug_step(
-                        f"step={step:03d} ACCEPTED",
+                        _committed_label,
                         phi_deg=phi_deg, dt_s=dt_step,
                         aw_result=_accepted,
                         eps_x=ex / params.c, eps_y=ey / params.c,
@@ -2339,6 +2416,14 @@ def run_transient(F_max=None, debug=False,
         "stage_j_fp_converged": coupling_fp_converged_all,
         "stage_j_n_trials": coupling_n_trials_all,
         "stage_j_rejection_reason": coupling_rejection_reason_all,
+        # Stage J fu-2 Task 32 — commit-semantics arrays.
+        "final_trial_status": final_trial_status_all,
+        "committed_state_status": committed_state_status_all,
+        "accepted_state_source": accepted_state_source_all,
+        "committed_state_is_finite": committed_state_is_finite_all,
+        "final_trial_failure_kind": final_trial_failure_kind_all,
+        "final_trial_residual": final_trial_residual_all,
+        "final_trial_n_inner": final_trial_n_inner_all,
         "F_hyd_x": F_hyd_x_all,
         "F_hyd_y": F_hyd_y_all,
         "F_ext_x": F_ext_x_all,

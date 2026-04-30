@@ -165,6 +165,38 @@ class MechanicalStepResult:
     fixed_point_converged_flag: bool = False
     picard_shrinks_count: int = 0
 
+    # Stage J fu-2 Task 32 — commit-semantics state machine.
+    # Distinguishes "what the final trial did" (which may be a
+    # nonfinite failure) from "what the runner actually committed
+    # to the trajectory" (which must be finite by the pre-commit
+    # gate). Without these fields, a final-trial failure with
+    # F_hyd=NaN/res=NaN/converged=False used to print as
+    # ``[ACCEPTED]`` because the kernel still committed the legacy
+    # ``last_known`` state — misleading.
+    #
+    # ``final_trial_status``:
+    #   "converged" / "solver_nonfinite" / "solver_invalid_input" /
+    #   "solver_budget" / "solver_residual" / "picard_not_converged" /
+    #   "mechanical_guard" / "physical_guard" / "no_attempt".
+    # ``committed_state_status``:
+    #   "committed_converged" — final trial was finite + converged.
+    #   "committed_last_valid" — final trial failed; last finite
+    #                            trial in trial_log was committed.
+    #   "rolled_back_previous" — no finite trial existed; mechanics
+    #                            rolled back to ex_n / ey_n.
+    #   "rejected_no_commit"   — none of the above; trajectory has
+    #                            NaN markers (legacy fallback path).
+    # ``accepted_state_source``:
+    #   "converged_trial" / "last_valid_trial" / "rollback_previous" /
+    #   "none".
+    final_trial_status: str = "no_attempt"
+    committed_state_status: str = "rejected_no_commit"
+    accepted_state_source: str = "none"
+    committed_state_is_finite: bool = False
+    final_trial_failure_kind: str = ""
+    final_trial_residual: float = float("nan")
+    final_trial_n_inner: int = 0
+
 
 # ─── Public kernel entry point ─────────────────────────────────────
 
@@ -471,6 +503,24 @@ def _run_legacy_verlet(
     # Legacy reports "accepted" even when the SOR solver failed —
     # the mechanical state always advances; only force/pressure
     # arrays go to NaN. Match that contract.
+    # Stage J fu-2 Task 32 — derive commit-semantics fields from
+    # the same ``solve_ok`` signal: converged → committed_converged;
+    # SOR-failed → rejected_no_commit (legacy fallback for HS path
+    # which has no last-valid-trial concept). The legacy mechanical
+    # advance to ex_pred is preserved bit-for-bit (Gate 1).
+    if solve_ok:
+        _final_trial_status = "converged"
+        _committed_state_status = "committed_converged"
+        _accepted_state_source = "converged_trial"
+        _committed_finite = bool(
+            P_last is not None
+            and np.all(np.isfinite(np.asarray(P_last)))
+            and np.isfinite(Fx_hyd) and np.isfinite(Fy_hyd))
+    else:
+        _final_trial_status = "solver_residual"
+        _committed_state_status = "rejected_no_commit"
+        _accepted_state_source = "none"
+        _committed_finite = False
     return MechanicalStepResult(
         accepted=True,
         eps_x_new=ex_new, eps_y_new=ey_new,
@@ -510,6 +560,13 @@ def _run_legacy_verlet(
         # schema for both backends.
         fixed_point_converged_flag=False,
         picard_shrinks_count=0,
+        final_trial_status=_final_trial_status,
+        committed_state_status=_committed_state_status,
+        accepted_state_source=_accepted_state_source,
+        committed_state_is_finite=bool(_committed_finite),
+        final_trial_failure_kind=("" if solve_ok else solve_reason),
+        final_trial_residual=residual_for_diag,
+        final_trial_n_inner=last_n_inner,
     )
 
 
@@ -1264,6 +1321,130 @@ def _run_damped_implicit_film(
         vx_new, vy_new = float(vx_n), float(vy_n)
         ax_new, ay_new = float(ax_prev), float(ay_prev)
 
+    # ─── Stage J fu-2 Task 32 — commit-semantics finalisation ──
+    # Compute the four state-machine labels from local variables
+    # already set above. No additional GPU calls — we use what
+    # ``state_committed`` / ``picard_no_advance`` / the local
+    # P/F/theta finite flags tell us. The pre-commit finite gate
+    # is a SOFT check: if the committed state is non-finite, we
+    # mark it as ``rolled_back_previous`` and reset eps locals
+    # to the kernel's start-of-step inputs so the runner sees a
+    # safe rollback. This catches the pathological case where
+    # the runner used to print ``[ACCEPTED] |F_hyd|=nankN ...``
+    # because a non-converged commit silently kept last-trial
+    # NaN values.
+    def _finite_arr(a) -> bool:
+        if a is None:
+            return False
+        return bool(np.all(np.isfinite(np.asarray(a))))
+
+    _commit_state_finite = (
+        _finite_arr(P_last)
+        and (theta_for_diag is None
+              or _finite_arr(theta_for_diag))
+        and np.isfinite(Fx_hyd)
+        and np.isfinite(Fy_hyd)
+    )
+
+    if picard_no_advance:
+        # Already rolled back above. The kernel earlier set
+        # ex_new=ex_n / vx_new=vx_n / ax_new=ax_prev so mechanics
+        # are at the kernel-input state — finite by construction.
+        final_trial_status = "picard_not_converged"
+        committed_state_status = "rolled_back_previous"
+        accepted_state_source = "rollback_previous"
+        committed_state_is_finite = True
+        final_trial_failure_kind = "picard_not_converged"
+        final_trial_residual = (prev_step_norm
+                                  if prev_step_norm is not None
+                                  else float("nan"))
+    elif state_committed and _commit_state_finite:
+        final_trial_status = "converged"
+        committed_state_status = "committed_converged"
+        accepted_state_source = "converged_trial"
+        committed_state_is_finite = True
+        final_trial_failure_kind = ""
+        final_trial_residual = residual_for_diag
+    elif solve_ok and _commit_state_finite:
+        # Last accepted Picard trial's pressure / F_hyd are finite,
+        # but ``state_committed=False`` means the FINAL commit-time
+        # GPU call returned non-converged (e.g. squeeze near
+        # ε_max). Trajectory continuity uses the last-valid-trial
+        # values that the existing code already keeps in P_last /
+        # Fx_hyd / Fy_hyd.
+        final_trial_status = (
+            "solver_nonfinite"
+            if (not np.isfinite(residual_for_diag))
+            else "solver_residual")
+        committed_state_status = "committed_last_valid"
+        accepted_state_source = "last_valid_trial"
+        committed_state_is_finite = True
+        final_trial_failure_kind = (
+            "commit_call_not_converged"
+            if not np.isfinite(residual_for_diag)
+            else "")
+        final_trial_residual = residual_for_diag
+    else:
+        # ``solve_ok=False`` (line-search exhausted) OR
+        # committed state non-finite. Rollback mechanics to the
+        # kernel-input state and zero out trial outputs so the
+        # runner doesn't write NaN-tainted P / F / theta to the
+        # trajectory and doesn't print ``[ACCEPTED]`` for it.
+        ex_new, ey_new = float(ex_n), float(ey_n)
+        vx_new, vy_new = float(vx_n), float(vy_n)
+        ax_new, ay_new = float(ax_prev), float(ay_prev)
+        P_last = None
+        theta_for_diag = None
+        Fx_hyd = float("nan")
+        Fy_hyd = float("nan")
+        residual_for_diag = float("nan")
+        p_warm_local = None
+        # Classify failure-kind for the dump trigger / classifier.
+        if not _commit_state_finite and state_committed:
+            # Pathological: commit returned converged but the
+            # state itself was non-finite — sentinel for the
+            # gpu-reynolds Task 12 nonfinite signal.
+            final_trial_status = "solver_nonfinite"
+            final_trial_failure_kind = "nonfinite_state"
+        elif rejection_reason == RejectionReason.PICARD_NOT_CONVERGED:
+            final_trial_status = "picard_not_converged"
+            final_trial_failure_kind = "picard_not_converged"
+        elif rejection_reason == RejectionReason.SOLVER_BUDGET:
+            final_trial_status = "solver_budget"
+            final_trial_failure_kind = "solver_budget"
+        elif rejection_reason == RejectionReason.SOLVER_NONFINITE:
+            final_trial_status = "solver_nonfinite"
+            final_trial_failure_kind = "nonfinite_state"
+        elif rejection_reason == RejectionReason.SOLVER_RESIDUAL:
+            final_trial_status = "solver_residual"
+            final_trial_failure_kind = "solver_residual"
+        elif rejection_reason in (
+                RejectionReason.MECHANICAL_DELTA_EPS_INNER,
+                RejectionReason.MECHANICAL_DELTA_EPS_STEP,
+                RejectionReason.MECHANICAL_EPS_MAX):
+            final_trial_status = "mechanical_guard"
+            final_trial_failure_kind = "mechanical_guard"
+        elif rejection_reason in (
+                RejectionReason.PHYSICAL_PRESSURE_GPA,
+                RejectionReason.PHYSICAL_FORCE_RATIO,
+                RejectionReason.PHYSICAL_SAME_DIR_RUNAWAY,
+                RejectionReason.PHYSICAL_CAV_RUNAWAY):
+            final_trial_status = "physical_guard"
+            final_trial_failure_kind = "physical_guard"
+        else:
+            final_trial_status = "no_attempt"
+            final_trial_failure_kind = ""
+        committed_state_status = "rolled_back_previous"
+        accepted_state_source = "rollback_previous"
+        committed_state_is_finite = True  # kernel-input ε is by-construction finite
+        final_trial_residual = float("nan")
+        state_committed = False
+        # accepted reflects whether the runner should treat this as
+        # a real advance for trajectory continuity. Rollback is NOT
+        # a real advance — set False so the runner-side
+        # ``_ms.accepted=False`` branch fires.
+        picard_no_advance = True
+
     return MechanicalStepResult(
         accepted=not bool(picard_no_advance),
         eps_x_new=ex_new, eps_y_new=ey_new,
@@ -1296,4 +1477,12 @@ def _run_damped_implicit_film(
         dt_ausas_committed=dt_ausas_for_diag,
         fixed_point_converged_flag=bool(fixed_point_converged),
         picard_shrinks_count=int(picard_shrinks_count),
+        final_trial_status=final_trial_status,
+        committed_state_status=committed_state_status,
+        accepted_state_source=accepted_state_source,
+        committed_state_is_finite=bool(committed_state_is_finite),
+        final_trial_failure_kind=final_trial_failure_kind,
+        final_trial_residual=float(final_trial_residual)
+            if np.isfinite(final_trial_residual) else float("nan"),
+        final_trial_n_inner=int(last_n_inner),
     )
