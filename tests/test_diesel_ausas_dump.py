@@ -327,6 +327,73 @@ def test_dump_skipped_on_healthy_step(tmp_path):
         set_ausas_backend_for_tests(None)
 
 
+def test_dump_handles_none_diagnostic_fields(tmp_path):
+    """Stage J fu-2 Task 29 hotfix — gpu-reynolds emits unset
+    diagnostic keys as ``None`` (not absent), so a naive
+    ``int(out.get("nan_iter", -1))`` would raise TypeError on
+    ``int(None)``. Ensure the safe-coerce helpers tolerate it."""
+    set_ausas_backend_for_tests(_fake_backend_returns(dict(
+        # Healthy result, but every diagnostic field explicitly None.
+        residual_linf=1e-7, n_inner=10, converged=True,
+        failure_kind=None,
+        first_nan_field=None,
+        first_nan_index=None,
+        first_nan_is_ghost=None,
+        first_nan_is_axial_boundary=None,
+        first_nan_is_phi_seam=None,
+        nan_iter=None,
+        nonfinite_count=None,
+        residual_rms=None,
+        residual_l2_abs=None,
+    )))
+    try:
+        result = _call_ausas(extra_options={
+            "tol": 1e-6, "max_inner": 5000,
+        })
+        # No crash, healthy result.
+        assert result.converged is True
+        assert result.failure_kind == ""
+        assert result.first_nan_field == ""
+        assert result.first_nan_index == ()
+        assert result.first_nan_is_ghost is False
+        assert result.nan_iter == -1
+        assert result.nonfinite_count == 0
+        assert np.isnan(result.residual_rms)
+        assert np.isnan(result.residual_l2_abs)
+    finally:
+        set_ausas_backend_for_tests(None)
+
+
+def test_dump_handles_none_metadata_fields(tmp_path,
+                                              _failing_dict_backend):
+    """Same hotfix on the metadata side — runner may thread
+    ``F_hyd_x=None`` / ``F_hyd_y=None`` for a step where the trial
+    hasn't computed forces yet. Dump path must not crash."""
+    out = tmp_path / "dumps"
+    cfg = DumpConfig(directory=str(out), limit=10)
+    counters = DumpCounters()
+    _call_ausas(extra_options={
+        "tol": 1e-6, "max_inner": 5000,
+        "__dump_config__": cfg,
+        "__dump_metadata__": dict(
+            step=None, substep=None, trial=None,
+            phi_deg=None, eps_x=None, eps_y=None,
+            config_label=None,
+            trial_kind=None, texture_kind=None,
+            groove_preset=None, cavitation=None,
+            F_hyd_x=None, F_hyd_y=None,
+        ),
+        "__dump_counters__": counters,
+    })
+    # Triggered by failure_kind=nonfinite_state from backend, but
+    # all None metadata coerced to defaults — file written ok.
+    assert counters.written == 1
+    files = list(out.iterdir())
+    assert len(files) == 1
+    ok, missing = validate_dump_npz(str(files[0]))
+    assert ok, f"missing keys: {missing}"
+
+
 def test_dump_routing_keys_stripped_before_backend(tmp_path,
                                                      _failing_dict_backend):
     """The reserved ``__dump_*__`` keys must NOT reach the backend

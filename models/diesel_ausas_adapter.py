@@ -669,25 +669,26 @@ def ausas_one_step_with_state(
         H_curr=H_curr_phys,
         dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
         reason=("ok" if converged else "ausas_not_converged"),
-        failure_kind=str(_dump_signals.get("failure_kind", "")),
-        first_nan_field=str(_dump_signals.get("first_nan_field", "")),
-        first_nan_index=tuple(
-            _dump_signals.get("first_nan_index", ()) or ()),
-        first_nan_is_ghost=bool(
-            _dump_signals.get("first_nan_is_ghost", False)),
-        first_nan_is_axial_boundary=bool(
-            _dump_signals.get("first_nan_is_axial_boundary", False)),
-        first_nan_is_phi_seam=bool(
-            _dump_signals.get("first_nan_is_phi_seam", False)),
-        nan_iter=int(_dump_signals.get("nan_iter", -1)),
-        nonfinite_count=int(
-            _dump_signals.get("nonfinite_count", 0)),
-        residual_linf=float(
-            _dump_signals.get("residual_linf", float("nan"))),
-        residual_rms=float(
-            _dump_signals.get("residual_rms", float("nan"))),
-        residual_l2_abs=float(
-            _dump_signals.get("residual_l2_abs", float("nan"))),
+        failure_kind=_safe_str(_dump_signals.get("failure_kind"), ""),
+        first_nan_field=_safe_str(
+            _dump_signals.get("first_nan_field"), ""),
+        first_nan_index=_safe_tuple(
+            _dump_signals.get("first_nan_index")),
+        first_nan_is_ghost=_safe_bool(
+            _dump_signals.get("first_nan_is_ghost"), False),
+        first_nan_is_axial_boundary=_safe_bool(
+            _dump_signals.get("first_nan_is_axial_boundary"), False),
+        first_nan_is_phi_seam=_safe_bool(
+            _dump_signals.get("first_nan_is_phi_seam"), False),
+        nan_iter=_safe_int(_dump_signals.get("nan_iter"), -1),
+        nonfinite_count=_safe_int(
+            _dump_signals.get("nonfinite_count"), 0),
+        residual_linf=_safe_float(
+            _dump_signals.get("residual_linf"), float("nan")),
+        residual_rms=_safe_float(
+            _dump_signals.get("residual_rms"), float("nan")),
+        residual_l2_abs=_safe_float(
+            _dump_signals.get("residual_l2_abs"), float("nan")),
     )
 
 
@@ -740,9 +741,9 @@ def _maybe_emit_failed_dump(
         return
     primary = triggers[0]
     fname = build_dump_filename(
-        step=int(meta.get("step", -1)),
-        substep=int(meta.get("substep", -1)),
-        trial=int(meta.get("trial", -1)),
+        step=_safe_int(meta.get("step"), -1),
+        substep=_safe_int(meta.get("substep"), -1),
+        trial=_safe_int(meta.get("trial"), -1),
         commit=bool(commit),
         primary_trigger=primary,
     )
@@ -766,45 +767,45 @@ def _maybe_emit_failed_dump(
             if k not in {"H_curr", "H_prev", "P_prev", "theta_prev"}
         },
         # Step metadata
-        "step": int(meta.get("step", -1)),
-        "substep": int(meta.get("substep", -1)),
-        "trial": int(meta.get("trial", -1)),
+        "step": _safe_int(meta.get("step"), -1),
+        "substep": _safe_int(meta.get("substep"), -1),
+        "trial": _safe_int(meta.get("trial"), -1),
         "commit": bool(commit),
-        "phi_deg": float(meta.get("phi_deg", float("nan"))),
-        "eps_x": float(meta.get("eps_x", float("nan"))),
-        "eps_y": float(meta.get("eps_y", float("nan"))),
-        "config_label": str(meta.get("config_label", "")),
-        "trial_kind": str(meta.get("trial_kind", "")),
-        "texture_kind": str(meta.get("texture_kind", "")),
-        "groove_preset": str(meta.get("groove_preset", "")),
-        "cavitation": str(meta.get("cavitation", "")),
+        "phi_deg": _safe_float(meta.get("phi_deg"), float("nan")),
+        "eps_x": _safe_float(meta.get("eps_x"), float("nan")),
+        "eps_y": _safe_float(meta.get("eps_y"), float("nan")),
+        "config_label": _safe_str(meta.get("config_label"), ""),
+        "trial_kind": _safe_str(meta.get("trial_kind"), ""),
+        "texture_kind": _safe_str(meta.get("texture_kind"), ""),
+        "groove_preset": _safe_str(meta.get("groove_preset"), ""),
+        "cavitation": _safe_str(meta.get("cavitation"), ""),
         "n_phi": int(H_curr_phys.shape[1]),
         "n_z": int(H_curr_phys.shape[0]),
         # Solver result + nonfinite diagnostics
         "converged": bool(converged),
-        "failure_kind": str(dump_signals.get("failure_kind", "")),
-        "first_nan_field": str(
-            dump_signals.get("first_nan_field", "")),
-        "first_nan_index": tuple(
-            dump_signals.get("first_nan_index", ()) or ()),
-        "first_nan_is_ghost": bool(
-            dump_signals.get("first_nan_is_ghost", False)),
-        "first_nan_is_axial_boundary": bool(
-            dump_signals.get(
-                "first_nan_is_axial_boundary", False)),
-        "first_nan_is_phi_seam": bool(
-            dump_signals.get("first_nan_is_phi_seam", False)),
-        "nan_iter": int(dump_signals.get("nan_iter", -1)),
+        "failure_kind": _safe_str(
+            dump_signals.get("failure_kind"), ""),
+        "first_nan_field": _safe_str(
+            dump_signals.get("first_nan_field"), ""),
+        "first_nan_index": _safe_tuple(
+            dump_signals.get("first_nan_index")),
+        "first_nan_is_ghost": _safe_bool(
+            dump_signals.get("first_nan_is_ghost"), False),
+        "first_nan_is_axial_boundary": _safe_bool(
+            dump_signals.get("first_nan_is_axial_boundary"), False),
+        "first_nan_is_phi_seam": _safe_bool(
+            dump_signals.get("first_nan_is_phi_seam"), False),
+        "nan_iter": _safe_int(dump_signals.get("nan_iter"), -1),
         "residual": float(residual),
-        "residual_linf": float(
-            dump_signals.get("residual_linf", residual)),
-        "residual_rms": float(
-            dump_signals.get("residual_rms", float("nan"))),
-        "residual_l2_abs": float(
-            dump_signals.get("residual_l2_abs", float("nan"))),
+        "residual_linf": _safe_float(
+            dump_signals.get("residual_linf"), residual),
+        "residual_rms": _safe_float(
+            dump_signals.get("residual_rms"), float("nan")),
+        "residual_l2_abs": _safe_float(
+            dump_signals.get("residual_l2_abs"), float("nan")),
         "n_inner": int(n_inner),
-        "nonfinite_count": int(
-            dump_signals.get("nonfinite_count", 0)),
+        "nonfinite_count": _safe_int(
+            dump_signals.get("nonfinite_count"), 0),
         # Shape diagnostics — adapter unpadded the backend's return,
         # so the in-RAM shapes are the physical (N_z, N_phi).
         "P_shape_raw": tuple(P_nd.shape),
@@ -816,14 +817,14 @@ def _maybe_emit_failed_dump(
         "theta_is_padded": False,
         # Commit-semantics metadata (Task 32 sync) — runner threads
         # these through meta when known. Defaults preserve schema.
-        "final_trial_status": str(meta.get(
-            "final_trial_status", "no_attempt")),
-        "committed_state_status": str(meta.get(
-            "committed_state_status", "rejected_no_commit")),
-        "accepted_state_source": str(meta.get(
-            "accepted_state_source", "none")),
-        "committed_state_is_finite": bool(meta.get(
-            "committed_state_is_finite", False)),
+        "final_trial_status": _safe_str(
+            meta.get("final_trial_status"), "no_attempt"),
+        "committed_state_status": _safe_str(
+            meta.get("committed_state_status"), "rejected_no_commit"),
+        "accepted_state_source": _safe_str(
+            meta.get("accepted_state_source"), "none"),
+        "committed_state_is_finite": _safe_bool(
+            meta.get("committed_state_is_finite"), False),
     }
     if cfg.include_force_inputs:
         # Optional force-integration inputs. Runner populates these
@@ -838,8 +839,8 @@ def _maybe_emit_failed_dump(
             counters.by_trigger[t] = counters.by_trigger.get(t, 0) + 1
         # One-line stdout marker for the operator.
         print(
-            f"[AUSAS-DUMP] step={meta.get('step', -1)} "
-            f"trial={meta.get('trial', -1)} "
+            f"[AUSAS-DUMP] step={_safe_int(meta.get('step'), -1)} "
+            f"trial={_safe_int(meta.get('trial'), -1)} "
             f"trigger={primary} file={target}",
             flush=True)
     except Exception as exc:
@@ -847,10 +848,54 @@ def _maybe_emit_failed_dump(
         # Non-fatal — surface a one-line warning so the run
         # log carries the failure trail.
         print(
-            f"[AUSAS-DUMP-FAILED] step={meta.get('step', -1)} "
-            f"trial={meta.get('trial', -1)} "
+            f"[AUSAS-DUMP-FAILED] step={_safe_int(meta.get('step'), -1)} "
+            f"trial={_safe_int(meta.get('trial'), -1)} "
             f"reason={type(exc).__name__}: {exc}",
             flush=True)
+
+
+# Stage J fu-2 Task 29 hotfix — gpu-reynolds emits ``key: None``
+# for unset diagnostic fields (rather than omitting the key), so
+# ``dict.get(key, default)`` returns ``None`` instead of the
+# default. Coerce defensively across the whole signal block.
+
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        if v is None:
+            return int(default)
+        return int(v)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_str(v: Any, default: str = "") -> str:
+    if v is None:
+        return str(default)
+    return str(v)
+
+
+def _safe_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return bool(default)
+    return bool(v)
+
+
+def _safe_tuple(v: Any) -> Tuple[int, ...]:
+    if v is None:
+        return ()
+    try:
+        return tuple(int(x) for x in v)
+    except (TypeError, ValueError):
+        return ()
 
 
 def _unpack_ausas_dump_signals(
