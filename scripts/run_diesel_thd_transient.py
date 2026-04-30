@@ -866,6 +866,33 @@ def _write_summary(run_dir, results, thermal, retry_cfg, *,
                 f"    committed_state_nonfinite: {n_nonfinite}")
         lines.append("")
 
+    # Stage J fu-2 Task 29 — Ausas failed one-step dumps block.
+    # Always present in summary, even when disabled (so the
+    # operator can confirm at-a-glance whether the dump path was
+    # active for this run).
+    _dump_dir = results.get("ausas_dump_directory")
+    _dump_written = int(results.get("ausas_dump_written", 0))
+    _dump_suppressed = int(results.get("ausas_dump_suppressed", 0))
+    _dump_failed_writes = int(results.get(
+        "ausas_dump_write_failed", 0))
+    _dump_by_trigger = results.get("ausas_dump_by_trigger") or {}
+    lines.append("Ausas failed one-step dumps:")
+    lines.append(
+        f"  enabled              : "
+        f"{'true' if _dump_dir else 'false'}")
+    lines.append(
+        f"  directory            : {_dump_dir if _dump_dir else 'n/a'}")
+    lines.append(f"  written              : {_dump_written}")
+    lines.append(
+        f"  suppressed_after_limit: {_dump_suppressed}")
+    lines.append(f"  write_failed         : {_dump_failed_writes}")
+    if _dump_by_trigger:
+        lines.append("  triggers:")
+        for trig, n in sorted(_dump_by_trigger.items(),
+                               key=lambda kv: -kv[1]):
+            lines.append(f"    {trig:24s}: {n}")
+    lines.append("")
+
     # Groove geometry block — only emitted when the run actually
     # uses grooves so half-Sommerfeld dimple regressions stay quiet.
     if tex_kind == "groove" and groove_preset_resolved:
@@ -1879,6 +1906,24 @@ def _run_one(thermal: ThermalConfig, retry_cfg: SolverRetryConfig,
         max_mech_inner=getattr(args, "max_mech_inner", None),
         mech_relax_initial=getattr(args, "mech_relax_initial", None),
         mech_relax_min=getattr(args, "mech_relax_min", None),
+        # Stage J fu-2 Task 29 — failed-Ausas dump path + capability-
+        # safe debug forwarding.
+        dump_failed_one_step_dir=getattr(
+            args, "dump_failed_one_step_dir", None),
+        dump_failed_one_step_limit=int(getattr(
+            args, "dump_failed_one_step_limit", 20)),
+        dump_failed_one_step_force_inputs=bool(getattr(
+            args, "dump_failed_one_step_force_inputs", True)),
+        ausas_debug_checks=bool(getattr(
+            args, "ausas_debug_checks", False)),
+        ausas_debug_check_every=int(getattr(
+            args, "ausas_debug_check_every", 50)),
+        ausas_debug_stop_on_nonfinite=bool(getattr(
+            args, "ausas_debug_stop_on_nonfinite", True)),
+        ausas_debug_return_bad_state=bool(getattr(
+            args, "ausas_debug_return_bad_state", False)),
+        ausas_debug_return_last_finite_state=bool(getattr(
+            args, "ausas_debug_return_last_finite_state", True)),
     )
     dt = time.time() - t0
     if args.max_wall_sec is not None and dt > args.max_wall_sec:
@@ -2050,6 +2095,62 @@ def main(argv=None):
     # after RB is implemented in
     # ``reynolds_solver/cavitation/ausas/solver_dynamic_gpu.py``
     # (Stage J fu-2 plan, Task 3 Variant A — gpu-reynolds repo).
+    # Stage J fu-2 Task 29 — Ausas one-step dump path (off by
+    # default; production runs are silent on dump I/O).
+    pa.add_argument("--dump-failed-one-step-dir",
+                    dest="dump_failed_one_step_dir",
+                    default=None,
+                    help="Directory for failed Ausas one-step .npz "
+                         "dumps. Default off (None).")
+    pa.add_argument("--dump-failed-one-step-limit",
+                    dest="dump_failed_one_step_limit",
+                    type=int, default=20,
+                    help="Max number of dump files written per run "
+                         "(suppressions tracked in summary). "
+                         "Default 20.")
+    pa.add_argument("--no-dump-failed-one-step-force-inputs",
+                    dest="dump_failed_one_step_force_inputs",
+                    action="store_false", default=True,
+                    help="Skip the optional force-integration "
+                         "input keys from the dump payload "
+                         "(P_raw, theta_raw, integration weights, "
+                         "etc.). Default ON.")
+    # Stage J fu-2 Task 29 — capability-safe forwarding of debug
+    # solver kwargs. Forwarded as ``extra_options`` keys; unknown
+    # kwargs are dropped silently by the adapter on backends that
+    # don't accept them.
+    pa.add_argument("--ausas-debug-checks",
+                    dest="ausas_debug_checks",
+                    action="store_true", default=False,
+                    help="Enable solver-side debug nonfinite/invalid "
+                         "checks (capability-safe forwarding to "
+                         "ausas_unsteady_one_step_gpu).")
+    pa.add_argument("--ausas-debug-check-every",
+                    dest="ausas_debug_check_every",
+                    type=int, default=50,
+                    help="Inner-iteration interval for solver debug "
+                         "checks. Default 50.")
+    pa.add_argument("--ausas-debug-stop-on-nonfinite",
+                    dest="ausas_debug_stop_on_nonfinite",
+                    action="store_true", default=True,
+                    help="Solver-side hard stop on first non-finite "
+                         "cell (default ON in diagnostic mode).")
+    pa.add_argument("--no-ausas-debug-stop-on-nonfinite",
+                    dest="ausas_debug_stop_on_nonfinite",
+                    action="store_false")
+    pa.add_argument("--ausas-debug-return-bad-state",
+                    dest="ausas_debug_return_bad_state",
+                    action="store_true", default=False,
+                    help="Return the bad state from the solver on "
+                         "failure (forwarded via extra_options).")
+    pa.add_argument("--ausas-debug-return-last-finite-state",
+                    dest="ausas_debug_return_last_finite_state",
+                    action="store_true", default=True,
+                    help="Return last finite state instead of NaN on "
+                         "failure. Default ON.")
+    pa.add_argument("--no-ausas-debug-return-last-finite-state",
+                    dest="ausas_debug_return_last_finite_state",
+                    action="store_false")
     pa.add_argument("--save-field-checkpoints",
                     dest="save_field_checkpoints",
                     action="store_true", default=False,

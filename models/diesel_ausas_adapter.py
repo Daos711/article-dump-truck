@@ -28,6 +28,18 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
+# Stage J fu-2 Task 29 — dump-writer module + DumpConfig / DumpCounters.
+# Imported at module top so the adapter can read cfg.directory cheaply
+# and the production path stays None-by-default (no I/O).
+from models.diesel_ausas_dump_io import (
+    DumpConfig,
+    DumpCounters,
+    OPTIONAL_FORCE_INPUT_KEYS,
+    build_dump_filename,
+    evaluate_triggers,
+    write_dump_npz,
+)
+
 
 # ─── State container ───────────────────────────────────────────────
 
@@ -168,6 +180,22 @@ class DieselAusasStepResult:
     dt_phys_s: float
     dt_ausas: float
     reason: str = "ok"
+    # Stage J fu-2 Task 29 — pass-through fields from the
+    # gpu-reynolds Task 12 dict-API. Empty / NaN defaults preserve
+    # the legacy 4-tuple-return path (``failure_kind=""`` and
+    # ``nonfinite_count=0`` map to "no info" → classifier falls
+    # back to the numerical-residual rules).
+    failure_kind: str = ""
+    first_nan_field: str = ""
+    first_nan_index: Tuple[int, ...] = ()
+    first_nan_is_ghost: bool = False
+    first_nan_is_axial_boundary: bool = False
+    first_nan_is_phi_seam: bool = False
+    nan_iter: int = -1
+    nonfinite_count: int = 0
+    residual_linf: float = float("nan")
+    residual_rms: float = float("nan")
+    residual_l2_abs: float = float("nan")
 
     @property
     def cav_frac(self) -> float:
@@ -493,7 +521,16 @@ def ausas_one_step_with_state(
         theta_bc_zL=1.0,
     )
     if extra_options:
-        kwargs.update(extra_options)
+        # Stage J fu-2 Task 29 — strip reserved adapter-only keys
+        # (``__dump_config__`` / ``__dump_metadata__`` /
+        # ``__dump_counters__``) before forwarding to the GPU
+        # backend; they're routing metadata for the dump path, not
+        # solver kwargs.
+        _solver_kwargs = {
+            k: v for k, v in extra_options.items()
+            if not (isinstance(k, str) and k.startswith("__"))
+        }
+        kwargs.update(_solver_kwargs)
     # ``max_inner`` is only used to derive the convergence flag when
     # the solver does not return one explicitly. If the caller did
     # not override it, we don't know the solver's internal budget,
@@ -599,6 +636,30 @@ def ausas_one_step_with_state(
             state.dt_ausas_last = float(dt_ausas)
             state.valid = True
 
+    # Stage J fu-2 Task 29 — extract dump signals from the dict
+    # return shape (empty for legacy 4-tuple returns).
+    _dump_signals = _unpack_ausas_dump_signals(out)
+
+    # Stage J fu-2 Task 29 — opportunistic dump of the failed
+    # one-step input state. Only fires when the runner explicitly
+    # threaded ``__dump_config__`` + ``__dump_metadata__`` through
+    # ``extra_options`` AND at least one trigger condition matches.
+    # Pure observability; never raises into the runner.
+    _maybe_emit_failed_dump(
+        extra_options=extra_options,
+        H_curr_phys=H_curr_phys, H_prev_phys=H_prev_phys,
+        P_prev_phys=P_prev_phys, theta_prev_phys=theta_prev_phys,
+        P_nd=P_nd, theta_phys=theta_phys,
+        residual=float(residual) if np.isfinite(residual)
+            else float("nan"),
+        n_inner=int(n_inner), converged=bool(converged),
+        commit=commit,
+        dt_s=float(dt_s), d_phi=float(d_phi), d_Z=float(d_Z),
+        kwargs_snapshot=kwargs,
+        dump_signals=_dump_signals,
+        user_max_inner=user_max_inner,
+    )
+
     return DieselAusasStepResult(
         P_nd=np.asarray(P_nd), theta=np.asarray(theta_phys),
         residual=float(residual)
@@ -608,7 +669,217 @@ def ausas_one_step_with_state(
         H_curr=H_curr_phys,
         dt_phys_s=float(dt_s), dt_ausas=float(dt_ausas),
         reason=("ok" if converged else "ausas_not_converged"),
+        failure_kind=str(_dump_signals.get("failure_kind", "")),
+        first_nan_field=str(_dump_signals.get("first_nan_field", "")),
+        first_nan_index=tuple(
+            _dump_signals.get("first_nan_index", ()) or ()),
+        first_nan_is_ghost=bool(
+            _dump_signals.get("first_nan_is_ghost", False)),
+        first_nan_is_axial_boundary=bool(
+            _dump_signals.get("first_nan_is_axial_boundary", False)),
+        first_nan_is_phi_seam=bool(
+            _dump_signals.get("first_nan_is_phi_seam", False)),
+        nan_iter=int(_dump_signals.get("nan_iter", -1)),
+        nonfinite_count=int(
+            _dump_signals.get("nonfinite_count", 0)),
+        residual_linf=float(
+            _dump_signals.get("residual_linf", float("nan"))),
+        residual_rms=float(
+            _dump_signals.get("residual_rms", float("nan"))),
+        residual_l2_abs=float(
+            _dump_signals.get("residual_l2_abs", float("nan"))),
     )
+
+
+def _maybe_emit_failed_dump(
+    *,
+    extra_options: Optional[Dict[str, Any]],
+    H_curr_phys: np.ndarray, H_prev_phys: np.ndarray,
+    P_prev_phys: np.ndarray, theta_prev_phys: np.ndarray,
+    P_nd: np.ndarray, theta_phys: np.ndarray,
+    residual: float, n_inner: int, converged: bool,
+    commit: bool, dt_s: float, d_phi: float, d_Z: float,
+    kwargs_snapshot: Dict[str, Any],
+    dump_signals: Dict[str, Any],
+    user_max_inner: Optional[int],
+) -> None:
+    """Stage J fu-2 Task 29 — write a ``.npz`` of the failed
+    one-step call when the runner threaded the dump-config /
+    metadata through ``extra_options``. Catches its own exceptions
+    so the diesel runner never trips on a dump-write failure.
+    """
+    if not extra_options:
+        return
+    cfg = extra_options.get("__dump_config__")
+    meta = extra_options.get("__dump_metadata__")
+    counters = extra_options.get("__dump_counters__")
+    if cfg is None or meta is None or counters is None:
+        return
+    if cfg.directory is None:
+        return
+    # Trigger evaluation
+    F_hyd_x = meta.get("F_hyd_x")
+    F_hyd_y = meta.get("F_hyd_y")
+    triggers = evaluate_triggers(
+        cfg=cfg,
+        converged=bool(converged),
+        failure_kind=str(dump_signals.get("failure_kind", "")),
+        residual=float(residual),
+        n_inner=int(n_inner),
+        n_inner_max=int(user_max_inner)
+            if user_max_inner is not None else int(n_inner) + 1,
+        F_hyd_x=F_hyd_x, F_hyd_y=F_hyd_y,
+    )
+    if not triggers:
+        return
+    # Limit gate
+    if counters.written >= int(cfg.limit):
+        counters.suppressed_after_limit += 1
+        for t in triggers:
+            counters.by_trigger[t] = counters.by_trigger.get(t, 0) + 1
+        return
+    primary = triggers[0]
+    fname = build_dump_filename(
+        step=int(meta.get("step", -1)),
+        substep=int(meta.get("substep", -1)),
+        trial=int(meta.get("trial", -1)),
+        commit=bool(commit),
+        primary_trigger=primary,
+    )
+    payload: Dict[str, Any] = {
+        # Mandatory solver inputs
+        "H_prev": np.asarray(H_prev_phys, dtype=float),
+        "H_curr": np.asarray(H_curr_phys, dtype=float),
+        "P_prev": np.asarray(P_prev_phys, dtype=float),
+        "theta_prev": np.asarray(theta_prev_phys, dtype=float),
+        "dt_s": float(dt_s),
+        "d_phi": float(d_phi),
+        "d_Z": float(d_Z),
+        "periodic_phi": bool(kwargs_snapshot.get("periodic_phi", True)),
+        "periodic_z": bool(kwargs_snapshot.get("periodic_z", False)),
+        "bc_z_low": kwargs_snapshot.get("p_bc_z0"),
+        "bc_z_high": kwargs_snapshot.get("p_bc_zL"),
+        "bc_phi_low": kwargs_snapshot.get("theta_bc_z0"),
+        "bc_phi_high": kwargs_snapshot.get("theta_bc_zL"),
+        "solver_kwargs": {
+            k: v for k, v in kwargs_snapshot.items()
+            if k not in {"H_curr", "H_prev", "P_prev", "theta_prev"}
+        },
+        # Step metadata
+        "step": int(meta.get("step", -1)),
+        "substep": int(meta.get("substep", -1)),
+        "trial": int(meta.get("trial", -1)),
+        "commit": bool(commit),
+        "phi_deg": float(meta.get("phi_deg", float("nan"))),
+        "eps_x": float(meta.get("eps_x", float("nan"))),
+        "eps_y": float(meta.get("eps_y", float("nan"))),
+        "config_label": str(meta.get("config_label", "")),
+        "trial_kind": str(meta.get("trial_kind", "")),
+        "texture_kind": str(meta.get("texture_kind", "")),
+        "groove_preset": str(meta.get("groove_preset", "")),
+        "cavitation": str(meta.get("cavitation", "")),
+        "n_phi": int(H_curr_phys.shape[1]),
+        "n_z": int(H_curr_phys.shape[0]),
+        # Solver result + nonfinite diagnostics
+        "converged": bool(converged),
+        "failure_kind": str(dump_signals.get("failure_kind", "")),
+        "first_nan_field": str(
+            dump_signals.get("first_nan_field", "")),
+        "first_nan_index": tuple(
+            dump_signals.get("first_nan_index", ()) or ()),
+        "first_nan_is_ghost": bool(
+            dump_signals.get("first_nan_is_ghost", False)),
+        "first_nan_is_axial_boundary": bool(
+            dump_signals.get(
+                "first_nan_is_axial_boundary", False)),
+        "first_nan_is_phi_seam": bool(
+            dump_signals.get("first_nan_is_phi_seam", False)),
+        "nan_iter": int(dump_signals.get("nan_iter", -1)),
+        "residual": float(residual),
+        "residual_linf": float(
+            dump_signals.get("residual_linf", residual)),
+        "residual_rms": float(
+            dump_signals.get("residual_rms", float("nan"))),
+        "residual_l2_abs": float(
+            dump_signals.get("residual_l2_abs", float("nan"))),
+        "n_inner": int(n_inner),
+        "nonfinite_count": int(
+            dump_signals.get("nonfinite_count", 0)),
+        # Shape diagnostics — adapter unpadded the backend's return,
+        # so the in-RAM shapes are the physical (N_z, N_phi).
+        "P_shape_raw": tuple(P_nd.shape),
+        "theta_shape_raw": tuple(theta_phys.shape),
+        "expected_physical_shape": tuple(H_curr_phys.shape),
+        "expected_padded_shape": (
+            H_curr_phys.shape[0], H_curr_phys.shape[1] + 2),
+        "P_is_padded": False,
+        "theta_is_padded": False,
+        # Commit-semantics metadata (Task 32 sync) — runner threads
+        # these through meta when known. Defaults preserve schema.
+        "final_trial_status": str(meta.get(
+            "final_trial_status", "no_attempt")),
+        "committed_state_status": str(meta.get(
+            "committed_state_status", "rejected_no_commit")),
+        "accepted_state_source": str(meta.get(
+            "accepted_state_source", "none")),
+        "committed_state_is_finite": bool(meta.get(
+            "committed_state_is_finite", False)),
+    }
+    if cfg.include_force_inputs:
+        # Optional force-integration inputs. Runner populates these
+        # via meta when available; absent values stay as None / NaN.
+        for k in OPTIONAL_FORCE_INPUT_KEYS:
+            if k in meta:
+                payload[k] = meta[k]
+    try:
+        target = write_dump_npz(cfg.directory, fname, payload)
+        counters.written += 1
+        for t in triggers:
+            counters.by_trigger[t] = counters.by_trigger.get(t, 0) + 1
+        # One-line stdout marker for the operator.
+        print(
+            f"[AUSAS-DUMP] step={meta.get('step', -1)} "
+            f"trial={meta.get('trial', -1)} "
+            f"trigger={primary} file={target}",
+            flush=True)
+    except Exception as exc:
+        counters.write_failed += 1
+        # Non-fatal — surface a one-line warning so the run
+        # log carries the failure trail.
+        print(
+            f"[AUSAS-DUMP-FAILED] step={meta.get('step', -1)} "
+            f"trial={meta.get('trial', -1)} "
+            f"reason={type(exc).__name__}: {exc}",
+            flush=True)
+
+
+def _unpack_ausas_dump_signals(
+    out: Any,
+) -> Dict[str, Any]:
+    """Stage J fu-2 Task 29 — pull the gpu-reynolds Task 12 dump
+    signals out of a dict return shape. Returns an empty dict for
+    non-dict shapes (legacy 4-tuple) so callers can ``.get(..., default)``
+    without checking the input type.
+    """
+    if not isinstance(out, dict):
+        return {}
+    out_d: Dict[str, Any] = {}
+    for k in (
+        "failure_kind",
+        "first_nan_field",
+        "first_nan_index",
+        "first_nan_is_ghost",
+        "first_nan_is_axial_boundary",
+        "first_nan_is_phi_seam",
+        "nan_iter",
+        "nonfinite_count",
+        "residual_linf",
+        "residual_rms",
+        "residual_l2_abs",
+    ):
+        if k in out:
+            out_d[k] = out[k]
+    return out_d
 
 
 def _unpack_ausas_return(

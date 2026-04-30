@@ -1206,7 +1206,20 @@ def run_transient(F_max=None, debug=False,
                   coupling_override: str = "auto",
                   max_mech_inner: Optional[int] = None,
                   mech_relax_initial: Optional[float] = None,
-                  mech_relax_min: Optional[float] = None):
+                  mech_relax_min: Optional[float] = None,
+                  # Stage J fu-2 Task 29 — failed-Ausas dump path.
+                  # ``dump_failed_one_step_dir=None`` keeps the
+                  # production path silent; setting a directory and
+                  # the runner's CLI thread the writes through the
+                  # adapter via reserved ``extra_options`` keys.
+                  dump_failed_one_step_dir: Optional[str] = None,
+                  dump_failed_one_step_limit: int = 20,
+                  dump_failed_one_step_force_inputs: bool = True,
+                  ausas_debug_checks: bool = False,
+                  ausas_debug_check_every: int = 50,
+                  ausas_debug_stop_on_nonfinite: bool = True,
+                  ausas_debug_return_bad_state: bool = False,
+                  ausas_debug_return_last_finite_state: bool = True):
     """Нестационарный расчёт.
 
     Stage Diesel Transient THD-0 — see module docstring. ``thermal=None``
@@ -1524,6 +1537,38 @@ def run_transient(F_max=None, debug=False,
     applicable_arr = np.zeros(n_cfg, dtype=bool)
     applicable_reason_arr = np.full(n_cfg, "", dtype="<U96")
 
+    # Stage J fu-2 Task 29 — failed-Ausas dump path setup.
+    # Single ``DumpConfig`` / ``DumpCounters`` per run (shared
+    # across configs) so the limit is global. Disabled-by-default
+    # production path: ``directory=None`` → no I/O, no perf hit.
+    from models.diesel_ausas_dump_io import DumpConfig as _DumpCfg
+    from models.diesel_ausas_dump_io import DumpCounters as _DumpCnt
+    _dump_cfg = _DumpCfg(
+        directory=dump_failed_one_step_dir,
+        limit=int(dump_failed_one_step_limit),
+        include_force_inputs=bool(
+            dump_failed_one_step_force_inputs),
+    )
+    _dump_counters = _DumpCnt()
+
+    # Stage J fu-2 Task 29 — capability-safe debug kwargs to forward
+    # to ``ausas_unsteady_one_step_gpu``. Adapter strips reserved
+    # ``__dump_*__`` keys before the backend call; the ``debug_*``
+    # kwargs ARE forwarded, and the GPU side accepts whichever it
+    # supports (unknown kwargs would TypeError on a real backend
+    # but the test backends use ``**kwargs`` and silently swallow).
+    _ausas_debug_options: Dict[str, Any] = {}
+    if ausas_debug_checks:
+        _ausas_debug_options["debug_checks"] = True
+        _ausas_debug_options["debug_check_every"] = int(
+            ausas_debug_check_every)
+        _ausas_debug_options["debug_stop_on_nonfinite"] = bool(
+            ausas_debug_stop_on_nonfinite)
+        _ausas_debug_options["debug_return_bad_state"] = bool(
+            ausas_debug_return_bad_state)
+        _ausas_debug_options["debug_return_last_finite_state"] = bool(
+            ausas_debug_return_last_finite_state)
+
     for ic, cfg in enumerate(cfg_list):
         eta_const = float(cfg["oil"]["eta_diesel"])
         rho = float(cfg["oil"]["rho"])
@@ -1713,8 +1758,29 @@ def run_transient(F_max=None, debug=False,
                 guards_cfg=_guards_cfg,
                 ausas_tol=_kernel_ausas_tol,
                 ausas_max_inner=_kernel_ausas_max_inner,
-                extra_options=(ausas_options if use_ausas_dynamic
-                               else None),
+                extra_options=(
+                    {
+                        **(ausas_options or {}),
+                        **_ausas_debug_options,
+                        "__dump_config__": _dump_cfg,
+                        "__dump_counters__": _dump_counters,
+                        "__dump_metadata__": dict(
+                            step=int(step),
+                            substep=-1,
+                            trial=-1,
+                            phi_deg=float(phi_deg),
+                            eps_x=float(ex_n) / params.c,
+                            eps_y=float(ey_n) / params.c,
+                            config_label=str(cfg["label"]),
+                            trial_kind="picard_trial",
+                            texture_kind=str(texture_kind),
+                            groove_preset=str(groove_preset)
+                                if groove_preset else "",
+                            cavitation=str(cavitation),
+                            F_hyd_x=None, F_hyd_y=None,
+                        ),
+                    }
+                    if use_ausas_dynamic else None),
                 context=step_ctx,
                 m_shaft=float(params.m_shaft),
                 eps_max=float(params.eps_max),
@@ -2397,6 +2463,16 @@ def run_transient(F_max=None, debug=False,
         "groove_relief_stats": groove_relief_stats,
         "fidelity": (str(fidelity) if fidelity is not None else None),
         "ausas_options": dict(ausas_options or {}),
+        # Stage J fu-2 Task 29 — dump-path counters surfaced in
+        # the summary writer's "Ausas failed one-step dumps" block.
+        "ausas_dump_directory": dump_failed_one_step_dir,
+        "ausas_dump_limit": int(dump_failed_one_step_limit),
+        "ausas_dump_written": int(_dump_counters.written),
+        "ausas_dump_suppressed": int(
+            _dump_counters.suppressed_after_limit),
+        "ausas_dump_write_failed": int(
+            _dump_counters.write_failed),
+        "ausas_dump_by_trigger": dict(_dump_counters.by_trigger),
         "ausas_converged": ausas_converged_all,
         "ausas_n_inner": ausas_n_inner_all,
         "ausas_cav_frac": ausas_cav_frac_all,
